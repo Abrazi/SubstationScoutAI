@@ -43,7 +43,7 @@ describe('SFC priority inline edit', () => {
 
     // Switch to code view and assert PRI comment inserted
     userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
-    const codeArea = await screen.findByRole('textbox');
+    const codeArea = await screen.findByRole('textbox') as HTMLTextAreaElement;
     expect(codeArea.value).toContain('(* PRI: 10 *)');
   });
 
@@ -67,7 +67,7 @@ describe('SFC priority inline edit', () => {
 
     // After auto-resolve, both PRI comments must exist and be unique
     userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
-    const codeArea = await screen.findByRole('textbox');
+    const codeArea = await screen.findByRole('textbox') as HTMLTextAreaElement;
     expect(codeArea.value).toMatch(/\(\* PRI: 1 \*\)/);
     expect(codeArea.value).toMatch(/\(\* PRI: 2 \*\)/);
   });
@@ -102,7 +102,7 @@ describe('SFC priority inline edit', () => {
 
     // Check ST contains PRI comments
     userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
-    const codeArea = await screen.findByRole('textbox');
+    const codeArea = await screen.findByRole('textbox') as HTMLTextAreaElement;
     expect(codeArea.value).toMatch(/\(\* PRI: 1 \*\)/);
     expect(codeArea.value).toMatch(/\(\* PRI: 2 \*\)/);
   });
@@ -118,8 +118,28 @@ describe('SFC priority inline edit', () => {
 
     // Check ST contains normalized PRI comments
     userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
-    const codeArea = await screen.findByRole('textbox');
+    const codeArea = await screen.findByRole('textbox') as HTMLTextAreaElement;
     expect(codeArea.value).toMatch(/\(\* PRI: 10 \*\)/);
     expect(codeArea.value).toMatch(/\(\* PRI: 20 \*\)/);
+  });
+
+  it('respects configured normalize step size', async () => {
+    render(<ScriptEditor ieds={[{ id: 'P1', name: 'Device P1', type: 'IED' } as any]} initialDeviceId="P1" />);
+    userEvent.click(screen.getByRole('button', { name: /SFC Diagram/i }));
+    await screen.findByText('A');
+
+    // change normalize step size to 5
+    const select = screen.getByLabelText('normalize-step-size');
+    userEvent.selectOptions(select, '5');
+
+    // click Normalize button for the step
+    const normalizeBtn = screen.getAllByTitle('Normalize priorities')[0];
+    userEvent.click(normalizeBtn);
+
+    // Check ST contains normalized PRI comments with step 5
+    userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
+    const codeArea = await screen.findByRole('textbox') as HTMLTextAreaElement;
+    expect(codeArea.value).toMatch(/\(\* PRI: 5 \*\)/);
+    expect(codeArea.value).toMatch(/\(\* PRI: 10 \*\)/);
   });
 });

@@ -22,11 +22,9 @@ import { IEDNode, ViewMode, LogEntry, WatchItem } from './types';
 import { engine } from './services/SimulationEngine';
 
 // --- Error Boundary Component ---
-class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean, error: Error | null }> {
-  constructor(props: { children: React.ReactNode }) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
+export class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean, error: Error | null }> {
+  // explicit state field to keep TypeScript happy in all environments
+  state: { hasError: boolean; error: Error | null } = { hasError: false, error: null };
 
   static getDerivedStateFromError(error: Error) {
     return { hasError: true, error };
@@ -56,7 +54,7 @@ class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError:
     }
     return this.props.children;
   }
-}
+} 
 
 // Helper to recursively find GSE nodes
 const findGooseNodes = (node: IEDNode, results: IEDNode[] = []) => {

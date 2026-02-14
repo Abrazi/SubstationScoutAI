@@ -183,7 +183,7 @@ export const parseSFC = (code: string): SFCNode[] => {
 
             // Detect Transition Block (IF cond THEN <stateVar> := target)
             // Check for inline transition: IF cond THEN <stateVar> := TARGET; END_IF;
-            const inlineTrans = trimmed.match(new RegExp(`^IF\\s+(.+)\\s+THEN\\s+${stateVarName}\\s*:=\\s*(STATE_\\w+);\\s*END_IF;`, 'i'));
+            const inlineTrans = trimmed.match(new RegExp(`^(?:\\(\\*[\\s\\S]*?\\*\\)\\s*)?IF\\s+(.+)\\s+THEN\\s+${stateVarName}\\s*:=\\s*(STATE_\\w+);\\s*END_IF;`, 'i'));
             if (inlineTrans && stateNames.has(inlineTrans[2])) {
                  const blockText = line;
                  const priMatch = blockText.match(/\(\*\s*PRI(?:ORITY)?\s*:\s*(\d+)\s*\*\)/i);
@@ -436,6 +436,8 @@ export const removeStateFromCode = (code: string, stateId: string, stateVarName 
     // Remove direct assignments to the removed state
     const assignRe = new RegExp('\\b' + stateVarName.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '\\s*:=\\s*' + escState + '\\b;?', 'g');
     out = out.replace(assignRe, '');
+    // Finally strip any remaining textual references to the removed state (e.g. in OR chains)
+    out = out.replace(new RegExp('\\b' + escState + '\\b', 'g'), '');
     return out;
 };
 
@@ -460,7 +462,7 @@ export const reorderTransitionBlocks = (code: string, nodeId: string, fromIndex:
     return lines.join('\n');
 };
 
-const exportPLCopenXML = (nodes: SFCNode[], code: string) => {
+const exportPLCopenXML = (nodes: SFCNode[], code?: string) => {
     const pouName = 'SFC_POU';
     const xmlParts: string[] = [];
     xmlParts.push('<?xml version="1.0" encoding="utf-8"?>');
@@ -541,6 +543,8 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   const [forceModal, setForceModal] = useState<{ isOpen: boolean; nodeId?: string; label?: string }>({ isOpen: false, nodeId: undefined });
   // Inline priority editor state
   const [editingPriority, setEditingPriority] = useState<{ nodeId?: string; idx?: number; value?: number }>({});
+  // Normalization step size (configurable via SFC toolbar)
+  const [normalizeStepSize, setNormalizeStepSize] = useState<number>(10);
 
   // Debug State
   const [debugState, setDebugState] = useState<DebugState>({
@@ -558,6 +562,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   const [forcedSteps, setForcedSteps] = useState<Record<string, boolean>>({});
   const [showPrintBounds, setShowPrintBounds] = useState(false);
   const [findReplaceOpen, setFindReplaceOpen] = useState(false);
+  const [showDebugPanel, setShowDebugPanel] = useState(false);
+  const [debugPanelTab, setDebugPanelTab] = useState<'variables' | 'breakpoints' | 'watch'>('variables');
+  const [watchExpressions, setWatchExpressions] = useState<string[]>([]);
+  const [newWatchExpr, setNewWatchExpr] = useState('');
   const [findText, setFindText] = useState('');
   const [replaceText, setReplaceText] = useState('');
   const lastStateRef = useRef<number | null>(null);
@@ -960,33 +968,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
   };
 
   // --- SFC Edit Helpers: rename / delete step, reorder transitions ---
-  const handleRenameStep = (node: SFCNode) => {
-      const input = prompt('Rename step (enter new name, e.g. PARKED)', node.label);
-      if (!input) return;
-      const clean = input.trim().toUpperCase().replace(/\s+/g, '_');
-      const newStateId = clean.startsWith('STATE_') ? clean : `STATE_${clean}`;
-      if (!/^[A-Z0-9_]+$/.test(clean)) {
-          alert('Invalid step name. Use letters, numbers and underscores only.');
-          return;
-      }
-      if (newStateId === node.id) return;
-      const newCode = renameStateInCode(code, node.id, newStateId);
-      setCode(newCode);
-      setIsDirty(true);
-      setConsoleOutput(prev => [...prev, `> Renamed ${node.id} -> ${newStateId}`]);
-  };
 
-  const handleDeleteStep = (node: SFCNode) => {
-      if (node.type === 'init') {
-          alert('Cannot delete the initial step.');
-          return;
-      }
-      if (!confirm(`Delete step '${node.label}' and remove all transitions targeting it?`)) return;
-      const newCode = removeStateFromCode(code, node.id, detectedStateVar);
-      setCode(newCode);
-      setIsDirty(true);
-      setConsoleOutput(prev => [...prev, `> Deleted step ${node.id}`]);
-  };
 
   const moveTransitionInCode = (nodeId: string, idx: number, direction: 'up' | 'down') => {
       const nodes = parseSFC(code);
@@ -1189,6 +1171,14 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
           
           <div className="flex gap-2 shrink-0">
                <button 
+                  onClick={() => setShowDebugPanel(!showDebugPanel)}
+                  className={`flex items-center gap-2 px-3 py-1.5 border rounded text-sm transition-colors ${showDebugPanel ? 'bg-scada-accent/20 text-scada-accent border-scada-accent/50' : 'bg-transparent hover:bg-white/5 border-transparent hover:border-scada-border text-scada-muted'}`}
+                  title="Toggle Debug Panel"
+               >
+                  <Icons.Bug className="w-4 h-4" />
+                  <span className="hidden sm:inline">Debug</span>
+               </button>
+               <button 
                   onClick={() => setShowHelp(true)}
                   className="flex items-center gap-2 px-3 py-1.5 bg-transparent hover:bg-white/5 border border-transparent hover:border-scada-border rounded text-sm transition-colors text-scada-accent"
                >
@@ -1228,7 +1218,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
       <div className="flex-1 flex overflow-hidden">
           
           {/* Main Content Area (Dual View) */}
-          <div className="flex-1 bg-[#0d1117] relative flex border-r border-scada-border overflow-hidden">
+          <div className={`flex-1 bg-[#0d1117] relative flex border-r border-scada-border overflow-hidden transition-all ${showDebugPanel ? 'mr-80' : ''}`}>
               
               {viewMode === 'code' ? (
                   <>
@@ -1273,6 +1263,15 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                   <option value={200}>200%</option>
                               </select>
                               <button onClick={() => setZoomLevel(z => Math.min(200, z + 25))} className="p-1 hover:bg-white/10 rounded text-scada-muted"><Icons.ChevronRight className="w-4 h-4 -rotate-90" /></button>
+                              <label className="ml-3 text-xs text-scada-muted flex items-center gap-2">Normalize step
+                                  <select aria-label="normalize-step-size" value={normalizeStepSize} onChange={e => setNormalizeStepSize(parseInt(e.target.value || '10', 10))} className="ml-2 bg-[#0d1117] border border-scada-border rounded p-1 text-xs">
+                                      <option value={1}>1</option>
+                                      <option value={5}>5</option>
+                                      <option value={10}>10</option>
+                                      <option value={20}>20</option>
+                                      <option value={50}>50</option>
+                                  </select>
+                              </label>
                               <button onClick={() => exportPLCopenXML(sfcNodes)} title="Export PLCopen TC6 XML" className="ml-3 px-2 py-1 bg-scada-bg border border-scada-border rounded text-xs text-scada-muted hover:text-white">Export XML</button>
                               <button onClick={() => setFindReplaceOpen(true)} title="Find / Replace" className="px-2 py-1 bg-scada-bg border border-scada-border rounded text-xs text-scada-muted hover:text-white">Find/Replace</button>
                           </div>
@@ -1442,7 +1441,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                       
                                                       {/* Normalize + Add Another Transition Button (Branching) */}
                                                       <div className="mt-2 flex items-center gap-2">
-                                                          <button onClick={() => normalizePriorities(node.id)} className="px-2 py-1 text-xs bg-scada-bg border border-scada-border rounded text-scada-muted hover:text-white" title="Normalize priorities">Normalize</button>
+                                                          <button onClick={() => normalizePriorities(node.id, normalizeStepSize)} className="px-2 py-1 text-xs bg-scada-bg border border-scada-border rounded text-scada-muted hover:text-white" title="Normalize priorities">Normalize</button>
                                                           <button 
                                                               onClick={() => setAddModal({isOpen: true, type: 'transition', sourceId: node.id})}
                                                               className="w-6 h-6 rounded-full bg-scada-bg border border-scada-border flex items-center justify-center text-scada-muted hover:text-white hover:border-scada-accent transition-colors text-xs"
@@ -1727,7 +1726,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
               <div className="bg-scada-panel border border-scada-border rounded-lg shadow-2xl w-full max-w-md flex flex-col overflow-hidden animate-in zoom-in-95">
                   <div className="p-4 border-b border-scada-border bg-scada-bg/50 flex justify-between items-center">
                       <h3 className="font-bold text-white flex items-center gap-2">
-                          {addModal.type === 'step' ? <Icons.Box className="w-4 h-4 text-scada-accent" /> : <Icons.GitGraph className="w-4 h-4 text-yellow-500" />}
+                          {addModal.type === 'step' ? <Icons.Box className="w-4 h-4 text-scada-accent" /> : <Icons.GitBranch className="w-4 h-4 text-yellow-500" />}
                           {addModal.type === 'step' ? 'Add New Step' : 'Add Transition'}
                       </h3>
                       <button onClick={() => setAddModal({ ...addModal, isOpen: false })} className="text-scada-muted hover:text-white"><Icons.Close className="w-5 h-5" /></button>

@@ -52,7 +52,7 @@ describe('ScriptEditor — component interactions (SFC modals)', () => {
     const codeBtn = screen.getByRole('button', { name: /ST Code/i });
     userEvent.click(codeBtn);
 
-    const codeArea = await screen.findByRole('textbox');
+    const codeArea = await screen.findByRole('textbox') as HTMLTextAreaElement;
     expect(codeArea).toHaveValue(expect.stringContaining('STATE_PARKED'));
   });
 
@@ -74,7 +74,7 @@ describe('ScriptEditor — component interactions (SFC modals)', () => {
 
     // Verify in code view STATE_B no longer exists
     userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
-    const codeArea = await screen.findByRole('textbox');
+    const codeArea = await screen.findByRole('textbox') as HTMLTextAreaElement;
     expect(codeArea.value).not.toContain('STATE_B');
 
     // parseSFC should not return STATE_B

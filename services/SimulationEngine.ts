@@ -639,6 +639,7 @@ export class SimulationEngine {
   }
 
   public compile(deviceId: string, sourceCode: string): { success: boolean; error?: string } {
+    let wrappedCode = ''; // Declare outside try block for error logging
     try {
       const script = this.scripts.get(deviceId);
       if (!script) return { success: false, error: "Device not found" };
@@ -646,7 +647,20 @@ export class SimulationEngine {
       script.code = sourceCode;
 
       // 0. Strip PLC-style block comments globally (avoid leftover '(*' tokens)
-      const cleanedSource = sourceCode.replace(/\(\*[\s\S]*?\*\)/g, "");
+      let cleanedSource = sourceCode.replace(/\(\*[\s\S]*?\*\)/g, "");
+
+      // 0.a Convert VAR...END_VAR blocks into `scope.<name>` initializations so
+      //     declarations like `X : INT := 1;` become valid JS (`scope.X = 1;`).
+      // Use __ASSIGN__ placeholder to avoid interference with later = → === transformation
+      cleanedSource = cleanedSource.replace(/VAR([\s\S]*?)END_VAR/g, (_m, inner) => {
+          return inner.split('\n').map(l => {
+              const mInit = l.match(/^\s*([A-Za-z_][\w]*)\s*:\s*[A-Za-z_][\w]*\s*:=\s*(.+);?\s*$/);
+              if (mInit) return `scope.${mInit[1]} __ASSIGN__ ${mInit[2]};`;
+              const mNoInit = l.match(/^\s*([A-Za-z_][\w]*)\s*:\s*[A-Za-z_][\w]*\s*;?\s*$/);
+              if (mNoInit) return `scope.${mNoInit[1]} __ASSIGN__ scope.${mNoInit[1]};`;
+              return l;
+          }).join('\n');
+      });
 
       // 1. Line-by-Line Instrumentation and Syntax Translation
       const lines = cleanedSource.split('\n');
@@ -666,15 +680,19 @@ export class SimulationEngine {
             .replace(/Device\.WriteRegister\('(\d+)',\s*(.*)\)/g, "ctx.writeRegister($1, $2)")
             
             // IEC 61131-3 ST Syntax to JS conversions
-            .replace(/:=/g, "=") // Assignment
+            // Handle assignment vs. comparison carefully:
+            // In ST: ":=" is assignment, "=" is comparison (equality)
+            .replace(/:=/g, "__ASSIGN__") // Temp placeholder for assignment
+            .replace(/(?<![<>!=])=(?!=)/g, "===") // Comparison: = to ===, but not >=, <=, !=, ==
+            .replace(/__ASSIGN__/g, "=") // Now convert assignment placeholder to =
             .replace(/<>/g, "!==") // Inequality
             .replace(/\bTRUE\b/g, "true")
             .replace(/\bFALSE\b/g, "false")
             .replace(/\bAND\b/g, "&&")
             .replace(/\bOR\b/g, "||")
             .replace(/\bNOT\b/g, "!")
-            .replace(/\bIF\s+(.*)\s+THEN/g, "if ($1) {")
-            .replace(/\bELSIF\s+(.*)\s+THEN/g, "} else if ($1) {")
+            .replace(/\bIF\s+(.*?)\s+THEN/g, "if ($1) {")
+            .replace(/\bELSIF\s+(.*?)\s+THEN/g, "} else if ($1) {")
             .replace(/\bELSE\b/g, "} else {")
             .replace(/\bEND_IF;/g, "}")
             .replace(/\bWHILE\s+(.*)\s+DO/g, "while ($1) {")
@@ -700,7 +718,7 @@ export class SimulationEngine {
           return `yield ${lineNum}; ${jsLine}`;
       });
 
-      const wrappedCode = `
+      wrappedCode = `
         return function* (ctx, scope) {
            with(scope) {
               ${instrumentedLines.join('\n')}
@@ -715,6 +733,8 @@ export class SimulationEngine {
       
       return { success: true };
     } catch (e: any) {
+      // Emit console message to help debugging of ST->JS translation/runtime issues
+      try { console.error(`[SimulationEngine.compile] device=${deviceId} error=`, e && e.message, '\nwrappedCode snippet:\n', (wrappedCode || '').toString().slice(0, 400)); } catch(err) {}
       return { success: false, error: e.message };
     }
   }

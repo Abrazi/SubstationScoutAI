@@ -38,7 +38,8 @@ import {
   ArrowUpRight,
   ArrowDownLeft,
   Send,
-  GitGraph
+  GitBranch,
+  Clock
 } from 'lucide-react';
 
 export const Icons = {
@@ -47,5 +48,5 @@ export const Icons = {
   Stop: StopCircle, Upload, AI: Bot, Chat: MessageSquare, ChevronRight, 
   ChevronDown, Dashboard: LayoutDashboard, Database, Code, Save, 
   Refresh: RefreshCw, Run: Play, Box, Filter, Trash: Trash2, Eye, Pause: PauseCircle, List,
-  CheckCircle, FileText, Help: HelpCircle, Close: X, Cable, ArrowUpRight, ArrowDownLeft, Send, SFC: GitGraph, GitGraph
+  CheckCircle, FileText, Help: HelpCircle, Close: X, Cable, ArrowUpRight, ArrowDownLeft, Send, Clock, SFC: GitBranch, GitBranch
 };

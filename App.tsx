@@ -301,6 +301,10 @@ const App = () => {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-scada-bg text-scada-text font-sans">
+      {/* Debug mount indicator (visible for troubleshooting) */}
+      <div className="fixed top-3 right-3 z-50 rounded bg-scada-accent/10 text-scada-accent text-xs px-2 py-1 font-medium pointer-events-none">
+        Mounted • {viewMode} • {simulationTime}s
+      </div>
       
       {/* 1. Left Sidebar: Navigation & Project Structure */}
       <div className={`${sidebarOpen ? 'w-64' : 'w-16'} transition-all duration-300 flex flex-col border-r border-scada-border bg-scada-bg z-30`}>

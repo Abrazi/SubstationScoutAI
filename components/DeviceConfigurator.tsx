@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
-import { IEDNode, IEDConfig, NodeType, ModbusRegister, ModbusRegisterType } from '../types';
+import { IEDNode, IEDConfig, NodeType, ModbusRegister, ModbusRegisterType, PollingTask } from '../types';
 import { Icons } from './Icons';
-import { parseSCL, validateSCL, extractIEDs } from '../utils/sclParser';
+import { parseSCL, validateSCL, extractIEDs, extractCommunication } from '../utils/sclParser';
+import { generateMockIED } from '../utils/mockGenerator';
 
 interface DeviceConfiguratorProps {
   onSave: (ied: IEDNode) => void;
@@ -10,10 +11,11 @@ interface DeviceConfiguratorProps {
 }
 
 type Step = 'source' | 'configure' | 'network' | 'review';
+type ImportMode = 'modbus-slave' | 'modbus-master' | 'modbus-client' | 'scl' | 'demo';
 
 export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, onCancel, existingIEDs }) => {
   const [step, setStep] = useState<Step>('source');
-  const [importMode, setImportMode] = useState<'modbus' | 'scl'>('modbus');
+  const [importMode, setImportMode] = useState<ImportMode>('modbus-slave');
   const [sclContent, setSclContent] = useState<string>('');
   const [fileName, setFileName] = useState<string>('');
   const [parseError, setParseError] = useState<string | null>(null);
@@ -21,6 +23,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
   // SCL Import State
   const [availableIEDs, setAvailableIEDs] = useState<{name: string, desc: string, manufacturer: string}[]>([]);
   const [selectedImportIED, setSelectedImportIED] = useState<string>('');
+  const [sclRole, setSclRole] = useState<'server' | 'client'>('server');
   
   // Draft IED State (for SCL)
   const [draftIED, setDraftIED] = useState<IEDNode | null>(null);
@@ -28,17 +31,31 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
 
   // Modbus Configuration State
   const [modbusSettings, setModbusSettings] = useState({
-      name: 'Modbus_Device_01',
-      description: 'Generic Modbus TCP Slave',
+      name: 'New_Device',
+      description: 'Configured Device',
       port: 502,
       unitId: 1
   });
   
-  // Dynamic Register Map State
+  // Dynamic Register Map State (For Slaves)
   const [registers, setRegisters] = useState<ModbusRegister[]>([
       { address: 1, type: 'Coil', value: false, name: 'System Enable', description: 'Master control' },
       { address: 40001, type: 'HoldingRegister', value: 100, name: 'Setpoint A', description: 'Process Setpoint' }
   ]);
+
+  // Dynamic Polling List State (For Masters/Clients)
+  const [pollingTasks, setPollingTasks] = useState<PollingTask[]>([]);
+  const [newTask, setNewTask] = useState<PollingTask>({
+      id: '',
+      name: 'Read Status',
+      targetIp: '192.168.1.10',
+      port: 502,
+      unitId: 1,
+      functionCode: 3,
+      address: 40001,
+      count: 10,
+      interval: 1000
+  });
 
   // New Register Form State
   const [newReg, setNewReg] = useState<any>({
@@ -51,7 +68,8 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
     subnet: '255.255.255.0',
     gateway: '192.168.1.1',
     vlan: 10,
-    isDHCP: false
+    isDHCP: false,
+    role: 'server'
   });
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -87,9 +105,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
   };
 
   const processSource = () => {
-    if (importMode === 'modbus') {
-        setStep('configure');
-    } else {
+    if (importMode === 'scl') {
         if (!sclContent) {
             setParseError("Please upload a file first.");
             return;
@@ -100,14 +116,54 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
         }
 
         try {
+            // Parse Tree
             const ied = parseSCL(sclContent, selectedImportIED);
             setDraftIED(ied);
-            // Default to selecting all LDs
+            
+            // Auto-select all LDs
             setSelectedLDs(ied.children?.map(c => c.id) || []);
+            
+            // Extract Communication Config from SCL if available
+            const extractedConfig = extractCommunication(sclContent, selectedImportIED);
+            if (extractedConfig) {
+                setNetConfig(prev => ({
+                    ...prev,
+                    ip: extractedConfig.ip || prev.ip,
+                    subnet: extractedConfig.subnet || prev.subnet,
+                    gateway: extractedConfig.gateway || prev.gateway,
+                    role: sclRole // Apply selected role
+                }));
+            } else {
+                setNetConfig(prev => ({ ...prev, role: sclRole }));
+            }
+
             setStep('configure');
         } catch (err: any) {
             setParseError(err.message);
         }
+    } else if (importMode === 'demo') {
+        // Create Mock IED using generator (includes XCBR with SBO)
+        const mockName = `Demo_IED_${Math.floor(Math.random() * 1000)}`;
+        const ied = generateMockIED(mockName);
+        setDraftIED(ied);
+        setSelectedLDs(ied.children?.map(c => c.id) || []);
+        setNetConfig(prev => ({ ...prev, ip: '192.168.1.200', role: 'server' }));
+        setStep('configure');
+    } else {
+        // Modbus Modes
+        const defaults = {
+            'modbus-slave': { name: 'Modbus_Slave_01', desc: 'Modbus TCP Server', role: 'server' as const },
+            'modbus-master': { name: 'Modbus_Master_01', desc: 'Modbus TCP Scanner / Master', role: 'client' as const },
+            'modbus-client': { name: 'Modbus_Client_01', desc: 'Modbus TCP Client', role: 'client' as const }
+        };
+        const def = defaults[importMode as keyof typeof defaults];
+        setModbusSettings({
+            ...modbusSettings,
+            name: def.name,
+            description: def.desc
+        });
+        setNetConfig(prev => ({ ...prev, role: def.role }));
+        setStep('configure');
     }
   };
 
@@ -116,6 +172,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
     setSelectedLDs(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   };
 
+  // Register Map Logic
   const addRegister = () => {
       let val: any = newReg.value;
       if (typeof val === 'string') {
@@ -132,12 +189,57 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
       setRegisters(prev => prev.filter((_, i) => i !== index));
   };
 
+  // Polling Task Logic
+  const addPollingTask = () => {
+      setPollingTasks(prev => [...prev, { ...newTask, id: Date.now().toString() }]);
+      setNewTask({ ...newTask, name: 'Read Next Block', address: newTask.address + newTask.count });
+  };
+
+  const removePollingTask = (id: string) => {
+      setPollingTasks(prev => prev.filter(t => t.id !== id));
+  };
+
   const createModbusIED = (): IEDNode => {
       const id = `modbus-${Date.now()}`;
+      const isMaster = importMode === 'modbus-master' || importMode === 'modbus-client';
+      
       const finalConfig: IEDConfig = {
           ...netConfig,
-          modbusMap: registers
+          modbusMap: isMaster ? undefined : registers,
+          pollingList: isMaster ? pollingTasks : undefined
       };
+
+      // Create structure children
+      const children: IEDNode[] = [];
+      if (!isMaster) {
+          children.push({
+              id: `${id}-ld0`,
+              name: 'ModbusMap',
+              type: NodeType.LDevice,
+              path: `${modbusSettings.name}ModbusMap`,
+              description: `Port: ${modbusSettings.port}, ID: ${modbusSettings.unitId}`,
+              children: [
+                  {
+                      id: `${id}-ln-holding`,
+                      name: 'Registers',
+                      type: NodeType.LN,
+                      path: `${modbusSettings.name}ModbusMap/Registers`,
+                      description: `Mapped Registers (${registers.length})`,
+                      children: [] 
+                  }
+              ]
+          });
+      } else {
+          // Master device structure
+          children.push({
+              id: `${id}-scanner`,
+              name: 'Scanner',
+              type: NodeType.LDevice,
+              path: `${modbusSettings.name}/Scanner`,
+              description: `Polling Engine (${pollingTasks.length} tasks)`,
+              children: []
+          });
+      }
 
       return {
           id: id,
@@ -146,42 +248,25 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
           description: modbusSettings.description,
           path: modbusSettings.name,
           config: finalConfig,
-          children: [
-              {
-                  id: `${id}-ld0`,
-                  name: 'ModbusMap',
-                  type: NodeType.LDevice,
-                  path: `${modbusSettings.name}ModbusMap`,
-                  description: `Port: ${modbusSettings.port}, ID: ${modbusSettings.unitId}`,
-                  children: [
-                      {
-                          id: `${id}-ln-holding`,
-                          name: 'Registers',
-                          type: NodeType.LN,
-                          path: `${modbusSettings.name}ModbusMap/Registers`,
-                          description: `Mapped Registers (${registers.length})`,
-                          children: [] 
-                      }
-                  ]
-              }
-          ]
+          children
       };
   };
 
   const finalize = () => {
     let finalIED: IEDNode;
 
-    if (importMode === 'modbus') {
-        finalIED = createModbusIED();
-    } else {
+    if (importMode === 'scl' || importMode === 'demo') {
         if (!draftIED) return;
         const filteredChildren = draftIED.children?.filter(c => selectedLDs.includes(c.id)) || [];
         
         finalIED = {
             ...draftIED,
             children: filteredChildren,
-            config: netConfig
+            config: netConfig,
+            description: draftIED.description + (netConfig.role === 'client' ? ' [Client/Remote]' : ' [Server/Simulated]')
         };
+    } else {
+        finalIED = createModbusIED();
     }
     
     onSave(finalIED);
@@ -213,16 +298,34 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
             {/* Step 1: Source */}
             {step === 'source' && (
                 <div className="space-y-6">
-                    <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2">Select Device Source</h3>
+                    <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2">Select Device Role & Protocol</h3>
                     
-                    <div className="grid grid-cols-2 gap-6">
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
                         <button 
-                            onClick={() => setImportMode('modbus')}
-                            className={`p-6 border-2 rounded-xl text-left transition-all ${importMode === 'modbus' ? 'border-scada-accent bg-scada-accent/10' : 'border-scada-border hover:border-scada-muted bg-scada-panel'}`}
+                            onClick={() => setImportMode('modbus-slave')}
+                            className={`p-6 border-2 rounded-xl text-left transition-all ${importMode === 'modbus-slave' ? 'border-scada-accent bg-scada-accent/10' : 'border-scada-border hover:border-scada-muted bg-scada-panel'}`}
                         >
                             <Icons.Database className="w-8 h-8 mb-4 text-yellow-500" />
-                            <div className="font-bold text-lg mb-1">Modbus Slave Device</div>
-                            <div className="text-sm text-scada-muted">Configure a new Modbus TCP server/slave device with register mapping.</div>
+                            <div className="font-bold text-lg mb-1">Modbus Slave</div>
+                            <div className="text-xs text-scada-muted">Configures a TCP Server to expose local registers to other devices.</div>
+                        </button>
+
+                        <button 
+                            onClick={() => setImportMode('modbus-master')}
+                            className={`p-6 border-2 rounded-xl text-left transition-all ${importMode === 'modbus-master' ? 'border-scada-accent bg-scada-accent/10' : 'border-scada-border hover:border-scada-muted bg-scada-panel'}`}
+                        >
+                            <Icons.ArrowUpRight className="w-8 h-8 mb-4 text-purple-400" />
+                            <div className="font-bold text-lg mb-1">Modbus Master</div>
+                            <div className="text-xs text-scada-muted">Configures a Scanner to poll multiple slave devices cyclically.</div>
+                        </button>
+
+                        <button 
+                            onClick={() => setImportMode('modbus-client')}
+                            className={`p-6 border-2 rounded-xl text-left transition-all ${importMode === 'modbus-client' ? 'border-scada-accent bg-scada-accent/10' : 'border-scada-border hover:border-scada-muted bg-scada-panel'}`}
+                        >
+                            <Icons.Cable className="w-8 h-8 mb-4 text-blue-400" />
+                            <div className="font-bold text-lg mb-1">Modbus Client</div>
+                            <div className="text-xs text-scada-muted">Connects to a single remote server. Similar to Master but focused on peer connection.</div>
                         </button>
 
                         <button 
@@ -230,15 +333,23 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                             className={`p-6 border-2 rounded-xl text-left transition-all ${importMode === 'scl' ? 'border-scada-accent bg-scada-accent/10' : 'border-scada-border hover:border-scada-muted bg-scada-panel'}`}
                         >
                             <Icons.Upload className="w-8 h-8 mb-4 text-scada-success" />
-                            <div className="font-bold text-lg mb-1">Import SCL/CID File</div>
-                            <div className="text-sm text-scada-muted">Parse an existing IEC 61850 configuration file (SCD, CID, ICD).</div>
+                            <div className="font-bold text-lg mb-1">Import SCL</div>
+                            <div className="text-xs text-scada-muted">Parse an existing IEC 61850 configuration file (SCD, CID, ICD).</div>
+                        </button>
+
+                        <button 
+                            onClick={() => setImportMode('demo')}
+                            className={`p-6 border-2 rounded-xl text-left transition-all ${importMode === 'demo' ? 'border-scada-accent bg-scada-accent/10' : 'border-scada-border hover:border-scada-muted bg-scada-panel'}`}
+                        >
+                            <Icons.Zap className="w-8 h-8 mb-4 text-white" />
+                            <div className="font-bold text-lg mb-1">Demo IED</div>
+                            <div className="text-xs text-scada-muted">Creates a sample Bay Control Unit with XCBR and protection functions.</div>
                         </button>
                     </div>
 
                     {importMode === 'scl' && (
                         <div className="mt-8 space-y-4 animate-in fade-in slide-in-from-top-2">
-                            
-                            {/* File Upload Area */}
+                            {/* ... SCL Upload (Same as before) ... */}
                             <div className="bg-scada-panel p-6 rounded-lg border border-scada-border border-dashed hover:border-scada-accent/50 transition-colors">
                                 <div className="flex items-center justify-between">
                                     <div>
@@ -297,6 +408,48 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                             </div>
                                         ))}
                                     </div>
+                                    
+                                    {/* Role Selection after IED is picked */}
+                                    {selectedImportIED && (
+                                        <div className="mt-6 p-4 bg-scada-panel border border-scada-border rounded-lg animate-in slide-in-from-top-2">
+                                            <h4 className="text-sm font-bold text-white uppercase mb-3 flex items-center gap-2">
+                                                <Icons.Settings className="w-4 h-4 text-scada-accent" /> Role Configuration
+                                            </h4>
+                                            <div className="grid grid-cols-2 gap-4">
+                                                <label 
+                                                    className={`
+                                                        p-3 border rounded-lg cursor-pointer transition-all flex items-center gap-3
+                                                        ${sclRole === 'server' ? 'bg-scada-accent/20 border-scada-accent' : 'bg-scada-bg border-scada-border hover:border-scada-muted'}
+                                                    `}
+                                                >
+                                                    <input type="radio" name="role" value="server" checked={sclRole === 'server'} onChange={() => setSclRole('server')} className="hidden"/>
+                                                    <div className="p-2 bg-scada-panel rounded border border-scada-border">
+                                                        <Icons.Server className={`w-5 h-5 ${sclRole === 'server' ? 'text-scada-accent' : 'text-scada-muted'}`} />
+                                                    </div>
+                                                    <div>
+                                                        <div className="font-bold text-sm text-white">Server (Simulate)</div>
+                                                        <div className="text-xs text-scada-muted">Host this Data Model locally and simulate values.</div>
+                                                    </div>
+                                                </label>
+
+                                                <label 
+                                                    className={`
+                                                        p-3 border rounded-lg cursor-pointer transition-all flex items-center gap-3
+                                                        ${sclRole === 'client' ? 'bg-scada-accent/20 border-scada-accent' : 'bg-scada-bg border-scada-border hover:border-scada-muted'}
+                                                    `}
+                                                >
+                                                    <input type="radio" name="role" value="client" checked={sclRole === 'client'} onChange={() => setSclRole('client')} className="hidden"/>
+                                                    <div className="p-2 bg-scada-panel rounded border border-scada-border">
+                                                        <Icons.Cable className={`w-5 h-5 ${sclRole === 'client' ? 'text-blue-400' : 'text-scada-muted'}`} />
+                                                    </div>
+                                                    <div>
+                                                        <div className="font-bold text-sm text-white">Client (Connect)</div>
+                                                        <div className="text-xs text-scada-muted">Connect to the physical device IP and read DA values.</div>
+                                                    </div>
+                                                </label>
+                                            </div>
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -307,10 +460,11 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
             {/* Step 2: Configure (Preview) */}
             {step === 'configure' && (
                 <div className="space-y-6">
-                    {importMode === 'modbus' ? (
+                    {importMode !== 'scl' && importMode !== 'demo' ? (
                          <>
-                            <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2">Modbus Slave Settings</h3>
+                            <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2">Device Parameters</h3>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                {/* ... existing modbus fields ... */}
                                 <div className="space-y-2">
                                     <label className="text-sm font-bold text-scada-muted">Device Name</label>
                                     <input 
@@ -327,95 +481,182 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                         className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
                                     />
                                 </div>
-                                <div className="space-y-2">
-                                    <label className="text-sm font-bold text-scada-muted">TCP Port</label>
-                                    <input 
-                                        type="number" value={modbusSettings.port} 
-                                        onChange={e => setModbusSettings({...modbusSettings, port: parseInt(e.target.value)})}
-                                        className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
-                                    />
-                                </div>
-                                <div className="space-y-2">
-                                    <label className="text-sm font-bold text-scada-muted">Unit ID (Slave ID)</label>
-                                    <input 
-                                        type="number" value={modbusSettings.unitId} 
-                                        onChange={e => setModbusSettings({...modbusSettings, unitId: parseInt(e.target.value)})}
-                                        className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
-                                    />
-                                </div>
+                                {importMode === 'modbus-slave' && (
+                                    <>
+                                        <div className="space-y-2">
+                                            <label className="text-sm font-bold text-scada-muted">Listen Port</label>
+                                            <input 
+                                                type="number" value={modbusSettings.port} 
+                                                onChange={e => setModbusSettings({...modbusSettings, port: parseInt(e.target.value)})}
+                                                className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <label className="text-sm font-bold text-scada-muted">Unit ID (Slave ID)</label>
+                                            <input 
+                                                type="number" value={modbusSettings.unitId} 
+                                                onChange={e => setModbusSettings({...modbusSettings, unitId: parseInt(e.target.value)})}
+                                                className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
+                                            />
+                                        </div>
+                                    </>
+                                )}
                             </div>
 
-                            <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2 mt-4">Register Map</h3>
-                            
-                            {/* Add Register Form */}
-                            <div className="bg-scada-panel/50 p-4 rounded border border-scada-border flex flex-wrap gap-4 items-end">
-                                <div className="flex-1 min-w-[120px]">
-                                    <label className="text-xs font-bold text-scada-muted uppercase">Type</label>
-                                    <select 
-                                        value={newReg.type} 
-                                        onChange={e => setNewReg({...newReg, type: e.target.value as ModbusRegisterType})}
-                                        className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm"
-                                    >
-                                        <option value="Coil">Coil (0x)</option>
-                                        <option value="DiscreteInput">Discrete Input (1x)</option>
-                                        <option value="InputRegister">Input Register (3x)</option>
-                                        <option value="HoldingRegister">Holding Register (4x)</option>
-                                    </select>
-                                </div>
-                                <div className="flex-1 min-w-[80px]">
-                                    <label className="text-xs font-bold text-scada-muted uppercase">Address</label>
-                                    <input type="number" value={newReg.address} onChange={e => setNewReg({...newReg, address: parseInt(e.target.value)})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
-                                </div>
-                                <div className="flex-[2] min-w-[150px]">
-                                    <label className="text-xs font-bold text-scada-muted uppercase">Name</label>
-                                    <input type="text" value={newReg.name} onChange={e => setNewReg({...newReg, name: e.target.value})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
-                                </div>
-                                <div className="flex-1 min-w-[80px]">
-                                    <label className="text-xs font-bold text-scada-muted uppercase">Value</label>
-                                    <input type="text" value={String(newReg.value)} onChange={e => setNewReg({...newReg, value: e.target.value})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
-                                </div>
-                                <button onClick={addRegister} className="px-4 py-2 bg-scada-accent text-white rounded font-bold hover:bg-cyan-600 text-sm">
-                                    <Icons.Box className="w-4 h-4" /> Add
-                                </button>
-                            </div>
+                            {/* ... Modbus Editors ... */}
+                            {/* --- Slave: Register Map Editor --- */}
+                            {importMode === 'modbus-slave' && (
+                                <>
+                                    <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2 mt-4">Local Register Map</h3>
+                                    
+                                    <div className="bg-scada-panel/50 p-4 rounded border border-scada-border flex flex-wrap gap-4 items-end">
+                                        <div className="flex-1 min-w-[120px]">
+                                            <label className="text-xs font-bold text-scada-muted uppercase">Type</label>
+                                            <select 
+                                                value={newReg.type} 
+                                                onChange={e => setNewReg({...newReg, type: e.target.value as ModbusRegisterType})}
+                                                className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm"
+                                            >
+                                                <option value="Coil">Coil (0x)</option>
+                                                <option value="DiscreteInput">Discrete Input (1x)</option>
+                                                <option value="InputRegister">Input Register (3x)</option>
+                                                <option value="HoldingRegister">Holding Register (4x)</option>
+                                            </select>
+                                        </div>
+                                        <div className="flex-1 min-w-[80px]">
+                                            <label className="text-xs font-bold text-scada-muted uppercase">Address</label>
+                                            <input type="number" value={newReg.address} onChange={e => setNewReg({...newReg, address: parseInt(e.target.value)})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
+                                        </div>
+                                        <div className="flex-[2] min-w-[150px]">
+                                            <label className="text-xs font-bold text-scada-muted uppercase">Name</label>
+                                            <input type="text" value={newReg.name} onChange={e => setNewReg({...newReg, name: e.target.value})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
+                                        </div>
+                                        <div className="flex-1 min-w-[80px]">
+                                            <label className="text-xs font-bold text-scada-muted uppercase">Value</label>
+                                            <input type="text" value={String(newReg.value)} onChange={e => setNewReg({...newReg, value: e.target.value})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
+                                        </div>
+                                        <button onClick={addRegister} className="px-4 py-2 bg-scada-accent text-white rounded font-bold hover:bg-cyan-600 text-sm">
+                                            <Icons.Box className="w-4 h-4" /> Add
+                                        </button>
+                                    </div>
 
-                            {/* Register List */}
-                            <div className="border border-scada-border rounded overflow-hidden max-h-64 overflow-y-auto">
-                                <table className="w-full text-sm text-left">
-                                    <thead className="bg-scada-panel text-scada-muted text-xs uppercase font-mono sticky top-0">
-                                        <tr>
-                                            <th className="px-4 py-2">Type</th>
-                                            <th className="px-4 py-2">Addr</th>
-                                            <th className="px-4 py-2">Name</th>
-                                            <th className="px-4 py-2">Init Value</th>
-                                            <th className="px-4 py-2 w-10"></th>
-                                        </tr>
-                                    </thead>
-                                    <tbody className="divide-y divide-scada-border/30">
-                                        {registers.length === 0 && <tr><td colSpan={5} className="text-center py-4 text-scada-muted">No registers defined</td></tr>}
-                                        {registers.map((reg, i) => (
-                                            <tr key={i} className="hover:bg-white/5">
-                                                <td className="px-4 py-2">{reg.type}</td>
-                                                <td className="px-4 py-2 font-mono">{reg.address}</td>
-                                                <td className="px-4 py-2">{reg.name}</td>
-                                                <td className="px-4 py-2 font-mono">{String(reg.value)}</td>
-                                                <td className="px-4 py-2">
-                                                    <button onClick={() => removeRegister(i)} className="text-scada-danger hover:text-red-400">
-                                                        <Icons.Trash className="w-3 h-3" />
-                                                    </button>
-                                                </td>
-                                            </tr>
-                                        ))}
-                                    </tbody>
-                                </table>
-                            </div>
+                                    <div className="border border-scada-border rounded overflow-hidden max-h-64 overflow-y-auto">
+                                        <table className="w-full text-sm text-left">
+                                            <thead className="bg-scada-panel text-scada-muted text-xs uppercase font-mono sticky top-0">
+                                                <tr>
+                                                    <th className="px-4 py-2">Type</th>
+                                                    <th className="px-4 py-2">Addr</th>
+                                                    <th className="px-4 py-2">Name</th>
+                                                    <th className="px-4 py-2">Init Value</th>
+                                                    <th className="px-4 py-2 w-10"></th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-scada-border/30">
+                                                {registers.length === 0 && <tr><td colSpan={5} className="text-center py-4 text-scada-muted">No registers defined</td></tr>}
+                                                {registers.map((reg, i) => (
+                                                    <tr key={i} className="hover:bg-white/5">
+                                                        <td className="px-4 py-2">{reg.type}</td>
+                                                        <td className="px-4 py-2 font-mono">{reg.address}</td>
+                                                        <td className="px-4 py-2">{reg.name}</td>
+                                                        <td className="px-4 py-2 font-mono">{String(reg.value)}</td>
+                                                        <td className="px-4 py-2">
+                                                            <button onClick={() => removeRegister(i)} className="text-scada-danger hover:text-red-400">
+                                                                <Icons.Trash className="w-3 h-3" />
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </>
+                            )}
+
+                            {/* --- Master/Client: Polling List Editor --- */}
+                            {(importMode === 'modbus-master' || importMode === 'modbus-client') && (
+                                <>
+                                    <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2 mt-4">Polling Configuration</h3>
+                                    
+                                    <div className="bg-scada-panel/50 p-4 rounded border border-scada-border grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
+                                        <div className="col-span-1">
+                                            <label className="text-xs font-bold text-scada-muted uppercase">Task Name</label>
+                                            <input type="text" value={newTask.name} onChange={e => setNewTask({...newTask, name: e.target.value})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
+                                        </div>
+                                        <div className="col-span-1">
+                                            <label className="text-xs font-bold text-scada-muted uppercase">Target IP</label>
+                                            <input type="text" value={newTask.targetIp} onChange={e => setNewTask({...newTask, targetIp: e.target.value})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm font-mono" />
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <div>
+                                                <label className="text-xs font-bold text-scada-muted uppercase">Func</label>
+                                                <select value={newTask.functionCode} onChange={e => setNewTask({...newTask, functionCode: parseInt(e.target.value)})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm">
+                                                    <option value="1">01 (Coils)</option>
+                                                    <option value="2">02 (Disc)</option>
+                                                    <option value="3">03 (Hold)</option>
+                                                    <option value="4">04 (Input)</option>
+                                                </select>
+                                            </div>
+                                            <div>
+                                                <label className="text-xs font-bold text-scada-muted uppercase">Addr</label>
+                                                <input type="number" value={newTask.address} onChange={e => setNewTask({...newTask, address: parseInt(e.target.value)})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
+                                            </div>
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <div>
+                                                <label className="text-xs font-bold text-scada-muted uppercase">Count</label>
+                                                <input type="number" value={newTask.count} onChange={e => setNewTask({...newTask, count: parseInt(e.target.value)})} className="w-full bg-scada-bg border border-scada-border rounded p-2 text-sm" />
+                                            </div>
+                                            <button onClick={addPollingTask} className="px-4 py-2 bg-scada-accent text-white rounded font-bold hover:bg-cyan-600 text-sm h-[38px]">
+                                                <Icons.Box className="w-4 h-4" /> Add
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="border border-scada-border rounded overflow-hidden max-h-64 overflow-y-auto">
+                                        <table className="w-full text-sm text-left">
+                                            <thead className="bg-scada-panel text-scada-muted text-xs uppercase font-mono sticky top-0">
+                                                <tr>
+                                                    <th className="px-4 py-2">Task</th>
+                                                    <th className="px-4 py-2">Target</th>
+                                                    <th className="px-4 py-2">Function</th>
+                                                    <th className="px-4 py-2">Range</th>
+                                                    <th className="px-4 py-2">Interval</th>
+                                                    <th className="px-4 py-2 w-10"></th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-scada-border/30">
+                                                {pollingTasks.length === 0 && <tr><td colSpan={6} className="text-center py-4 text-scada-muted">No polling tasks defined</td></tr>}
+                                                {pollingTasks.map((task) => (
+                                                    <tr key={task.id} className="hover:bg-white/5">
+                                                        <td className="px-4 py-2 font-bold">{task.name}</td>
+                                                        <td className="px-4 py-2 font-mono text-scada-accent">{task.targetIp}</td>
+                                                        <td className="px-4 py-2">FC: {task.functionCode}</td>
+                                                        <td className="px-4 py-2 font-mono">{task.address} (x{task.count})</td>
+                                                        <td className="px-4 py-2 text-xs text-scada-muted">{task.interval}ms</td>
+                                                        <td className="px-4 py-2">
+                                                            <button onClick={() => removePollingTask(task.id)} className="text-scada-danger hover:text-red-400">
+                                                                <Icons.Trash className="w-3 h-3" />
+                                                            </button>
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </>
+                            )}
                          </>
                     ) : (
                         draftIED && (
                             <>
+                                {/* SCL / Demo Preview Logic */}
                                 <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2 flex items-center justify-between">
                                     <span>Import Preview: {draftIED.name}</span>
-                                    <span className="text-xs font-normal text-scada-muted font-mono">{draftIED.description}</span>
+                                    <div className="flex items-center gap-2">
+                                        <span className={`px-2 py-0.5 rounded-full text-xs uppercase font-bold border ${netConfig.role === 'client' ? 'text-blue-400 border-blue-400 bg-blue-400/10' : 'text-scada-accent border-scada-accent bg-scada-accent/10'}`}>
+                                            {netConfig.role === 'client' ? 'Client / Remote' : 'Server / Simulated'}
+                                        </span>
+                                    </div>
                                 </h3>
                                 
                                 <div className="space-y-4">
@@ -424,13 +665,11 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                         Select the Logical Devices (LDs) you wish to include in this import.
                                     </div>
 
-                                    {/* Tree View Preview */}
                                     <div className="border border-scada-border rounded-lg bg-scada-panel overflow-hidden">
                                         {draftIED.children?.map(ld => {
                                             const isSelected = selectedLDs.includes(ld.id);
                                             return (
                                                 <div key={ld.id} className="border-b border-scada-border last:border-0">
-                                                    {/* LD Header (Selectable) */}
                                                     <div 
                                                         onClick={(e) => toggleLD(ld.id, e)} 
                                                         className={`p-3 flex items-center justify-between cursor-pointer transition-colors ${isSelected ? 'bg-white/5' : 'hover:bg-white/5 opacity-75'}`}
@@ -451,19 +690,6 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                                             {ld.children?.length || 0} LNs
                                                         </div>
                                                     </div>
-
-                                                    {/* LN List (Preview only) */}
-                                                    {isSelected && ld.children && (
-                                                        <div className="bg-scada-bg/50 border-t border-scada-border/50 py-2 px-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
-                                                            {ld.children.map(ln => (
-                                                                <div key={ln.id} className="flex items-center gap-2 text-xs py-1 px-2 rounded hover:bg-white/5 text-scada-muted">
-                                                                    <Icons.Activity className="w-3 h-3 text-blue-400 shrink-0" />
-                                                                    <span className="font-mono">{ln.name}</span>
-                                                                    <span className="opacity-50 truncate ml-auto">{ln.description}</span>
-                                                                </div>
-                                                            ))}
-                                                        </div>
-                                                    )}
                                                 </div>
                                             );
                                         })}
@@ -478,7 +704,9 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
             {/* Step 3: Network */}
             {step === 'network' && (
                 <div className="space-y-6">
-                    <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2">Network Configuration</h3>
+                    <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2">
+                        {netConfig.role === 'client' ? 'Remote Connection Settings' : 'Network Configuration'}
+                    </h3>
                     
                     <div className="grid grid-cols-2 gap-6">
                          <div className="space-y-2">
@@ -536,12 +764,12 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                             <div>
                                 <div className="text-sm text-scada-muted uppercase">Device Name</div>
                                 <div className="text-xl font-bold text-scada-accent">
-                                    {importMode === 'modbus' ? modbusSettings.name : draftIED?.name}
+                                    {importMode === 'scl' || importMode === 'demo' ? draftIED?.name : modbusSettings.name}
                                 </div>
                             </div>
                             <div className="text-right">
                                 <div className="text-sm text-scada-muted uppercase">Type</div>
-                                <div className="font-mono">{importMode === 'modbus' ? 'Modbus TCP Slave' : 'IEC 61850 IED'}</div>
+                                <div className="font-mono uppercase">{importMode.replace(/-/g, ' ')}</div>
                             </div>
                         </div>
                         
@@ -557,16 +785,26 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                              <div>
                                 <div className="text-xs text-scada-muted uppercase mb-1">Details</div>
                                 <div className="font-mono text-sm">
-                                    {importMode === 'modbus' ? (
+                                    {importMode === 'modbus-slave' && (
                                         <>
                                             Port: {modbusSettings.port}<br/>
                                             Unit ID: {modbusSettings.unitId}<br/>
                                             Regs: {registers.length}
                                         </>
-                                    ) : (
+                                    )}
+                                    {(importMode === 'modbus-master' || importMode === 'modbus-client') && (
+                                        <>
+                                            Polling Tasks: {pollingTasks.length}<br/>
+                                            Status: Active Scanner
+                                        </>
+                                    )}
+                                    {(importMode === 'scl' || importMode === 'demo') && (
                                         <>
                                             {selectedLDs.length} Logical Devices<br/>
-                                            {draftIED?.children?.filter(c => selectedLDs.includes(c.id)).reduce((acc, curr) => acc + (curr.children?.length || 0), 0)} Logical Nodes
+                                            {draftIED?.children?.filter(c => selectedLDs.includes(c.id)).reduce((acc, curr) => acc + (curr.children?.length || 0), 0)} Logical Nodes<br/>
+                                            Role: <span className={netConfig.role === 'client' ? 'text-blue-400 font-bold' : 'text-scada-success font-bold'}>
+                                                {netConfig.role === 'client' ? 'CLIENT (Remote)' : 'SERVER (Simulated)'}
+                                            </span>
                                         </>
                                     )}
                                 </div>

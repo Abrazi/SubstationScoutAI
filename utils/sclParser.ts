@@ -1,5 +1,5 @@
 
-import { IEDNode, NodeType } from '../types';
+import { IEDNode, NodeType, IEDConfig } from '../types';
 import { LOGICAL_NODE_DESCRIPTIONS } from '../constants';
 
 let idCounter = 10000;
@@ -218,6 +218,57 @@ export const extractIEDs = (xmlText: string): { name: string; desc: string; manu
         desc: ied.getAttribute('desc') || '',
         manufacturer: ied.getAttribute('manufacturer') || ''
     }));
+};
+
+// Helper to extract Communication IP parameters
+export const extractCommunication = (xmlText: string, iedName: string): Partial<IEDConfig> | null => {
+    try {
+        const parser = new DOMParser();
+        const xmlDoc = parser.parseFromString(xmlText, "text/xml");
+        const communication = xmlDoc.querySelector('Communication');
+        
+        if (!communication) return null;
+
+        // Find ConnectedAP for this IED
+        // Structure: Communication -> SubNetwork -> ConnectedAP
+        let targetAp: Element | null = null;
+        const subNetworks = communication.querySelectorAll('SubNetwork');
+        
+        for (let i = 0; i < subNetworks.length; i++) {
+            const sn = subNetworks[i];
+            const aps = sn.querySelectorAll('ConnectedAP');
+            for (let j = 0; j < aps.length; j++) {
+                if (aps[j].getAttribute('iedName') === iedName) {
+                    targetAp = aps[j];
+                    break;
+                }
+            }
+            if (targetAp) break;
+        }
+
+        if (!targetAp) return null;
+
+        const address = targetAp.querySelector('Address');
+        if (!address) return null;
+
+        const config: Partial<IEDConfig> = {};
+        
+        address.querySelectorAll('P').forEach(p => {
+            const type = p.getAttribute('type');
+            const val = p.textContent?.trim();
+            if (val) {
+                if (type === 'IP') config.ip = val;
+                if (type === 'IP-SUBNET') config.subnet = val;
+                if (type === 'Gateway') config.gateway = val;
+            }
+        });
+
+        return config;
+
+    } catch (e) {
+        console.error("Failed to extract communication parameters", e);
+        return null;
+    }
 };
 
 export const parseSCL = (xmlText: string, targetIEDName?: string): IEDNode => {

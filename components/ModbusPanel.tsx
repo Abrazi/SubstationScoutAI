@@ -9,6 +9,7 @@ interface ModbusPanelProps {
   onSelectNode: (node: IEDNode) => void;
   onUpdateNode: (node: IEDNode) => void;
   onAddToWatch?: (item: WatchItem) => void;
+  onDeleteNode?: (id: string) => void;
 }
 
 // Default Fallback if no custom map exists
@@ -23,7 +24,7 @@ const DEFAULT_REGISTERS: ModbusRegister[] = [
   { address: 40002, type: 'HoldingRegister', value: 1000, name: 'Reclose Delay', description: 'ms' },
 ];
 
-export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList, onSelectNode, onUpdateNode, onAddToWatch }) => {
+export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList, onSelectNode, onUpdateNode, onAddToWatch, onDeleteNode }) => {
   const [view, setView] = useState<'map' | 'config'>('map');
   const [activeTab, setActiveTab] = useState<ModbusRegisterType>('Coil');
   const [searchTerm, setSearchTerm] = useState('');
@@ -224,20 +225,32 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
            </p>
         </div>
         
-        {/* View Switcher */}
-        <div className="flex bg-scada-bg rounded p-1 border border-scada-border">
-            <button 
-                onClick={() => setView('map')}
-                className={`px-4 py-1.5 text-sm rounded transition-all font-medium flex items-center gap-2 ${view === 'map' ? 'bg-scada-panel text-white shadow ring-1 ring-scada-border' : 'text-scada-muted hover:text-white'}`}
-            >
-                <Icons.Database className="w-4 h-4" /> Memory Map
-            </button>
-            <button 
-                onClick={() => setView('config')}
-                className={`px-4 py-1.5 text-sm rounded transition-all font-medium flex items-center gap-2 ${view === 'config' ? 'bg-scada-panel text-white shadow ring-1 ring-scada-border' : 'text-scada-muted hover:text-white'}`}
-            >
-                <Icons.Settings className="w-4 h-4" /> Configuration
-            </button>
+        {/* Actions & View Switcher */}
+        <div className="flex items-center gap-3">
+            {onDeleteNode && (
+                <button 
+                    onClick={() => onDeleteNode(selectedNode.id)}
+                    className="flex items-center gap-2 px-3 py-1.5 bg-scada-danger/10 hover:bg-scada-danger/20 border border-scada-danger/30 text-scada-danger rounded text-sm transition-colors"
+                    title={`Delete ${selectedNode.name}`}
+                >
+                    <Icons.Trash className="w-4 h-4" />
+                </button>
+            )}
+
+            <div className="flex bg-scada-bg rounded p-1 border border-scada-border">
+                <button 
+                    onClick={() => setView('map')}
+                    className={`px-4 py-1.5 text-sm rounded transition-all font-medium flex items-center gap-2 ${view === 'map' ? 'bg-scada-panel text-white shadow ring-1 ring-scada-border' : 'text-scada-muted hover:text-white'}`}
+                >
+                    <Icons.Database className="w-4 h-4" /> Memory Map
+                </button>
+                <button 
+                    onClick={() => setView('config')}
+                    className={`px-4 py-1.5 text-sm rounded transition-all font-medium flex items-center gap-2 ${view === 'config' ? 'bg-scada-panel text-white shadow ring-1 ring-scada-border' : 'text-scada-muted hover:text-white'}`}
+                >
+                    <Icons.Settings className="w-4 h-4" /> Configuration
+                </button>
+            </div>
         </div>
       </div>
 
@@ -349,6 +362,7 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
           </>
       ) : (
           <div className="flex-1 overflow-auto p-8">
+                {/* ... (Existing Config View Content - Unchanged) ... */}
                 <div className="max-w-4xl mx-auto space-y-8">
                     {/* Server Status Card */}
                     <div className="bg-scada-panel border border-scada-border rounded-lg p-6">

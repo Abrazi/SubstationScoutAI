@@ -6,6 +6,7 @@ import { engine } from '../services/SimulationEngine';
 interface NetworkTopologyProps {
   ieds: IEDNode[];
   onSelectIED: (id: string) => void;
+  onDeleteIED: (id: string) => void;
   simulationTime: number; // Used to trigger traffic generation
 }
 
@@ -24,7 +25,7 @@ const VLAN_CONFIG = {
   1:  { name: 'Management', color: '#64748b', subnet: '192.168.1' } // Slate
 };
 
-export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelectIED, simulationTime }) => {
+export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelectIED, onDeleteIED, simulationTime }) => {
   // Transform IEDs into Network Nodes for visualization
   const { nodes, links } = useMemo(() => {
     // Central Switch Configuration
@@ -329,14 +330,26 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                     }`}></span>
                 </div>
                 
-                {/* Enhanced Tooltip Label */}
+                {/* Enhanced Tooltip Label with Delete Button */}
                 <div className={`
-                    absolute top-14 left-1/2 -translate-x-1/2 px-3 py-2 bg-scada-panel/95 backdrop-blur rounded-md border border-scada-border text-center min-w-[140px] pointer-events-none 
+                    absolute top-14 left-1/2 -translate-x-1/2 px-3 py-2 bg-scada-panel/95 backdrop-blur rounded-md border border-scada-border min-w-[140px] 
                     transition-all duration-200 shadow-xl z-30
                     ${node.type === 'switch' ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 translate-y-2 group-hover:translate-y-0'}
                 `}>
-                    <div className="text-xs font-bold text-white whitespace-nowrap mb-1">{node.name}</div>
-                    <div className="flex flex-col gap-0.5">
+                    <div className="flex justify-between items-start mb-1">
+                        <div className="text-xs font-bold text-white whitespace-nowrap">{node.name}</div>
+                        {node.type === 'ied' && (
+                            <button 
+                                onClick={(e) => { e.stopPropagation(); onDeleteIED(node.id); }} 
+                                className="text-scada-danger hover:text-red-400 p-0.5 ml-2 hover:bg-white/10 rounded transition-colors"
+                                title="Remove Device"
+                            >
+                                <Icons.Trash className="w-3 h-3" />
+                            </button>
+                        )}
+                    </div>
+                    
+                    <div className="flex flex-col gap-0.5 pointer-events-none">
                         <div className="flex items-center justify-between gap-4 text-[10px] font-mono text-scada-muted">
                             <span>IP:</span>
                             <span className="text-scada-accent">{node.ip}</span>

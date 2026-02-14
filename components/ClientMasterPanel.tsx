@@ -26,6 +26,7 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
 
   // MMS State
   const [mmsPath, setMmsPath] = useState('IED_Bay_01_Main/LD0/MMXU1.PhV.phsA.mag');
+  const [mmsWriteValue, setMmsWriteValue] = useState('');
 
   // Auto-scroll log
   useEffect(() => {
@@ -135,7 +136,8 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
           return;
       }
 
-      addLog('request', 'MMS', `TX > ${action.toUpperCase()} ${mmsPath}`);
+      const valDisplay = action === 'write' ? `=${mmsWriteValue}` : '';
+      addLog('request', 'MMS', `TX > ${action.toUpperCase()} ${mmsPath}${valDisplay}`);
 
        setTimeout(() => {
            // Resolve Target (Simulated)
@@ -151,9 +153,18 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                        addLog('error', 'MMS', `RX < DataObject Not Found`, undefined, 'error');
                    }
                } else if (action === 'write') {
-                   // Mock write value prompt or use a state
-                   // For demo, just toggling boolean or setting 1
-                   addLog('error', 'MMS', `Write not implemented in demo UI`, undefined, 'error');
+                   // Type Inference
+                   let valToWrite: any = mmsWriteValue;
+                   if (mmsWriteValue.toLowerCase() === 'true') valToWrite = true;
+                   else if (mmsWriteValue.toLowerCase() === 'false') valToWrite = false;
+                   else if (!isNaN(Number(mmsWriteValue)) && mmsWriteValue.trim() !== '') valToWrite = Number(mmsWriteValue);
+
+                   const res = engine.writeMMS(mmsPath, valToWrite, 'MasterClient');
+                   if (res.success) {
+                       addLog('response', 'MMS', `RX < Write Success`, valToWrite, 'success');
+                   } else {
+                       addLog('error', 'MMS', `RX < Write Failed`, undefined, 'error');
+                   }
                } else if (action === 'select') {
                    const res = engine.selectControl(mmsPath, 'MasterClient');
                    if (res.success) {
@@ -334,6 +345,18 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                             <p className="text-[10px] text-scada-muted">Example: IED_Bay_01_Main/LD0/MMXU1.PhV.phsA.mag</p>
                         </div>
 
+                        <div className="space-y-1">
+                            <label className="text-xs font-bold text-gray-400">Write Value (Optional)</label>
+                            <input 
+                                type="text" 
+                                value={mmsWriteValue} 
+                                onChange={(e) => setMmsWriteValue(e.target.value)}
+                                placeholder="Value to write..."
+                                disabled={!isConnected}
+                                className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-white font-mono text-xs focus:border-scada-accent outline-none disabled:opacity-50"
+                            />
+                        </div>
+
                         <div className="grid grid-cols-2 gap-2 mt-4">
                             <button 
                                 onClick={() => sendMmsRequest('read')}
@@ -350,8 +373,9 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                                 Select (SBO)
                             </button>
                             <button 
-                                disabled={true} // Not implemented in this demo view fully
-                                className="py-2 bg-scada-border text-scada-muted rounded font-bold text-xs cursor-not-allowed opacity-50 col-span-2"
+                                onClick={() => sendMmsRequest('write')}
+                                disabled={!isConnected}
+                                className="py-2 bg-purple-500/10 border border-purple-500/50 text-purple-400 rounded font-bold text-xs hover:bg-purple-500/20 disabled:opacity-50 col-span-2"
                             >
                                 SetDataValues (Write)
                             </button>

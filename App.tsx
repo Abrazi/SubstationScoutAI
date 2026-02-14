@@ -12,6 +12,7 @@ import { DeviceConfigurator } from './components/DeviceConfigurator';
 import { NetworkTap } from './components/NetworkTap';
 import { WatchListPanel } from './components/WatchListPanel';
 import { ClientMasterPanel } from './components/ClientMasterPanel';
+import { DeviceList } from './components/DeviceList';
 import { generateMockIED } from './utils/mockGenerator';
 import { analyzeSCLFile } from './services/geminiService';
 import { parseSCL, validateSCL } from './utils/sclParser';
@@ -53,19 +54,18 @@ const collectDataAttributes = (node: IEDNode, map: Map<string, any>) => {
 };
 
 const App = () => {
-  const [viewMode, setViewMode] = useState<ViewMode>('dashboard');
+  const [viewMode, setViewMode] = useState<ViewMode | 'devices'>('dashboard');
   
   // Initialize IEDs lazily to ensure stable IDs and references
-  const [iedList, setIedList] = useState<IEDNode[]>(() => [
-      generateMockIED(MOCK_IED_NAMES[0]), 
-      generateMockIED(MOCK_IED_NAMES[1]), 
-      generateMockIED(MOCK_IED_NAMES[2])
-  ]);
+  // CHANGED: Start with empty list to remove mock devices
+  const [iedList, setIedList] = useState<IEDNode[]>([]);
   
-  const [selectedIED, setSelectedIED] = useState<IEDNode | null>(() => iedList[0]);
-  const [selectedNode, setSelectedNode] = useState<IEDNode | null>(() => iedList[0]);
+  const [selectedIED, setSelectedIED] = useState<IEDNode | null>(null);
+  const [selectedNode, setSelectedNode] = useState<IEDNode | null>(null);
   
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [rightSidebarOpen, setRightSidebarOpen] = useState(true); // Watch List / AI Sidebar
+
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [simulationTime, setSimulationTime] = useState(0);
 
@@ -102,6 +102,11 @@ const App = () => {
             }
         });
     });
+
+    // Auto-adjust layout for smaller screens
+    if (window.innerWidth < 1280) {
+        setRightSidebarOpen(false);
+    }
 
   }, []); // Run once on mount
 
@@ -142,6 +147,11 @@ const App = () => {
     setSelectedNode(ied);
     setViewMode('network');
     
+    // Register data with engine immediately
+    const newData = new Map<string, any>();
+    collectDataAttributes(ied, newData);
+    engine.initializeData(newData);
+
     // Log creation
     setLogs(prev => [...prev, {
         id: Date.now().toString(),
@@ -173,30 +183,52 @@ const App = () => {
 
   const handleRemoveIED = (id: string) => {
       const iedToRemove = iedList.find(i => i.id === id);
-      if (!iedToRemove) return;
+      if (!iedToRemove) {
+          console.error(`Attempted to delete non-existent IED: ${id}`);
+          return;
+      }
 
-      if (window.confirm(`Are you sure you want to permanently remove device "${iedToRemove.name}"? This cannot be undone.`)) {
-          // Remove from engine logic
-          engine.unregisterDevice(iedToRemove.id); 
-          
-          // Remove from list
-          const newList = iedList.filter(i => i.id !== id);
-          setIedList(newList);
-          
-          // Log
-          setLogs(prev => [...prev, {
-              id: Date.now().toString(),
-              timestamp: new Date().toISOString(),
-              source: 'System',
-              level: 'warning',
-              message: `Device removed: ${iedToRemove.name}`
-          }]);
+      // CHANGED: Direct deletion without window.confirm
+      // Remove from engine logic
+      engine.unregisterDevice(iedToRemove.id); 
+      
+      // Remove from list
+      const newList = iedList.filter(i => i.id !== id);
+      setIedList(newList);
+      
+      // Log
+      setLogs(prev => [...prev, {
+          id: Date.now().toString(),
+          timestamp: new Date().toISOString(),
+          source: 'System',
+          level: 'warning',
+          message: `Device removed: ${iedToRemove.name}`
+      }]);
 
-          // Adjust selection if needed
-          if (selectedIED?.id === id) {
-              const next = newList.length > 0 ? newList[0] : null;
-              setSelectedIED(next);
-              setSelectedNode(next);
+      // Adjust selection if needed - ensure we don't hold onto a dead reference
+      if (selectedIED?.id === id) {
+          const next = newList.length > 0 ? newList[0] : null;
+          setSelectedIED(next);
+          setSelectedNode(next);
+          // If we are on a specific device view, maybe fallback to dashboard
+          if (viewMode === 'modbus' || viewMode === 'explorer') {
+              if(!next) setViewMode('dashboard');
+          }
+      }
+  };
+
+  const handleDeviceListSelect = (id: string, mode: 'configure' | 'view') => {
+      const ied = iedList.find(i => i.id === id);
+      if (ied) {
+          setSelectedIED(ied);
+          setSelectedNode(ied);
+          
+          if (mode === 'configure' && ied.config?.modbusMap) {
+              setViewMode('modbus'); // Or handle config view specifically
+          } else if (ied.config?.modbusMap) {
+               setViewMode('modbus');
+          } else {
+               setViewMode('explorer');
           }
       }
   };
@@ -215,6 +247,8 @@ const App = () => {
         
         return [...prev, item];
     });
+    // Auto-open the panel to show the user the watch list
+    setRightSidebarOpen(true);
   };
 
   const handleRemoveFromWatch = (id: string) => {
@@ -242,6 +276,11 @@ const App = () => {
         setSelectedIED(parsedIED);
         setSelectedNode(parsedIED);
         setViewMode('network');
+        
+        // Register data
+        const newData = new Map<string, any>();
+        collectDataAttributes(parsedIED, newData);
+        engine.initializeData(newData);
         
         setFileAnalysis("SCL Imported Successfully. Running AI Analysis...");
         const analysis = await analyzeSCLFile(text);
@@ -274,12 +313,13 @@ const App = () => {
 
         <nav className="flex-1 py-4 space-y-1 px-2">
            <NavItem icon={Icons.Dashboard} label="Dashboard" active={viewMode === 'dashboard'} onClick={() => setViewMode('dashboard')} collapsed={!sidebarOpen} />
+           <NavItem icon={Icons.List} label="Device List" active={viewMode === 'devices'} onClick={() => setViewMode('devices')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Wifi} label="Network Topology" active={viewMode === 'network'} onClick={() => setViewMode('network')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Activity} label="Network Tap" active={viewMode === 'tap'} onClick={() => setViewMode('tap')} collapsed={!sidebarOpen} />
-           <NavItem icon={Icons.Tree} label="IED Explorer" active={viewMode === 'explorer'} onClick={() => setViewMode('explorer')} collapsed={!sidebarOpen} />
            
            <div className="my-2 border-t border-scada-border/50 mx-2"></div>
            
+           <NavItem icon={Icons.Tree} label="IEC 61850 Explorer" active={viewMode === 'explorer'} onClick={() => setViewMode('explorer')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Cable} label="Client & Master" active={viewMode === 'client'} onClick={() => setViewMode('client')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Settings} label="Device Configurator" active={viewMode === 'config'} onClick={() => setViewMode('config')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Database} label="Modbus Slave" active={viewMode === 'modbus'} onClick={() => setViewMode('modbus')} collapsed={!sidebarOpen} />
@@ -308,9 +348,10 @@ const App = () => {
       <div className="flex-1 flex flex-col h-full relative overflow-hidden">
         
         {/* 2. Top Header */}
-        <header className="h-16 border-b border-scada-border bg-scada-panel/50 backdrop-blur flex items-center justify-between px-6 z-20">
+        <header className="h-16 border-b border-scada-border bg-scada-panel/50 backdrop-blur flex items-center justify-between px-6 z-20 shrink-0">
             <h1 className="text-lg font-medium text-white/90">
                 {viewMode === 'dashboard' && 'System Dashboard'}
+                {viewMode === 'devices' && 'All Device Explorer'}
                 {viewMode === 'network' && 'Network Simulation & Topology'}
                 {viewMode === 'tap' && 'Packet Analyzer (vTAP)'}
                 {viewMode === 'explorer' && 'IEC 61850 Data Model'}
@@ -325,10 +366,15 @@ const App = () => {
                     <button className="p-1.5 hover:bg-white/10 rounded text-scada-success" title="Run Simulation" onClick={() => engine.start()}><Icons.Play className="w-4 h-4" /></button>
                     <button className="p-1.5 hover:bg-white/10 rounded text-scada-danger" title="Stop" onClick={() => engine.stop()}><Icons.Stop className="w-4 h-4" /></button>
                  </div>
-                 <div className="flex items-center gap-2 text-xs text-scada-accent bg-scada-accent/10 px-3 py-1.5 rounded-full border border-scada-accent/20">
-                    <Icons.Activity className="w-3 h-3 animate-pulse" />
-                    <span>Live Simulation</span>
-                </div>
+                 
+                 {/* Right Sidebar Toggle (Watch List) */}
+                 <button 
+                    onClick={() => setRightSidebarOpen(!rightSidebarOpen)}
+                    className={`p-2 rounded-md transition-colors ${rightSidebarOpen ? 'bg-scada-accent/10 text-scada-accent' : 'text-scada-muted hover:bg-white/5'}`}
+                    title="Toggle Watch List & AI"
+                >
+                    <Icons.List className="w-5 h-5" />
+                </button>
             </div>
         </header>
 
@@ -352,9 +398,13 @@ const App = () => {
                                 }}
                                 className="w-full bg-scada-bg border border-scada-border rounded-md pl-3 pr-8 py-2 text-sm text-white focus:border-scada-accent focus:ring-1 focus:ring-scada-accent outline-none appearance-none transition-all hover:border-scada-muted cursor-pointer font-medium truncate"
                             >
-                                {iedList.map(ied => (
-                                    <option key={ied.id} value={ied.id}>{ied.name}</option>
-                                ))}
+                                {iedList.length === 0 ? (
+                                    <option value="">No Devices</option>
+                                ) : (
+                                    iedList.map(ied => (
+                                        <option key={ied.id} value={ied.id}>{ied.name}</option>
+                                    ))
+                                )}
                             </select>
                             <Icons.ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-scada-muted pointer-events-none group-hover:text-white transition-colors" />
                         </div>
@@ -374,9 +424,22 @@ const App = () => {
                             onUpdateNode={handleUpdateIED}
                         />
                     )}
+
+                    {viewMode === 'devices' && (
+                        <DeviceList 
+                            ieds={iedList} 
+                            onSelect={handleDeviceListSelect}
+                            onDelete={handleRemoveIED}
+                        />
+                    )}
                     
                     {viewMode === 'network' && (
-                        <NetworkTopology ieds={iedList} onSelectIED={handleTopologySelect} simulationTime={simulationTime} />
+                        <NetworkTopology 
+                            ieds={iedList} 
+                            onSelectIED={handleTopologySelect}
+                            onDeleteIED={handleRemoveIED} 
+                            simulationTime={simulationTime} 
+                        />
                     )}
 
                     {viewMode === 'tap' && (
@@ -402,6 +465,7 @@ const App = () => {
                             }}
                             onUpdateNode={handleUpdateIED}
                             onAddToWatch={handleAddToWatch}
+                            onDeleteNode={handleRemoveIED}
                         />
                     )}
 
@@ -439,8 +503,8 @@ const App = () => {
                 </div>
             </div>
 
-            {/* 4. Right Panel: AI & Watch List */}
-            <div className="w-80 border-l border-scada-border bg-scada-panel hidden 2xl:flex flex-col">
+            {/* 4. Right Panel: AI & Watch List (Toggleable Window) */}
+            <div className={`${rightSidebarOpen ? 'w-80 border-l' : 'w-0'} border-scada-border bg-scada-panel flex flex-col transition-all duration-300 overflow-hidden`}>
                 <div className="h-2/3 min-h-[300px] border-b border-scada-border">
                     <AIChat currentIED={selectedIED} />
                 </div>

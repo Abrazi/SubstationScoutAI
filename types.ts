@@ -18,6 +18,18 @@ export interface DashboardWidget {
   config?: any; // For future extensibility (e.g. selecting specific registers)
 }
 
+export interface PollingTask {
+  id: string;
+  name: string;
+  targetIp: string;
+  port: number;
+  unitId: number;
+  functionCode: number;
+  address: number;
+  count: number;
+  interval: number; // ms
+}
+
 export interface IEDConfig {
   ip: string;
   subnet: string;
@@ -25,7 +37,9 @@ export interface IEDConfig {
   vlan: number;
   mac?: string;
   isDHCP?: boolean;
-  modbusMap?: ModbusRegister[]; // Custom Register Map
+  role?: 'server' | 'client'; // New: Distinguish simulation vs connection
+  modbusMap?: ModbusRegister[]; // Custom Register Map (Slave)
+  pollingList?: PollingTask[]; // Polling Configuration (Master/Client)
 }
 
 export interface IEDNode {
@@ -97,7 +111,7 @@ export interface SimulationData {
   breakerStatus: boolean; // true = closed, false = open
 }
 
-export type ViewMode = 'explorer' | 'dashboard' | 'ai-analysis' | 'network' | 'modbus' | 'logic' | 'config' | 'tap' | 'client';
+export type ViewMode = 'explorer' | 'dashboard' | 'ai-analysis' | 'network' | 'modbus' | 'logic' | 'config' | 'tap' | 'client' | 'devices';
 
 export interface ChatMessage {
   id: string;

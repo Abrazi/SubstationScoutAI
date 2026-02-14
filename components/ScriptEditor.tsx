@@ -87,9 +87,19 @@ const parseSFC = (code: string): SFCNode[] => {
     const lines = code.split('\n');
     const stateNames = new Map<string, string>(); 
     
-    // 0. Detect Initial Step (heuristic)
+    // 0. Detect which state variable name is used (not always `state`) and initial-step heuristic
     let initialStepId: string | null = null;
-    const initMatch = code.match(/IF\s+state\s*=\s*undefined\s+THEN\s+state\s*:=\s*(STATE_\w+)/);
+    let stateVarName = 'state';
+
+    // Try to detect the state variable by scanning for IF <var> = STATE_... or assignments like <var> := STATE_...
+    const stateVarMatch = code.match(/IF\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*STATE_\w+/i) || code.match(/([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*STATE_\w+/i);
+    if (stateVarMatch) {
+        stateVarName = stateVarMatch[1];
+    }
+
+    // initial-step detection using the discovered state variable
+    const initRegex = new RegExp(`IF\\s+${stateVarName}\\s*=\\s*undefined\\s+THEN\\s+${stateVarName}\\s*:=\\s*(STATE_\\w+)`, 'i');
+    const initMatch = code.match(initRegex);
     if (initMatch) initialStepId = initMatch[1];
 
     // 1. Find States Constants
@@ -125,11 +135,12 @@ const parseSFC = (code: string): SFCNode[] => {
         // Skip empty lines or pure multi-line comment delimiters if they are on a single line
         if (!trimmed || trimmed === '(*' || trimmed === '*)') continue;
 
-        // Detect Step Block Start
-        const stepMatch = trimmed.match(/(?:IF|ELSIF)\s+state\s*=\s*(STATE_\w+)\s+THEN/);
+        // Detect Step Block Start (use discovered state variable name)
+        const stepRe = new RegExp(`(?:IF|ELSIF)\\s+${stateVarName}\\s*=\\s*(STATE_\\w+)\\s+THEN`, 'i');
+        const stepMatch = trimmed.match(stepRe);
         
         // Close previous step if we hit a new block starter or end
-        if (stepMatch || trimmed === 'END_IF;' || trimmed.startsWith('ELSE')) {
+        if (stepMatch || trimmed.toUpperCase() === 'END_IF;' || trimmed.toUpperCase().startsWith('ELSE')) {
             if (currentStep) {
                 const node = nodes.find(n => n.id === currentStep);
                 if (node) {
@@ -151,12 +162,9 @@ const parseSFC = (code: string): SFCNode[] => {
             const node = nodes.find(n => n.id === currentStep);
             if (!node) continue;
 
-            // Detect Transition Block (IF cond THEN state := target)
-            // Simple heuristic: IF ... THEN state := ...
-            // We need to handle single line and multi-line IFs reasonably well without a full parser
-            
-            // Check for inline transition: IF cond THEN state := TARGET; END_IF;
-            const inlineTrans = trimmed.match(/^IF\s+(.+)\s+THEN\s+state\s*:=\s*(STATE_\w+);\s*END_IF;/);
+            // Detect Transition Block (IF cond THEN <stateVar> := target)
+            // Check for inline transition: IF cond THEN <stateVar> := TARGET; END_IF;
+            const inlineTrans = trimmed.match(new RegExp(`^IF\\s+(.+)\\s+THEN\\s+${stateVarName}\\s*:=\\s*(STATE_\\w+);\\s*END_IF;`, 'i'));
             if (inlineTrans && stateNames.has(inlineTrans[2])) {
                  node.transitions.push({
                     target: inlineTrans[2],
@@ -170,12 +178,10 @@ const parseSFC = (code: string): SFCNode[] => {
             }
 
             // Check for multiline transition start: IF cond THEN
-            const transStartMatch = trimmed.match(/^IF\s+(.+)\s+THEN/);
+            const transStartMatch = trimmed.match(/^IF\s+(.+)\s+THEN/i);
             
             if (transStartMatch) {
-                // Check if this IF block contains a state assignment in the immediate next lines
-                // This is a naive check to separate transitions from normal logic
-                // We scan forward looking for `state := ...` at depth 1
+                // Scan forward looking for `<stateVar> := ...` at depth 1
                 let isTransition = false;
                 let targetState = '';
                 let j = i;
@@ -183,14 +189,13 @@ const parseSFC = (code: string): SFCNode[] => {
                 let depth = 1;
                 let foundAssign = false;
                 
-                // Scan forward limited lines to prevent hang on huge files
                 while (j < lines.length - 1 && j < i + 20) { 
                     j++;
                     const nextTrim = lines[j].trim();
-                    if (nextTrim.startsWith('IF ') && nextTrim.endsWith('THEN')) depth++;
-                    if (nextTrim === 'END_IF;') depth--;
+                    if (/^IF\s+/i.test(nextTrim) && /\bTHEN$/i.test(nextTrim)) depth++;
+                    if (/^END_IF;$/i.test(nextTrim)) depth--;
                     
-                    const assignMatch = nextTrim.match(/state\s*:=\s*(STATE_\w+)/);
+                    const assignMatch = nextTrim.match(new RegExp(`${stateVarName}\\s*:=\\s*(STATE_\\w+)`, 'i'));
                     if (assignMatch && depth >= 1) {
                         foundAssign = true;
                         targetState = assignMatch[1];
@@ -213,14 +218,13 @@ const parseSFC = (code: string): SFCNode[] => {
                         blockEndIndex: blockEnd
                     });
                     
-                    // Advance outer loop to skip this block
                     i = blockEnd; 
                     continue;
                 }
             }
             
-            // Simple direct assignment transition: state := TARGET
-            const simpleAssign = trimmed.match(/^state\s*:=\s*(STATE_\w+)/);
+            // Simple direct assignment transition: <stateVar> := TARGET
+            const simpleAssign = trimmed.match(new RegExp(`^${stateVarName}\\s*:=\\s*(STATE_\\w+)`, 'i'));
             if (simpleAssign) {
                  const target = simpleAssign[1];
                  if (stateNames.has(target)) {
@@ -268,6 +272,138 @@ const parseSFC = (code: string): SFCNode[] => {
     }
 
     return nodes;
+};
+
+// --- SFC Analyzer & Helpers (basic, fast checks used by the UI) ---
+const analyzeSFC = (nodes: SFCNode[], code: string) => {
+    const diagnostics: Array<{severity: 'error'|'warning'|'info', code: string, message: string, nodes?: string[]}> = [];
+    if (nodes.length === 0) return diagnostics;
+
+    // Initial step checks
+    const initials = nodes.filter(n => n.type === 'init');
+    if (initials.length === 0) diagnostics.push({ severity: 'error', code: 'IEC-SFC-001', message: 'No initial step detected — exactly one required.' });
+    if (initials.length > 1) diagnostics.push({ severity: 'error', code: 'IEC-SFC-002', message: `Multiple initial steps detected (${initials.length}) — exactly one required.`, nodes: initials.map(n => n.id) });
+
+    // Reachability (BFS)
+    const startId = initials[0]?.id;
+    if (startId) {
+        const visited = new Set<string>();
+        const q: string[] = [startId];
+        while (q.length) {
+            const id = q.shift()!;
+            if (visited.has(id)) continue;
+            visited.add(id);
+            const node = nodes.find(n => n.id === id);
+            if (!node) continue;
+            node.transitions.forEach(t => { if (!visited.has(t.target)) q.push(t.target); });
+        }
+        nodes.filter(n => !visited.has(n.id)).forEach(n => diagnostics.push({ severity: 'warning', code: 'IEC-SFC-003', message: `Unreachable step: ${n.label}`, nodes: [n.id] }));
+
+        // Deadlock detection (reachable step with no outgoing transitions and not obviously final)
+        nodes.filter(n => visited.has(n.id)).forEach(n => {
+            if (n.transitions.length === 0) {
+                const lname = n.label.toLowerCase();
+                if (!lname.includes('end') && !lname.includes('final')) {
+                    diagnostics.push({ severity: 'warning', code: 'IEC-SFC-004', message: `Possible deadlock: step '${n.label}' has no outgoing transitions.`, nodes: [n.id] });
+                }
+            }
+        });
+    }
+
+    // Nesting depth enforcement (recommendation)
+    nodes.forEach(n => {
+        if (n.stepStartLine >= 0 && n.stepEndLine >= 0) {
+            const lines = code.split('\n').slice(n.stepStartLine, n.stepEndLine + 1);
+            let depth = 0;
+            let maxDepth = 0;
+            for (const l of lines) {
+                const t = l.trim();
+                if (/^IF\s+/.test(t) && /\s+THEN$/.test(t)) { depth++; maxDepth = Math.max(maxDepth, depth); }
+                if (/^END_IF;/.test(t)) depth = Math.max(0, depth - 1);
+            }
+            if (maxDepth > 8) diagnostics.push({ severity: 'error', code: 'IEC-SFC-005', message: `Nesting depth ${maxDepth} in step '${n.label}' exceeds recommended maximum (8).`, nodes: [n.id] });
+        }
+    });
+
+    // Branching hints
+    nodes.forEach(n => {
+        if (n.transitions.length > 1) {
+            const priorities = n.transitions.map(t => t.priority);
+            const unique = new Set(priorities);
+            if (unique.size !== priorities.length) {
+                diagnostics.push({ severity: 'warning', code: 'IEC-SFC-006', message: `Duplicate transition priorities in step '${n.label}'.` , nodes: [n.id] });
+            } else {
+                diagnostics.push({ severity: 'info', code: 'IEC-SFC-007', message: `Branching detected in step '${n.label}' — verify OR/AND semantics and explicit priorities.`, nodes: [n.id] });
+            }
+        }
+    });
+
+    return diagnostics;
+};
+
+const resolveStateValue = (code: string, stateName: string): number | undefined => {
+    const re = new RegExp('^\\s*' + stateName.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + "\\s*:\\s*INT\\s*:=\\s*(\\d+);", 'm');
+    const m = code.match(re);
+    return m ? parseInt(m[1], 10) : undefined;
+};
+
+const resolveStateNameByValue = (code: string, value?: number | null) => {
+    if (value === undefined || value === null) return undefined;
+    const re = /^\s*(STATE_\w+)\s*:\s*INT\s*:=\s*(\d+);/gm;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(code)) !== null) {
+        if (parseInt(match[2], 10) === value) return match[1];
+    }
+    return undefined;
+};
+
+const getVariablesFromCode = (code: string) => {
+    const vars: string[] = [];
+    const varBlock = /VAR([\s\S]*?)END_VAR;/m.exec(code);
+    if (!varBlock) return vars;
+    const lines = varBlock[1].split('\n');
+    for (const l of lines) {
+        const m = l.trim().match(/^([a-zA-Z_][a-zA-Z0-9_]*)\s*:/);
+        if (m) vars.push(m[1]);
+    }
+    return vars;
+};
+
+const exportPLCopenXML = (nodes: SFCNode[], code: string) => {
+    const pouName = 'SFC_POU';
+    const xmlParts: string[] = [];
+    xmlParts.push('<?xml version="1.0" encoding="utf-8"?>');
+    xmlParts.push('<project>');
+    xmlParts.push(`  <pou name="${pouName}">`);
+    xmlParts.push('    <sfc>');
+    xmlParts.push('      <steps>');
+    nodes.forEach(n => {
+        xmlParts.push(`        <step id="${n.id}"><name>${n.label}</name><initial>${n.type === 'init'}</initial></step>`);
+    });
+    xmlParts.push('      </steps>');
+    xmlParts.push('      <transitions>');
+    nodes.forEach(n => n.transitions.forEach(t => {
+        xmlParts.push(`        <transition source="${n.id}" target="${t.target}"><condition>${t.condition}</condition><priority>${t.priority}</priority></transition>`);
+    }));
+    xmlParts.push('      </transitions>');
+    xmlParts.push('    </sfc>');
+    xmlParts.push('  </pou>');
+    xmlParts.push('</project>');
+    const xml = xmlParts.join('\n');
+    const blob = new Blob([xml], { type: 'application/xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `plcopen-sfc-${Date.now()}.xml`;
+    a.click();
+    URL.revokeObjectURL(url);
+};
+
+const formatElapsed = (ms: number | null) => {
+    if (ms === null) return '--';
+    if (ms < 1000) return `${ms} ms`;
+    const s = Math.floor(ms / 1000);
+    return `${s}s`;
 };
 
 export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceId }) => {
@@ -318,6 +454,14 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   });
   
   const [isCompiling, setIsCompiling] = useState(false);
+  const [transitionTrace, setTransitionTrace] = useState<Array<{timestamp:number, from?: number | null, to?: number | null, deviceId?: string}>>([]);
+  const transitionTraceRef = useRef<{timestamp:number, from?: number | null, to?: number | null, deviceId?: string} | null>(null);
+  const [forcedSteps, setForcedSteps] = useState<Record<string, boolean>>({});
+  const [showPrintBounds, setShowPrintBounds] = useState(false);
+  const [findReplaceOpen, setFindReplaceOpen] = useState(false);
+  const [findText, setFindText] = useState('');
+  const [replaceText, setReplaceText] = useState('');
+  const lastStateRef = useRef<number | null>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const lineContainerRef = useRef<HTMLDivElement>(null);
 
@@ -330,6 +474,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
           return [];
       }
   }, [code]);
+
+  // Diagnostics computed from parsed SFC + source code
+  const diagnostics = useMemo(() => analyzeSFC(sfcNodes, code), [sfcNodes, code]);
+
 
   // Initialize Engine Devices
   useEffect(() => {
@@ -354,7 +502,18 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
       engine.subscribeToDebug((state) => {
           setDebugState(state);
       });
-  }, []); 
+  }, []);
+
+  // Update transition trace when debugger reports a new 'state' value for the selected device
+  useEffect(() => {
+      const stateVal = debugState.variables['state'];
+      if (debugState.activeDeviceId === selectedDeviceId && stateVal !== undefined) {
+          if (lastStateRef.current !== stateVal) {
+              setTransitionTrace(prev => [{ timestamp: Date.now(), from: lastStateRef.current, to: stateVal, deviceId: selectedDeviceId }, ...prev].slice(0, 1000));
+              lastStateRef.current = stateVal;
+          }
+      }
+  }, [debugState.variables, debugState.activeDeviceId, selectedDeviceId]); 
 
   // ... (Handlers for scroll, save, run, stop, breakpoint) ...
   const handleScroll = () => {
@@ -760,8 +919,17 @@ ELSIF state = ${stepName} THEN
                       <div className="h-10 bg-scada-panel border-b border-scada-border flex items-center px-4 gap-4 z-10 shadow-md">
                           <div className="flex items-center gap-2">
                               <button onClick={() => setZoomLevel(z => Math.max(25, z - 25))} className="p-1 hover:bg-white/10 rounded text-scada-muted"><Icons.ChevronDown className="w-4 h-4" /></button>
-                              <span className="text-xs font-mono w-12 text-center text-white">{zoomLevel}%</span>
+                              <select value={zoomLevel} onChange={(e) => setZoomLevel(parseInt(e.target.value || '100'))} className="bg-scada-bg border border-scada-border rounded p-1 text-xs font-mono w-20 text-center text-white">
+                                  <option value={25}>25%</option>
+                                  <option value={50}>50%</option>
+                                  <option value={75}>75%</option>
+                                  <option value={100}>100%</option>
+                                  <option value={150}>150%</option>
+                                  <option value={200}>200%</option>
+                              </select>
                               <button onClick={() => setZoomLevel(z => Math.min(200, z + 25))} className="p-1 hover:bg-white/10 rounded text-scada-muted"><Icons.ChevronRight className="w-4 h-4 -rotate-90" /></button>
+                              <button onClick={() => exportPLCopenXML(sfcNodes)} title="Export PLCopen TC6 XML" className="ml-3 px-2 py-1 bg-scada-bg border border-scada-border rounded text-xs text-scada-muted hover:text-white">Export XML</button>
+                              <button onClick={() => setFindReplaceOpen(true)} title="Find / Replace" className="px-2 py-1 bg-scada-bg border border-scada-border rounded text-xs text-scada-muted hover:text-white">Find/Replace</button>
                           </div>
                           <div className="h-4 w-px bg-scada-border" />
                           <div className="text-xs text-scada-muted flex items-center gap-2">
@@ -782,22 +950,41 @@ ELSIF state = ${stepName} THEN
                               <div className="space-y-8 origin-top transition-transform duration-200" style={{ transform: `scale(${zoomLevel / 100})` }}>
                                   {sfcNodes.map((node, index) => {
                                       const isActive = activeSFCStepId === node.id;
+                                      const nodeHasError = diagnostics.some(d => d.nodes?.includes(node.id) && d.severity === 'error');
+                                      const nodeHasWarning = diagnostics.some(d => d.nodes?.includes(node.id) && d.severity === 'warning');
+                                      const isForced = !!forcedSteps[node.id];
+                                      const activationCount = (() => { const v = resolveStateValue(code, node.id); if (v === undefined) return 0; return transitionTrace.filter(t => t.to === v && t.deviceId === selectedDeviceId).length; })();
+                                      const lastActivationAge = (() => { const v = resolveStateValue(code, node.id); if (v === undefined) return null; const entry = transitionTrace.find(t => t.to === v && t.deviceId === selectedDeviceId); return entry ? Date.now() - entry.timestamp : null; })();
                                       return (
                                           <div key={node.id} className="relative flex flex-col items-center group">
                                               
                                               <div className="flex items-center gap-4">
-                                                  {/* Step Box */}
-                                                  <div className={`
-                                                      w-40 h-20 flex items-center justify-center font-bold text-sm shadow-xl transition-all duration-300 relative z-10
-                                                      ${isActive 
-                                                          ? 'bg-scada-success/20 border-scada-success text-white shadow-[0_0_20px_rgba(16,185,129,0.3)]' 
-                                                          : 'bg-scada-panel border-scada-border text-gray-300'}
-                                                      ${node.type === 'init' ? 'border-4 double' : 'border-2'}
-                                                  `}>
+                                                  {/* Step Box (enhanced) */}
+                                                  <div className={`w-40 h-20 flex flex-col items-center justify-center font-bold text-sm shadow-xl transition-all duration-300 relative z-10
+                                                      ${isActive ? 'bg-scada-success/20 border-scada-success text-white shadow-[0_0_20px_rgba(16,185,129,0.18)]' : 'bg-scada-panel text-gray-300'}
+                                                      ${nodeHasError ? 'border-scada-danger' : nodeHasWarning ? 'border-scada-warning' : 'border-scada-border'}
+                                                      ${node.type === 'init' ? 'border-4 border-double border-scada-accent' : 'border-2 border-scada-border'}`}>
                                                       <div className="text-center">
-                                                          <div className="text-[9px] uppercase text-scada-muted mb-1">{node.type === 'init' ? 'INITIAL' : `STEP ${index}`}</div>
-                                                          {node.label}
+                                                          <div className="text-[9px] uppercase text-scada-muted mb-1 flex items-center gap-2 justify-center">
+                                                              {node.type === 'init' ? <span className="px-2 py-0.5 rounded bg-black/20 border border-scada-accent text-scada-accent">INITIAL</span> : <span className="text-scada-muted">STEP {index}</span>}
+                                                              {isForced && <span className="ml-1 text-[9px] px-1 rounded bg-scada-warning/20 text-scada-warning">FORCED</span>}
+                                                          </div>
+                                                          <div className="truncate max-w-[120px]">{node.label}</div>
                                                       </div>
+
+                                                      {/* Indicators: _X (active), _T (elapsed), _N (count) */}
+                                                      <div className="absolute -bottom-3 left-1/2 -translate-x-1/2 flex gap-2 text-[10px]">
+                                                          <div className={`px-1 rounded ${isActive ? 'bg-scada-success text-black' : 'bg-scada-bg/80 text-scada-muted'}`}>{node.label}_X</div>
+                                                          <div className="px-1 rounded bg-scada-bg/80 text-scada-muted">{node.label}_T: {formatElapsed(lastActivationAge)}</div>
+                                                          <div className="px-1 rounded bg-scada-bg/80 text-scada-muted">{node.label}_N: {activationCount}</div>
+                                                      </div>
+
+                                                      {/* Force toggle */}
+                                                      <button title="Force step (UI-only)" onClick={() => {
+                                                          if (!confirm(`Force '${node.label}' active state? This simulates manual forcing (UI only).`)) return;
+                                                          setForcedSteps(prev => { const next = { ...prev, [node.id]: !prev[node.id] }; setConsoleOutput(c => [...c, `> Force ${next[node.id] ? 'APPLIED' : 'CLEARED'}: ${node.label}`]); return next; });
+                                                      }} className={`absolute top-1 right-1 p-1 rounded text-[10px] ${isForced ? 'bg-scada-warning text-black' : 'bg-transparent text-scada-muted hover:bg-white/5'}`}>{isForced ? 'F' : 'f'}</button>
+
                                                       {isActive && <div className="absolute -right-1.5 top-1.5 w-2 h-2 bg-scada-accent rounded-full animate-ping" />}
                                                   </div>
 
@@ -928,6 +1115,49 @@ ELSIF state = ${stepName} THEN
                       )}
                   </div>
               </div>
+
+              {/* SFC Diagnostics */}
+              <div className="border-b border-scada-border p-3 text-xs">
+                  <div className="flex items-center justify-between mb-2">
+                      <div className="font-bold text-scada-muted uppercase flex items-center gap-2"><Icons.Alert className="w-3 h-3 text-scada-warning" /> SFC Diagnostics</div>
+                      <div className="text-[11px] text-scada-muted">{diagnostics.length} issues</div>
+                  </div>
+                  <div className="space-y-2 max-h-36 overflow-y-auto">
+                      {diagnostics.length === 0 ? (
+                          <div className="text-scada-muted text-xs">No issues detected.</div>
+                      ) : (
+                          diagnostics.map((d, i) => (
+                              <div key={i} className={`flex items-start gap-2 p-2 rounded ${d.severity === 'error' ? 'bg-scada-danger/10 border border-scada-danger/30' : d.severity === 'warning' ? 'bg-scada-warning/10 border border-scada-warning/30' : 'bg-white/2 border border-scada-border'}`}>
+                                  <div className={`w-3 h-3 rounded-full ${d.severity === 'error' ? 'bg-scada-danger' : d.severity === 'warning' ? 'bg-scada-warning' : 'bg-scada-accent'}`} />
+                                  <div className="text-[11px]">
+                                      <div className="font-semibold">{d.code}</div>
+                                      <div className="text-scada-muted text-[11px]">{d.message}</div>
+                                  </div>
+                              </div>
+                          ))
+                      )}
+                  </div>
+              </div>
+
+              {/* Trace Buffer */}
+              <div className="p-3 border-b border-scada-border text-xs">
+                  <div className="flex items-center justify-between mb-2">
+                      <div className="font-bold text-scada-muted uppercase flex items-center gap-2"><Icons.Clock className="w-3 h-3 text-scada-accent" /> Trace (last {transitionTrace.length})</div>
+                      <div className="flex gap-2">
+                          <button onClick={() => setTransitionTrace([])} className="px-2 py-1 text-xs bg-scada-bg border border-scada-border rounded hover:bg-white/5">Clear</button>
+                          <button onClick={() => { const blob = new Blob([JSON.stringify(transitionTrace.slice(0,1000), null, 2)], {type:'application/json'}); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = `sfc-trace-${selectedDeviceId}.json`; a.click(); URL.revokeObjectURL(url); }} className="px-2 py-1 text-xs bg-scada-bg border border-scada-border rounded hover:bg-white/5">Export</button>
+                      </div>
+                  </div>
+                  <div className="max-h-36 overflow-y-auto font-mono text-[11px] text-scada-muted space-y-1">
+                      {transitionTrace.length === 0 ? <div className="text-scada-muted">No trace yet.</div> : transitionTrace.slice(0,50).map((t, i) => (
+                          <div key={i} className="flex justify-between items-center gap-2">
+                              <div>{new Date(t.timestamp).toLocaleTimeString()} — <span className="text-white">{resolveStateNameByValue(code, t.to) || t.to}</span></div>
+                              <div className="text-scada-muted text-[10px]">{t.deviceId}</div>
+                          </div>
+                      ))}
+                  </div>
+              </div>
+
               {/* Console Output */}
               <div className="h-1/3 flex flex-col">
                   <div className="p-3 border-b border-scada-border text-xs font-bold text-scada-muted uppercase flex items-center gap-2 bg-scada-bg/50">
@@ -1042,9 +1272,12 @@ ELSIF state = ${stepName} THEN
                           value={editModal.content} onChange={(e) => setEditModal({ ...editModal, content: e.target.value })}
                           spellCheck={false} autoFocus
                       />
-                      <div className="mt-2 text-xs text-scada-muted">
-                          Boolean expression (e.g., x &gt; 10 AND y &lt; 5)
-                      </div>
+                      <div className="mt-2 text-xs text-scada-muted">Boolean expression (e.g., x &gt; 10 AND y &lt; 5)</div>
+
+                      {/* Variable browser (quick insert) */}
+                      <div className="mt-3 text-xs text-scada-muted">Variables: {Array.from(new Set([...getVariablesFromCode(code), ...Object.keys(debugState.variables)])).slice(0,50).map(v => (
+                          <button key={v} onClick={() => setEditModal(m => ({ ...m, content: (m.content ? m.content + ' ' : '') + v }))} className="ml-2 mt-2 px-2 py-1 bg-scada-bg border border-scada-border rounded text-[11px] hover:bg-white/5">{v}</button>
+                      ))}</div>
                   </div>
                   <div className="p-4 border-t border-scada-border bg-scada-bg/30 flex justify-end gap-3">
                       <button onClick={() => setEditModal({ ...editModal, isOpen: false })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
@@ -1113,6 +1346,32 @@ ELSIF state = ${stepName} THEN
                   </div>
               </div>
           </div>
+      )}
+
+      {/* Find / Replace Modal */}
+      {findReplaceOpen && (
+         <div className="absolute inset-0 z-50 bg-black/80 flex items-center justify-center p-8 backdrop-blur-sm animate-in fade-in">
+             <div className="bg-scada-panel border border-scada-border rounded-lg shadow-2xl w-full max-w-md flex flex-col overflow-hidden animate-in zoom-in-95">
+                 <div className="p-4 border-b border-scada-border bg-scada-bg/50 flex justify-between items-center">
+                     <h3 className="font-bold text-white text-sm flex items-center gap-2"><Icons.Search className="w-4 h-4 text-scada-accent"/> Find & Replace</h3>
+                     <button onClick={() => setFindReplaceOpen(false)} className="text-scada-muted hover:text-white"><Icons.Close className="w-5 h-5" /></button>
+                 </div>
+                 <div className="p-4 space-y-3">
+                     <div>
+                         <label className="text-xs text-scada-muted block mb-1">Find</label>
+                         <input className="w-full bg-[#0d1117] border border-scada-border rounded p-2 text-white font-mono" value={findText} onChange={e => setFindText(e.target.value)} />
+                     </div>
+                     <div>
+                         <label className="text-xs text-scada-muted block mb-1">Replace</label>
+                         <input className="w-full bg-[#0d1117] border border-scada-border rounded p-2 text-white font-mono" value={replaceText} onChange={e => setReplaceText(e.target.value)} />
+                     </div>
+                     <div className="flex gap-2">
+                         <button onClick={() => { const matches = findText ? code.split(findText).length - 1 : 0; setCode(code.split(findText).join(replaceText)); setFindReplaceOpen(false); setConsoleOutput(prev => [...prev, `> Replaced ${matches} occurrences.`]); }} className="px-4 py-2 bg-scada-accent text-white rounded text-sm">Replace All</button>
+                         <button onClick={() => { const matches = findText ? code.split(findText).length - 1 : 0; setConsoleOutput(prev => [...prev, `> ${matches} matches found.`]); }} className="px-4 py-2 bg-scada-bg border border-scada-border rounded text-sm">Count Matches</button>
+                     </div>
+                 </div>
+             </div>
+         </div>
       )}
 
       {/* Help Modal - Unchanged */}

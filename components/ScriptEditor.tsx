@@ -538,6 +538,8 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   const [renameModal, setRenameModal] = useState<{ isOpen: boolean; nodeId?: string; value: string }>({ isOpen: false, nodeId: undefined, value: '' });
   const [deleteModal, setDeleteModal] = useState<{ isOpen: boolean; nodeId?: string; label?: string }>({ isOpen: false, nodeId: undefined });
   const [forceModal, setForceModal] = useState<{ isOpen: boolean; nodeId?: string; label?: string }>({ isOpen: false, nodeId: undefined });
+  // Inline priority editor state
+  const [editingPriority, setEditingPriority] = useState<{ nodeId?: string; idx?: number; value?: number }>({});
 
   // Debug State
   const [debugState, setDebugState] = useState<DebugState>({
@@ -949,6 +951,47 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
       setConsoleOutput(prev => [...prev, `> Reordered transitions for ${node.label}`]);
   };
 
+  // Update a transition's explicit priority in the ST source (inserts or updates a `(* PRI: N *)` comment)
+  const updateTransitionPriority = (nodeId: string, transIdx: number, newPriority: number) => {
+      const nodes = parseSFC(code);
+      const node = nodes.find(n => n.id === nodeId);
+      if (!node) return;
+      const trans = node.transitions[transIdx];
+      if (!trans) return;
+
+      const lines = code.split('\n');
+      const start = trans.lineIndex;
+      const end = trans.blockEndIndex;
+      const blockLines = lines.slice(start, end + 1);
+      const blockText = blockLines.join('\n');
+
+      const priRe = /\(\*\s*PRI(?:ORITY)?\s*:\s*\d+\s*\*\)/i;
+      if (priRe.test(blockText)) {
+          // replace existing PRI in the block
+          const newBlockText = blockText.replace(priRe, `(* PRI: ${newPriority} *)`);
+          const newBlockLines = newBlockText.split('\n');
+          lines.splice(start, end - start + 1, ...newBlockLines);
+      } else {
+          // insert PRI comment before the block start
+          lines.splice(start, 0, `   (* PRI: ${newPriority} *)`);
+      }
+
+      setCode(lines.join('\n'));
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Set priority ${newPriority} on transition ${node.label} -> ${trans.target.replace('STATE_', '')}`]);
+  };
+
+  const startEditPriority = (nodeId: string, idx: number, value: number) => {
+      setEditingPriority({ nodeId, idx, value });
+  };
+
+  const applyEditPriority = (applyValue?: number) => {
+      if (!editingPriority.nodeId || editingPriority.idx === undefined) return setEditingPriority({});
+      const v = applyValue !== undefined ? applyValue : editingPriority.value || 0;
+      updateTransitionPriority(editingPriority.nodeId, editingPriority.idx, Math.max(0, Math.floor(Number(v))));
+      setEditingPriority({});
+  };
+
   const isActiveDebugTarget = debugState.activeDeviceId === selectedDeviceId;
   const showDebugLine = debugState.isPaused && isActiveDebugTarget;
   
@@ -1247,7 +1290,20 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                                   {node.transitions.length > 1 && (
                                                                       <div className="absolute -left-14 flex flex-col items-center space-y-1 text-[10px] font-bold text-yellow-500">
                                                                           <button onClick={() => moveTransitionInCode(node.id, idx, 'up')} className="p-0.5 rounded bg-transparent hover:bg-white/5 text-scada-muted"><Icons.ChevronDown className="w-3 h-3 rotate-180" /></button>
-                                                                          <div>[{trans.priority}]</div>
+                                                                          {/* priority display / inline editor */}
+                                                                          {editingPriority.nodeId === node.id && editingPriority.idx === idx ? (
+                                                                              <input
+                                                                                  type="number"
+                                                                                  aria-label={`edit-priority-${node.id}-${idx}`}
+                                                                                  value={editingPriority.value}
+                                                                                  onChange={(e) => setEditingPriority(p => ({ ...p, value: parseInt(e.target.value || '0', 10) }))}
+                                                                                  onBlur={() => applyEditPriority()}
+                                                                                  onKeyDown={(e) => { if (e.key === 'Enter') applyEditPriority(); if (e.key === 'Escape') setEditingPriority({}); }}
+                                                                                  className="w-12 bg-[#0d1117] border border-scada-border rounded p-1 text-xs text-center"
+                                                                              />
+                                                                          ) : (
+                                                                              <button onClick={() => startEditPriority(node.id, idx, trans.priority)} className="px-1 py-0.5 rounded hover:bg-white/5">[{trans.priority}]</button>
+                                                                          )}
                                                                           <button onClick={() => moveTransitionInCode(node.id, idx, 'down')} className="p-0.5 rounded bg-transparent hover:bg-white/5 text-scada-muted"><Icons.ChevronDown className="w-3 h-3" /></button>
                                                                       </div>
                                                                   )}

@@ -1,5 +1,5 @@
 
-import React, { useMemo, useState, useEffect } from 'react';
+import React, { useMemo, useState, useEffect, useRef } from 'react';
 import { IEDNode, NetworkLink, NetworkNode, NetworkPacket } from '../types';
 import { Icons } from './Icons';
 import { engine } from '../services/SimulationEngine';
@@ -34,6 +34,11 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
   });
   const [isEditingSwitch, setIsEditingSwitch] = useState(false);
   const [activeVlanFilter, setActiveVlanFilter] = useState<'all' | number>('all');
+    const [nodePositions, setNodePositions] = useState<Record<string, { x: number; y: number }>>({});
+    const [legendPos, setLegendPos] = useState({ x: 16, y: 16 });
+    const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+    const [draggingLegend, setDraggingLegend] = useState(false);
+    const dragOffsetRef = useRef({ x: 0, y: 0 });
 
   // Transform IEDs into Network Nodes for visualization
   const { nodes, links } = useMemo(() => {
@@ -103,6 +108,59 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
   const [packets, setPackets] = useState<Packet[]>([]);
   const [linkActivity, setLinkActivity] = useState<Record<string, number>>({});
 
+    const positionedNodes = useMemo(() => {
+        return nodes.map(node => {
+            const override = nodePositions[node.id];
+            return override ? { ...node, x: override.x, y: override.y } : node;
+        });
+    }, [nodes, nodePositions]);
+
+    useEffect(() => {
+        setNodePositions(prev => {
+            const next: Record<string, { x: number; y: number }> = {};
+            nodes.forEach(node => {
+                next[node.id] = prev[node.id] || { x: node.x, y: node.y };
+            });
+            return next;
+        });
+    }, [nodes]);
+
+    useEffect(() => {
+        const handleMouseMove = (e: MouseEvent) => {
+            if (draggingNodeId) {
+                setNodePositions(prev => ({
+                    ...prev,
+                    [draggingNodeId]: {
+                        x: e.clientX - dragOffsetRef.current.x,
+                        y: e.clientY - dragOffsetRef.current.y
+                    }
+                }));
+            }
+
+            if (draggingLegend) {
+                setLegendPos({
+                    x: Math.max(0, e.clientX - dragOffsetRef.current.x),
+                    y: Math.max(0, e.clientY - dragOffsetRef.current.y)
+                });
+            }
+        };
+
+        const handleMouseUp = () => {
+            setDraggingNodeId(null);
+            setDraggingLegend(false);
+        };
+
+        if (draggingNodeId || draggingLegend) {
+            document.addEventListener('mousemove', handleMouseMove);
+            document.addEventListener('mouseup', handleMouseUp);
+        }
+
+        return () => {
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, [draggingNodeId, draggingLegend]);
+
   // Animation Loop (60fps)
   useEffect(() => {
     let animationFrameId: number;
@@ -144,7 +202,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
   useEffect(() => {
       const handlePacket = (packet: NetworkPacket) => {
           // Find source node by name (Packet source uses IED Name, Nodes use generated ID, but we mapped names)
-          const sourceNode = nodes.find(n => n.name === packet.source);
+          const sourceNode = positionedNodes.find(n => n.name === packet.source);
           
           if (sourceNode) {
               const linkToSwitch = links.find(l => (l.sourceId === sourceNode.id && l.targetId === 'switch-01') || (l.sourceId === 'switch-01' && l.targetId === sourceNode.id));
@@ -152,7 +210,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
               if (linkToSwitch) {
                   // Determine direction: Source -> Switch
                   const start = sourceNode;
-                  const end = nodes.find(n => n.id === 'switch-01');
+                  const end = positionedNodes.find(n => n.id === 'switch-01');
                   
                   if (start && end) {
                       const color = packet.protocol === 'GOOSE' ? '#a855f7' : (packet.protocol === 'SV' ? '#3b82f6' : '#10b981'); 
@@ -174,7 +232,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
 
       const unsubscribe = engine.subscribeToTraffic(handlePacket);
       return () => unsubscribe();
-  }, [nodes, links]);
+    }, [positionedNodes, links]);
 
   // Background Noise Traffic (Optional, for liveliness)
   useEffect(() => {
@@ -187,8 +245,8 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
 
     const color = '#64748b'; // Grey for noise
 
-    const sourceNode = nodes.find(n => n.id === link.sourceId);
-    const targetNode = nodes.find(n => n.id === link.targetId);
+    const sourceNode = positionedNodes.find(n => n.id === link.sourceId);
+    const targetNode = positionedNodes.find(n => n.id === link.targetId);
     
     if (sourceNode && targetNode) {
         setPackets(prev => [...prev, {
@@ -199,13 +257,22 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
             progress: 0
         }]);
     }
-  }, [simulationTime, links, nodes, activeVlanFilter]);
+    }, [simulationTime, links, positionedNodes, activeVlanFilter]);
 
   return (
     <div className="w-full h-full bg-scada-bg relative overflow-hidden">
       
       {/* Network Legend Panel */}
-      <div className="absolute top-4 left-4 z-10 bg-scada-panel/90 p-3 rounded-lg border border-scada-border backdrop-blur shadow-lg w-72">
+            <div className="absolute z-10 bg-scada-panel/90 p-3 rounded-lg border border-scada-border backdrop-blur shadow-lg w-72" style={{ top: legendPos.y, left: legendPos.x }}>
+                <div
+                    className="-mx-3 -mt-3 mb-2 px-3 py-1.5 bg-scada-bg/60 border-b border-scada-border cursor-move rounded-t-lg text-[10px] uppercase text-scada-muted tracking-wide"
+                    onMouseDown={(e) => {
+                        setDraggingLegend(true);
+                        dragOffsetRef.current = { x: e.clientX - legendPos.x, y: e.clientY - legendPos.y };
+                    }}
+                >
+                    VLAN Segment Window
+                </div>
         <div className="flex justify-between items-center mb-3">
             <h3 className="text-xs font-bold uppercase text-scada-muted flex items-center gap-2">
                 <Icons.Wifi className="w-3 h-3" /> VLAN Segments
@@ -299,8 +366,8 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
         
         {/* Network Links */}
         {links.map(link => {
-             const source = nodes.find(n => n.id === link.sourceId)!;
-             const target = nodes.find(n => n.id === link.targetId)!;
+             const source = positionedNodes.find(n => n.id === link.sourceId)!;
+             const target = positionedNodes.find(n => n.id === link.targetId)!;
              const intensity = linkActivity[link.id] || 0;
              const vlanConfig = VLAN_CONFIG[link.vlan as keyof typeof VLAN_CONFIG];
              const vlanColor = vlanConfig?.color || '#64748b';
@@ -361,7 +428,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
       </svg>
 
       {/* Interactive Nodes */}
-      {nodes.map(node => {
+    {positionedNodes.map(node => {
         const vlanConfig = node.vlan ? VLAN_CONFIG[node.vlan as keyof typeof VLAN_CONFIG] : null;
         const isOnline = node.status === 'online';
         const isDimmed = activeVlanFilter !== 'all' && node.vlan !== activeVlanFilter && node.type !== 'switch';
@@ -379,6 +446,16 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                 onClick={() => {
                     if (node.type === 'ied') onSelectIED(node.id);
                     if (node.type === 'switch') setIsEditingSwitch(true); // Open config on click
+                }}
+                onMouseDown={(e) => {
+                    if (e.button !== 0) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setDraggingNodeId(node.id);
+                    dragOffsetRef.current = {
+                        x: e.clientX - node.x,
+                        y: e.clientY - node.y
+                    };
                 }}
             >
                 <div className={`

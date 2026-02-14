@@ -213,6 +213,20 @@ export interface ControlSession {
 }
 
 // Debugger Types
+export interface BreakpointDetails {
+  line: number;
+  enabled: boolean;
+  condition?: string;
+  hitCount?: number;
+  hits: number;
+}
+
+export interface DebugExecutionFrame {
+  timestamp: number;
+  line: number;
+  deviceId: string;
+}
+
 export interface DebugState {
   isRunning: boolean;
   isPaused: boolean;
@@ -220,6 +234,9 @@ export interface DebugState {
   currentLine: number;
   variables: Record<string, any>;
   breakpoints: number[];
+  breakpointDetails?: BreakpointDetails[];
+  executionHistory?: DebugExecutionFrame[];
+  callStack?: string[];
 }
 
 export interface ScriptConfig {

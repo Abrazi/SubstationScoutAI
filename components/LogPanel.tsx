@@ -5,9 +5,11 @@ import { Icons } from './Icons';
 interface LogPanelProps {
   logs: LogEntry[];
   onClear: () => void;
+  isCollapsed: boolean;
+  onToggleCollapse: () => void;
 }
 
-export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClear }) => {
+export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClear, isCollapsed, onToggleCollapse }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to bottom
@@ -39,16 +41,27 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClear }) => {
 
   return (
     <div className="h-full flex flex-col bg-scada-bg text-sm font-mono border-t border-scada-border">
-      <div className="flex items-center justify-between px-4 py-2 border-b border-scada-border bg-scada-panel">
+      <div
+        className="flex items-center justify-between px-4 py-2 border-b border-scada-border bg-scada-panel cursor-pointer hover:bg-white/5 transition-colors"
+        onClick={onToggleCollapse}
+      >
         <div className="flex items-center gap-2">
             <Icons.Terminal className="w-4 h-4 text-scada-muted" />
             <span className="font-semibold text-scada-muted">Diagnostic Console</span>
             <span className="text-xs bg-scada-border px-2 rounded-full text-scada-text">{logs.length} Events</span>
+            <Icons.ChevronDown className={`w-4 h-4 text-scada-muted transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
         </div>
-        <button onClick={onClear} className="text-xs hover:text-white text-scada-muted flex items-center gap-1">
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onClear();
+          }}
+          className="text-xs hover:text-white text-scada-muted flex items-center gap-1"
+        >
             <Icons.Stop className="w-3 h-3" /> Clear
         </button>
       </div>
+      {!isCollapsed && (
       <div className="flex-1 overflow-y-auto p-2 space-y-1" ref={scrollRef}>
         {logs.length === 0 && (
             <div className="text-center text-scada-muted opacity-30 py-4">No logs available</div>
@@ -62,6 +75,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClear }) => {
           </div>
         ))}
       </div>
+      )}
     </div>
   );
 };

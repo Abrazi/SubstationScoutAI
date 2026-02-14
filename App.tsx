@@ -99,9 +99,25 @@ const AppContent = () => {
   const [selectedNode, setSelectedNode] = useState<IEDNode | null>(null);
   
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [rightSidebarOpen, setRightSidebarOpen] = useState(true); // Watch List / AI Sidebar
+    const [rightSidebarOpen, setRightSidebarOpen] = useState<boolean>(() => {
+        try {
+            const saved = localStorage.getItem('ui.rightSidebarOpen');
+            return saved === null ? true : saved === '1';
+        } catch {
+            return true;
+        }
+    }); // Watch List / AI Sidebar
+  const [rightSidebarWidth, setRightSidebarWidth] = useState(320);
+  const [isResizingRightSidebar, setIsResizingRightSidebar] = useState(false);
 
-  const [logs, setLogs] = useState<LogEntry[]>([]);
+    const [logs, setLogs] = useState<LogEntry[]>([]);
+    const [isLogPanelCollapsed, setIsLogPanelCollapsed] = useState<boolean>(() => {
+        try {
+            return localStorage.getItem('ui.logPanelCollapsed') === '1';
+        } catch {
+            return false;
+        }
+    });
   const [simulationTime, setSimulationTime] = useState(0);
 
   // Watch List State
@@ -112,6 +128,11 @@ const AppContent = () => {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null); // For Open Project
+
+    const handleRightSidebarResizeStart = (e: React.MouseEvent) => {
+            e.preventDefault();
+            setIsResizingRightSidebar(true);
+    };
 
   // --- Engine Initialization Logic ---
   const initializeSimulation = (nodes: IEDNode[]) => {
@@ -182,9 +203,16 @@ const AppContent = () => {
         }
     }, 100);
 
-    if (window.innerWidth < 1280) {
-        setRightSidebarOpen(false);
-    }
+        try {
+            const saved = localStorage.getItem('ui.rightSidebarOpen');
+            if (saved === null && window.innerWidth < 1280) {
+                setRightSidebarOpen(false);
+            }
+        } catch {
+            if (window.innerWidth < 1280) {
+                setRightSidebarOpen(false);
+            }
+        }
 
   }, []); // Run once on mount
 
@@ -194,6 +222,45 @@ const AppContent = () => {
       setSelectedNode(selectedIED);
     }
   }, [selectedIED]);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem('ui.logPanelCollapsed', isLogPanelCollapsed ? '1' : '0');
+        } catch {
+            // ignore storage errors
+        }
+    }, [isLogPanelCollapsed]);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem('ui.rightSidebarOpen', rightSidebarOpen ? '1' : '0');
+        } catch {
+            // ignore storage errors
+        }
+    }, [rightSidebarOpen]);
+
+    useEffect(() => {
+        if (!isResizingRightSidebar) return;
+
+        const handleMouseMove = (e: MouseEvent) => {
+            const newWidth = window.innerWidth - e.clientX;
+            const minWidth = 260;
+            const maxWidth = Math.min(720, Math.floor(window.innerWidth * 0.5));
+            setRightSidebarWidth(Math.max(minWidth, Math.min(maxWidth, newWidth)));
+        };
+
+        const handleMouseUp = () => {
+            setIsResizingRightSidebar(false);
+        };
+
+        document.addEventListener('mousemove', handleMouseMove);
+        document.addEventListener('mouseup', handleMouseUp);
+
+        return () => {
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+        };
+    }, [isResizingRightSidebar]);
 
   // Simulation Loop for Visuals
   useEffect(() => {
@@ -705,13 +772,25 @@ const AppContent = () => {
                 </div>
 
                 {/* 3c. Bottom Panel: Diagnostic Logs */}
-                <div className="h-48 border-t border-scada-border bg-scada-panel z-20">
-                    <LogPanel logs={logs} onClear={() => setLogs([])} />
+                <div className={`${isLogPanelCollapsed ? 'h-12' : 'h-48'} border-t border-scada-border bg-scada-panel z-20 transition-all duration-200 overflow-hidden`}>
+                    <LogPanel
+                      logs={logs}
+                      onClear={() => setLogs([])}
+                      isCollapsed={isLogPanelCollapsed}
+                      onToggleCollapse={() => setIsLogPanelCollapsed(prev => !prev)}
+                    />
                 </div>
             </div>
 
             {/* 4. Right Panel: AI & Watch List (Toggleable Window) */}
-            <div className={`${rightSidebarOpen ? 'w-80 border-l' : 'w-0'} border-scada-border bg-scada-panel flex flex-col transition-all duration-300 overflow-hidden`}>
+            <div className={`border-scada-border bg-scada-panel flex flex-col transition-all duration-300 overflow-hidden relative ${rightSidebarOpen ? 'border-l' : ''}`} style={{ width: rightSidebarOpen ? `${rightSidebarWidth}px` : '0px' }}>
+                {rightSidebarOpen && (
+                    <div
+                        onMouseDown={handleRightSidebarResizeStart}
+                        className="absolute left-0 top-0 bottom-0 w-1 -translate-x-1/2 cursor-ew-resize bg-scada-border/40 hover:bg-scada-accent transition-colors z-20"
+                        title="Drag to resize right sidebar"
+                    />
+                )}
                 <div className="h-2/3 min-h-[300px] border-b border-scada-border">
                     <AIChat currentIED={selectedIED} />
                 </div>

@@ -1,5 +1,12 @@
 
-import { IDeviceContext, LogEntry, NetworkPacket, ModbusRegister, BridgeStatus, NetworkAdapter, ControlSession, DebugState, ScriptConfig, GooseState, GooseConfig } from '../types';
+import { IDeviceContext, LogEntry, NetworkPacket, ModbusRegister, BridgeStatus, NetworkAdapter, ControlSession, DebugState, ScriptConfig, GooseState, GooseConfig, BreakpointDetails, DebugExecutionFrame } from '../types';
+
+interface BreakpointMeta {
+    enabled: boolean;
+    condition?: string;
+    hitCount?: number;
+    hits: number;
+}
 
 interface ScriptInstance {
     id: string; // Device ID
@@ -10,7 +17,13 @@ interface ScriptInstance {
     generator: GeneratorFunction | null;
     iterator: Generator | null;
     breakpoints: Set<number>;
+    breakpointMeta: Map<number, BreakpointMeta>;
     scope: any;
+    currentLine: number; // Last executed line for debugger UI
+    lastState: any; // Track previous state value
+    stateEntryTime: number; // When current state was entered (timestamp)
+    stateTimes: Map<string, { entryTime: number, stepTime: number }>; // Track time for all states
+    executionHistory: DebugExecutionFrame[];
 }
 
 /**
@@ -601,7 +614,13 @@ export class SimulationEngine {
               generator: null,
               iterator: null,
               breakpoints: new Set(),
-              scope: {}
+              breakpointMeta: new Map(),
+              scope: {},
+              currentLine: 0,
+              lastState: undefined,
+              stateEntryTime: Date.now(),
+              stateTimes: new Map(),
+              executionHistory: []
           });
       }
       return this.scripts.get(id)!;
@@ -646,8 +665,15 @@ export class SimulationEngine {
 
       script.code = sourceCode;
 
-      // 0. Strip PLC-style block comments globally (avoid leftover '(*' tokens)
-      let cleanedSource = sourceCode.replace(/\(\*[\s\S]*?\*\)/g, "");
+      // 0. Strip PLC-style block comments while preserving line count so debugger
+      //    line numbers stay synchronized with the original editor source.
+      const stripCommentsPreserveLines = (text: string) => {
+          return text.replace(/\(\*[\s\S]*?\*\)/g, (match) => {
+              const newlineCount = (match.match(/\n/g) || []).length;
+              return newlineCount > 0 ? '\n'.repeat(newlineCount) : ' ';
+          });
+      };
+      let cleanedSource = stripCommentsPreserveLines(sourceCode);
 
       // 0.a Convert VAR...END_VAR blocks into `scope.<name>` initializations so
       //     declarations like `X : INT := 1;` become valid JS (`scope.X = 1;`).
@@ -730,6 +756,9 @@ export class SimulationEngine {
       script.generator = new Function(wrappedCode)();
       script.scope = {}; // Reset scope
       script.iterator = null; // Reset execution state
+    script.currentLine = 0;
+    script.stateTimes = new Map();
+    script.executionHistory = [];
       
       return { success: true };
     } catch (e: any) {
@@ -747,8 +776,18 @@ export class SimulationEngine {
       const script = this.scripts.get(deviceId);
       if (!script) return;
       
-      if (enabled) script.breakpoints.add(line);
-      else script.breakpoints.delete(line);
+      if (enabled) {
+          script.breakpoints.add(line);
+          if (!script.breakpointMeta.has(line)) {
+              script.breakpointMeta.set(line, { enabled: true, hits: 0 });
+          } else {
+              const prev = script.breakpointMeta.get(line)!;
+              script.breakpointMeta.set(line, { ...prev, enabled: true });
+          }
+      } else {
+          script.breakpoints.delete(line);
+          script.breakpointMeta.delete(line);
+      }
       this.emitDebugState();
   }
 
@@ -756,9 +795,42 @@ export class SimulationEngine {
       const script = this.scripts.get(deviceId);
       if (!script) return;
       
-      if (script.breakpoints.has(line)) script.breakpoints.delete(line);
-      else script.breakpoints.add(line);
+      if (script.breakpoints.has(line)) {
+          script.breakpoints.delete(line);
+          script.breakpointMeta.delete(line);
+      } else {
+          script.breakpoints.add(line);
+          script.breakpointMeta.set(line, { enabled: true, hits: 0 });
+      }
       this.emitDebugState();
+  }
+
+  public setBreakpointOptions(deviceId: string, line: number, options: { condition?: string; hitCount?: number }) {
+      const script = this.scripts.get(deviceId);
+      if (!script) return;
+
+      if (!script.breakpoints.has(line)) {
+          script.breakpoints.add(line);
+      }
+
+      const prev = script.breakpointMeta.get(line) || { enabled: true, hits: 0 };
+      script.breakpointMeta.set(line, {
+          ...prev,
+          enabled: true,
+          condition: options.condition?.trim() || undefined,
+          hitCount: options.hitCount && options.hitCount > 0 ? options.hitCount : undefined
+      });
+      this.emitDebugState();
+  }
+
+  public setDebugVariable(deviceId: string, variableName: string, value: any): boolean {
+      const script = this.scripts.get(deviceId);
+      if (!script) return false;
+
+      script.scope[variableName] = value;
+      this.debugTargetId = deviceId;
+      this.emitDebugState();
+      return true;
   }
 
   public start() {
@@ -777,12 +849,21 @@ export class SimulationEngine {
     this.isRunning = false;
     this.isPaused = false;
     this.debugTargetId = null;
-    this.scripts.forEach(s => s.iterator = null);
+        this.scripts.forEach(s => {
+            s.iterator = null;
+            s.currentLine = 0;
+        });
     if (this.intervalId) clearInterval(this.intervalId);
     this.emitDebugState();
   }
 
-  public pause() {
+    public pause(deviceId?: string) {
+            if (deviceId && this.scripts.has(deviceId)) {
+                    this.debugTargetId = deviceId;
+            } else if (!this.debugTargetId) {
+                    const firstScript = this.scripts.values().next().value as ScriptInstance | undefined;
+                    this.debugTargetId = firstScript?.id || null;
+            }
       this.isPaused = true;
       this.emitDebugState();
   }
@@ -800,6 +881,50 @@ export class SimulationEngine {
       this.emitDebugState();
   }
 
+  public stepInto() {
+      this.stepOver();
+  }
+
+  public stepOut() {
+      this.stepOver();
+  }
+
+  private evaluateBreakpointCondition(condition: string, scope: any): boolean {
+      try {
+          // eslint-disable-next-line no-new-func
+          const fn = new Function('scope', `with(scope){ return Boolean(${condition}); }`);
+          return !!fn(scope);
+      } catch {
+          return false;
+      }
+  }
+
+  private buildPseudoCallStack(sourceCode: string, currentLine: number): string[] {
+      const lines = sourceCode.split('\n').slice(0, Math.max(0, currentLine));
+      const stack: string[] = ['PROGRAM'];
+
+      for (const raw of lines) {
+          const line = raw.trim();
+          if (!line) continue;
+
+          const ifMatch = line.match(/^IF\s+(.+?)\s+THEN/i);
+          const elsifMatch = line.match(/^ELSIF\s+(.+?)\s+THEN/i);
+          const whileMatch = line.match(/^WHILE\s+(.+?)\s+DO/i);
+          if (ifMatch) stack.push(`IF ${ifMatch[1]}`);
+          if (whileMatch) stack.push(`WHILE ${whileMatch[1]}`);
+          if (elsifMatch) {
+              while (stack.length > 1 && !stack[stack.length - 1].startsWith('IF ')) stack.pop();
+              if (stack.length > 1) stack[stack.length - 1] = `ELSIF ${elsifMatch[1]}`;
+          }
+
+          if (/^END_IF;$/i.test(line) || /^END_WHILE;$/i.test(line)) {
+              if (stack.length > 1) stack.pop();
+          }
+      }
+
+      return stack;
+  }
+
   private runCycle() {
     // 1. Update Physics (Simple Simulation) - runs every cycle
     // In reality this should be separate, but for mock simulation it's fine
@@ -815,6 +940,54 @@ export class SimulationEngine {
 
     for (const script of this.scripts.values()) {
         if (!script.generator) continue;
+
+        // Update stepTime (time in current state in milliseconds)
+        const currentState = script.scope.state;
+        if (script.lastState !== currentState) {
+            // State changed!
+            script.lastState = currentState;
+            script.stateEntryTime = now;
+        }
+        // Calculate stepTime in milliseconds
+        const currentStepTime = now - script.stateEntryTime;
+        script.scope.stepTime = currentStepTime;
+        
+        // Create state-name based time accessors (e.g., can check STATE_RUNNING_stepTime)
+        // First, extract all STATE_* constants from the code on first pass
+        if (!script.scope._stateNamesResolved) {
+            const stateRegex = /\b(STATE_\w+)\s*:\s*INT\s*:=\s*(\d+)/g;
+            let match;
+            while ((match = stateRegex.exec(script.code)) !== null) {
+                const stateName = match[1];
+                const stateValue = parseInt(match[2], 10);
+                // Keep numeric value for state comparisons
+                script.scope[stateName] = stateValue;
+                // Initialize time tracking for this state
+                if (!script.stateTimes.has(stateName)) {
+                    script.stateTimes.set(stateName, { entryTime: 0, stepTime: 0 });
+                }
+            }
+            script.scope._stateNamesResolved = true;
+        }
+        
+        // Update time tracking for all states and expose as stateName.stepTime
+        script.stateTimes.forEach((timeData, stateName) => {
+            const stateValue = script.scope[stateName];
+            if (currentState === stateValue) {
+                // This is the active state
+                timeData.entryTime = script.stateEntryTime;
+                timeData.stepTime = currentStepTime;
+                // Make available as STATE_NAME.stepTime by creating an object
+                if (typeof script.scope[stateName] === 'number') {
+                    // Replace the numeric constant with an object that has both value and stepTime
+                    const stateObj = Object.create(Number.prototype);
+                    stateObj.valueOf = function() { return stateValue; };
+                    stateObj.toString = function() { return String(stateValue); };
+                    stateObj.stepTime = currentStepTime;
+                    script.scope[stateName] = stateObj;
+                }
+            }
+        });
 
         // Check if it's time to run this script
         // Note: If we are in StepMode, we force run the debug target regardless of time
@@ -843,14 +1016,33 @@ export class SimulationEngine {
                     
                     if (result.value) { // Line number
                         const line = result.value as number;
+                        script.currentLine = line;
+                        script.executionHistory.unshift({ timestamp: Date.now(), line, deviceId: script.id });
+                        if (script.executionHistory.length > 500) {
+                            script.executionHistory.length = 500;
+                        }
                         
                         // Check Breakpoint
                         if (script.breakpoints.has(line)) {
-                            this.isPaused = true;
-                            this.stepMode = false;
-                            this.debugTargetId = script.id;
-                            this.emitDebugState();
-                            return; // Stop EVERYTHING
+                            const bpMeta = script.breakpointMeta.get(line) || { enabled: true, hits: 0 };
+                            bpMeta.hits += 1;
+                            script.breakpointMeta.set(line, bpMeta);
+
+                            let shouldPause = bpMeta.enabled !== false;
+                            if (shouldPause && bpMeta.condition) {
+                                shouldPause = this.evaluateBreakpointCondition(bpMeta.condition, script.scope);
+                            }
+                            if (shouldPause && bpMeta.hitCount && bpMeta.hitCount > 0) {
+                                shouldPause = bpMeta.hits >= bpMeta.hitCount;
+                            }
+
+                            if (shouldPause) {
+                                this.isPaused = true;
+                                this.stepMode = false;
+                                this.debugTargetId = script.id;
+                                this.emitDebugState();
+                                return; // Stop EVERYTHING
+                            }
                         }
 
                         // Check Step Mode
@@ -901,13 +1093,25 @@ export class SimulationEngine {
               isRunning: this.isRunning,
               isPaused: this.isPaused,
               activeDeviceId: this.debugTargetId,
-              currentLine: targetScript?.iterator ? (targetScript.iterator as any).currentLine || 0 : 0, // Current line is hard to get from generator unless we track it manually in the loop. 
-              // Correction: We yielded the line number. The loop consumes it. 
-              // We need to persist "last yielded line" in the script object if paused.
-              // For now, let's assume the UI gets the line from the fact we paused AT a line.
-              // Refactor: We need to store 'currentLine' in script instance during runCycle
+              currentLine: targetScript?.currentLine || 0,
               variables: targetScript ? { ...targetScript.scope } : {},
-              breakpoints: targetScript ? Array.from(targetScript.breakpoints) : []
+              breakpoints: targetScript ? Array.from(targetScript.breakpoints) : [],
+              breakpointDetails: targetScript
+                ? Array.from(targetScript.breakpoints)
+                    .sort((a, b) => a - b)
+                    .map((line): BreakpointDetails => {
+                        const meta = targetScript.breakpointMeta.get(line);
+                        return {
+                            line,
+                            enabled: meta?.enabled ?? true,
+                            condition: meta?.condition,
+                            hitCount: meta?.hitCount,
+                            hits: meta?.hits ?? 0
+                        };
+                    })
+                : [],
+              executionHistory: targetScript ? [...targetScript.executionHistory] : [],
+              callStack: targetScript ? this.buildPseudoCallStack(targetScript.code, targetScript.currentLine) : []
           });
       }
   }

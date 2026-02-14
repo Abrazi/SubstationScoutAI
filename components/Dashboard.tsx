@@ -1,6 +1,6 @@
 
-import React, { useEffect, useState, useRef } from 'react';
-import { SimulationData, IEDNode, DashboardWidget, DashboardWidgetType } from '../types';
+import React, { useEffect, useMemo, useState } from 'react';
+import { SimulationData, IEDNode, DashboardWidget, DashboardWidgetType, ModbusRegisterType } from '../types';
 import { SimulationChart } from './SimulationCharts';
 import { Icons } from './Icons';
 import { engine } from '../services/SimulationEngine';
@@ -22,9 +22,146 @@ const DEFAULT_LAYOUT: DashboardWidget[] = [
 
 export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSelectNode, onUpdateNode }) => {
   const [simData, setSimData] = useState<(SimulationData & { time: string })[]>([]);
-  const [breakerState, setBreakerState] = useState(engine.getCoil(2)); // Initialize from engine (Coil 2 = Breaker)
+    const [breakerState, setBreakerState] = useState(engine.getCoil(2));
   const [isEditing, setIsEditing] = useState(false);
   const [layout, setLayout] = useState<DashboardWidget[]>([]);
+    const [sourceFilterText, setSourceFilterText] = useState('');
+    const [sourceFilterGroup, setSourceFilterGroup] = useState<'all' | 'da' | 'modbus'>('all');
+
+    type SourceOption = { value: string; label: string; group: 'IEC 61850 DA' | 'Modbus' };
+
+    const sourceOptions = useMemo<SourceOption[]>(() => {
+            if (!selectedNode) return [];
+
+            const options: SourceOption[] = [];
+            const stack: IEDNode[] = [selectedNode];
+
+            while (stack.length > 0) {
+                    const node = stack.pop()!;
+                    if (node.type === 'DA' && node.path) {
+                            options.push({ value: `da:${node.path}`, label: node.path, group: 'IEC 61850 DA' });
+                    }
+                    if (node.children) stack.push(...node.children);
+            }
+
+            (selectedNode.config?.modbusMap || []).forEach((reg) => {
+                    options.push({
+                            value: `modbus:${reg.type}:${reg.address}`,
+                            label: `${reg.name} (${reg.type} ${reg.address})`,
+                            group: 'Modbus'
+                    });
+            });
+
+            return options;
+    }, [selectedNode]);
+
+          const filteredSourceOptions = useMemo(() => {
+              const query = sourceFilterText.trim().toLowerCase();
+              return sourceOptions.filter((opt) => {
+                  const groupMatch =
+                      sourceFilterGroup === 'all' ||
+                      (sourceFilterGroup === 'da' && opt.group === 'IEC 61850 DA') ||
+                      (sourceFilterGroup === 'modbus' && opt.group === 'Modbus');
+                  const textMatch = !query || opt.label.toLowerCase().includes(query) || opt.value.toLowerCase().includes(query);
+                  return groupMatch && textMatch;
+              });
+          }, [sourceOptions, sourceFilterGroup, sourceFilterText]);
+
+    const findDaPath = (root: IEDNode | null, suffix: string): string | undefined => {
+        if (!root) return undefined;
+        const stack: IEDNode[] = [root];
+        while (stack.length > 0) {
+            const node = stack.pop()!;
+            if (node.type === 'DA' && node.path && node.path.endsWith(suffix)) return node.path;
+            if (node.children) stack.push(...node.children);
+        }
+        return undefined;
+    };
+
+    const getRegisterByName = (root: IEDNode | null, name: string): number | undefined => {
+        const reg = root?.config?.modbusMap?.find(r => r.name.toLowerCase() === name.toLowerCase());
+        if (!reg) return undefined;
+        return engine.getRegister(reg.address);
+    };
+
+    const getNumericDa = (path?: string): number | undefined => {
+        if (!path) return undefined;
+        const value = engine.readMMS(path);
+        if (value === undefined || value === null || value === '') return undefined;
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : undefined;
+    };
+
+    const readMappedSource = (source?: string): number | boolean | undefined => {
+        if (!source) return undefined;
+
+        if (source.startsWith('da:')) {
+            const path = source.slice(3);
+            const value = engine.readMMS(path);
+            if (typeof value === 'boolean' || typeof value === 'number') return value;
+            if (typeof value === 'string') {
+                const normalized = value.toLowerCase();
+                if (normalized === 'true' || normalized === 'on' || normalized === 'closed') return true;
+                if (normalized === 'false' || normalized === 'off' || normalized === 'open') return false;
+                const parsed = Number(value);
+                return Number.isFinite(parsed) ? parsed : undefined;
+            }
+            return undefined;
+        }
+
+        if (source.startsWith('modbus:')) {
+            const [, type, addressText] = source.split(':');
+            const address = Number(addressText);
+            if (!Number.isFinite(address)) return undefined;
+            switch (type as ModbusRegisterType) {
+                case 'Coil':
+                    return engine.getCoil(address);
+                case 'DiscreteInput':
+                    return engine.getDiscreteInput(address);
+                case 'HoldingRegister':
+                    return engine.getRegister(address);
+                case 'InputRegister':
+                    return engine.getInputRegister(address);
+                default:
+                    return undefined;
+            }
+        }
+
+        return undefined;
+    };
+
+    const asNumber = (value: number | boolean | undefined): number | undefined => {
+        if (typeof value === 'number') return value;
+        if (typeof value === 'boolean') return value ? 1 : 0;
+        return undefined;
+    };
+
+    const asBoolean = (value: number | boolean | undefined): boolean | undefined => {
+        if (typeof value === 'boolean') return value;
+        if (typeof value === 'number') return value !== 0;
+        return undefined;
+    };
+
+    const updateWidgetConfig = (widgetId: string, patch: Record<string, any>) => {
+        setLayout(prev => prev.map(widget => widget.id === widgetId ? { ...widget, config: { ...(widget.config || {}), ...patch } } : widget));
+    };
+
+    const resolveBreakerState = (root: IEDNode | null): boolean => {
+        const posPath = findDaPath(root, '.XCBR1.Pos.stVal');
+        const posVal = posPath ? engine.readMMS(posPath) : undefined;
+        if (typeof posVal === 'string') {
+            const normalized = posVal.toLowerCase();
+            if (normalized === 'on' || normalized === 'closed') return true;
+            if (normalized === 'off' || normalized === 'open') return false;
+        }
+
+        const statusWord = getRegisterByName(root, 'Status Word 1');
+        if (typeof statusWord === 'number') {
+            return (statusWord & (1 << 4)) !== 0;
+        }
+
+        return engine.getCoil(2);
+    };
 
   // Initialize Layout on Node Change
   useEffect(() => {
@@ -33,28 +170,53 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
     }
   }, [selectedNode]);
 
-  // Simulation Loop
+    // Real telemetry polling loop
   useEffect(() => {
     const interval = setInterval(() => {
-      // Sync with Engine
-      const currentBreakerState = engine.getCoil(2);
+            const breakerWidget = layout.find(w => w.type === 'breaker-control');
+            const currentBreakerState = asBoolean(readMappedSource(breakerWidget?.config?.breakerSource)) ?? resolveBreakerState(selectedNode);
       if (currentBreakerState !== breakerState) {
           setBreakerState(currentBreakerState);
       }
 
       const now = new Date();
       const timeStr = now.toLocaleTimeString();
-      const noise = () => (Math.random() - 0.5) * 2;
-      
+
+            const frequencyRaw = getRegisterByName(selectedNode, 'Frequency');
+            const frequency = typeof frequencyRaw === 'number' ? frequencyRaw / 100 : 0;
+
+            const voltageReg = getRegisterByName(selectedNode, 'Voltage') ?? 0;
+            const currentReg = getRegisterByName(selectedNode, 'Current') ?? 0;
+
+            const phvPath = findDaPath(selectedNode, '.MMXU1.PhV.phsA');
+            const currentPath = findDaPath(selectedNode, '.MMXU1.A.phsA');
+            const daVoltage = getNumericDa(phvPath);
+            const daCurrent = getNumericDa(currentPath);
+
+                        const phaseVoltage = daVoltage ?? voltageReg;
+                        const phaseCurrent = currentBreakerState ? (daCurrent ?? currentReg) : 0;
+
+                        const voltageWidget = layout.find(w => w.type === 'chart-voltage');
+                        const currentWidget = layout.find(w => w.type === 'chart-current');
+                        const valueWidget = layout.find(w => w.type === 'value-card');
+
+                        const mappedVoltageA = asNumber(readMappedSource(voltageWidget?.config?.voltageA));
+                        const mappedVoltageB = asNumber(readMappedSource(voltageWidget?.config?.voltageB));
+                        const mappedVoltageC = asNumber(readMappedSource(voltageWidget?.config?.voltageC));
+                        const mappedCurrentA = asNumber(readMappedSource(currentWidget?.config?.currentA));
+                        const mappedCurrentB = asNumber(readMappedSource(currentWidget?.config?.currentB));
+                        const mappedCurrentC = asNumber(readMappedSource(currentWidget?.config?.currentC));
+                        const mappedFrequency = asNumber(readMappedSource(valueWidget?.config?.valueSource));
+
       const newData: SimulationData & { time: string } = {
         time: timeStr,
-        voltageA: 110 + noise(),
-        voltageB: 110 + noise(),
-        voltageC: 110 + noise(),
-        currentA: currentBreakerState ? 450 + noise() * 10 : 0,
-        currentB: currentBreakerState ? 445 + noise() * 10 : 0,
-        currentC: currentBreakerState ? 455 + noise() * 10 : 0,
-        frequency: 60 + noise() * 0.05,
+                                voltageA: mappedVoltageA ?? phaseVoltage,
+                                voltageB: mappedVoltageB ?? phaseVoltage,
+                                voltageC: mappedVoltageC ?? phaseVoltage,
+                                currentA: mappedCurrentA ?? phaseCurrent,
+                                currentB: mappedCurrentB ?? phaseCurrent,
+                                currentC: mappedCurrentC ?? phaseCurrent,
+                                frequency: mappedFrequency ?? frequency,
         breakerStatus: currentBreakerState
       };
 
@@ -66,12 +228,17 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [breakerState]); // Re-run if local state drifts, though engine read inside handles it.
+    }, [selectedNode, breakerState, layout]);
 
   const toggleBreaker = () => {
     const newState = !breakerState;
-    setBreakerState(newState); // Immediate UI update
-    engine.setCoil(2, newState, 'Dashboard User'); // Write to Engine
+        setBreakerState(newState);
+        engine.setCoil(2, newState, 'Dashboard User');
+
+        const posPath = findDaPath(selectedNode, '.XCBR1.Pos.stVal');
+        if (posPath) {
+            engine.writeMMS(posPath, newState ? 'on' : 'off', 'Dashboard User');
+        }
   };
 
   const saveLayout = () => {
@@ -85,7 +252,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
       const newWidget: DashboardWidget = {
           id: Date.now().toString(),
           type,
-          title
+          title,
+          config: {}
       };
       setLayout(prev => [...prev, newWidget]);
   };
@@ -112,6 +280,44 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
 
   // Render Logic for different widget types
   const renderWidget = (widget: DashboardWidget) => {
+      const cfg = widget.config || {};
+
+      const renderSourceSelect = (label: string, key: string) => (
+          (() => {
+              const selectedValue = cfg[key] || '';
+              const selectedOption = sourceOptions.find(opt => opt.value === selectedValue);
+              const visibleOptions = selectedOption && !filteredSourceOptions.some(opt => opt.value === selectedOption.value)
+                  ? [selectedOption, ...filteredSourceOptions]
+                  : filteredSourceOptions;
+              return (
+          <div className="space-y-1">
+              <label className="text-[10px] uppercase tracking-wide text-scada-muted">{label}</label>
+              <select
+                  value={cfg[key] || ''}
+                  onChange={(e) => updateWidgetConfig(widget.id, { [key]: e.target.value || undefined })}
+                  className="w-full bg-scada-bg border border-scada-border rounded px-2 py-1 text-[10px] text-white"
+              >
+                  <option value="">Auto / Default</option>
+                  <optgroup label="IEC 61850 DA">
+                      {visibleOptions.filter(o => o.group === 'IEC 61850 DA').map(opt => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                  </optgroup>
+                  <optgroup label="Modbus">
+                      {visibleOptions.filter(o => o.group === 'Modbus').map(opt => (
+                          <option key={opt.value} value={opt.value}>{opt.label}</option>
+                      ))}
+                  </optgroup>
+              </select>
+          </div>
+              );
+          })()
+      );
+
+      const tableA = asNumber(readMappedSource(cfg.tableA)) ?? latest.voltageA;
+      const tableB = asNumber(readMappedSource(cfg.tableB)) ?? latest.voltageB;
+      const tableC = asNumber(readMappedSource(cfg.tableC)) ?? latest.voltageC;
+
       const content = () => {
           switch (widget.type) {
               case 'value-card':
@@ -152,9 +358,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
                                 <tr><th className="px-3 py-1">Ph</th><th className="px-3 py-1">Val</th><th className="px-3 py-1">Unit</th></tr>
                             </thead>
                             <tbody>
-                                <tr><td className="px-3 py-1 text-scada-accent">Va</td><td>{latest.voltageA.toFixed(1)}</td><td className="text-gray-500">kV</td></tr>
-                                <tr><td className="px-3 py-1 text-yellow-500">Vb</td><td>{latest.voltageB.toFixed(1)}</td><td className="text-gray-500">kV</td></tr>
-                                <tr><td className="px-3 py-1 text-blue-400">Vc</td><td>{latest.voltageC.toFixed(1)}</td><td className="text-gray-500">kV</td></tr>
+                                <tr><td className="px-3 py-1 text-scada-accent">Va</td><td>{tableA.toFixed(1)}</td><td className="text-gray-500">kV</td></tr>
+                                <tr><td className="px-3 py-1 text-yellow-500">Vb</td><td>{tableB.toFixed(1)}</td><td className="text-gray-500">kV</td></tr>
+                                <tr><td className="px-3 py-1 text-blue-400">Vc</td><td>{tableC.toFixed(1)}</td><td className="text-gray-500">kV</td></tr>
                             </tbody>
                         </table>
                       </div>
@@ -177,6 +383,33 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
                   )}
               </div>
               <div className="flex-1 overflow-auto bg-scada-panel/30 min-h-[150px]">
+                  {isEditing && (
+                      <div className="p-2 border-b border-scada-border bg-scada-bg/30 space-y-2">
+                          {widget.type === 'value-card' && renderSourceSelect('Value Source', 'valueSource')}
+                          {widget.type === 'breaker-control' && renderSourceSelect('Breaker Status Source', 'breakerSource')}
+                          {widget.type === 'chart-voltage' && (
+                              <>
+                                  {renderSourceSelect('Phase A Source', 'voltageA')}
+                                  {renderSourceSelect('Phase B Source', 'voltageB')}
+                                  {renderSourceSelect('Phase C Source', 'voltageC')}
+                              </>
+                          )}
+                          {widget.type === 'chart-current' && (
+                              <>
+                                  {renderSourceSelect('Phase A Source', 'currentA')}
+                                  {renderSourceSelect('Phase B Source', 'currentB')}
+                                  {renderSourceSelect('Phase C Source', 'currentC')}
+                              </>
+                          )}
+                          {widget.type === 'measurement-table' && (
+                              <>
+                                  {renderSourceSelect('Row A Source', 'tableA')}
+                                  {renderSourceSelect('Row B Source', 'tableB')}
+                                  {renderSourceSelect('Row C Source', 'tableC')}
+                              </>
+                          )}
+                      </div>
+                  )}
                   {content()}
               </div>
               {isEditing && (
@@ -247,6 +480,34 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
               <button onClick={() => addWidget('breaker-control', 'Breaker Control')} className="px-3 py-1.5 bg-scada-bg border border-scada-border rounded text-xs hover:border-scada-accent transition-colors">+ Breaker</button>
               <button onClick={() => addWidget('measurement-table', 'Data Table')} className="px-3 py-1.5 bg-scada-bg border border-scada-border rounded text-xs hover:border-scada-accent transition-colors">+ Table</button>
               <button onClick={() => addWidget('value-card', 'Freq Card')} className="px-3 py-1.5 bg-scada-bg border border-scada-border rounded text-xs hover:border-scada-accent transition-colors">+ Value Card</button>
+
+              <div className="ml-auto flex items-center gap-2">
+                  <span className="text-[10px] uppercase text-scada-muted">Source Filter</span>
+                  <select
+                      value={sourceFilterGroup}
+                      onChange={(e) => setSourceFilterGroup(e.target.value as 'all' | 'da' | 'modbus')}
+                      className="bg-scada-bg border border-scada-border rounded px-2 py-1 text-xs text-white"
+                  >
+                      <option value="all">All</option>
+                      <option value="da">IEC 61850 DA</option>
+                      <option value="modbus">Modbus</option>
+                  </select>
+                  <input
+                      value={sourceFilterText}
+                      onChange={(e) => setSourceFilterText(e.target.value)}
+                      placeholder="Search source..."
+                      className="w-44 bg-scada-bg border border-scada-border rounded px-2 py-1 text-xs text-white"
+                  />
+                  <button
+                      onClick={() => {
+                          setSourceFilterGroup('all');
+                          setSourceFilterText('');
+                      }}
+                      className="px-2 py-1 bg-scada-bg border border-scada-border rounded text-xs text-scada-muted hover:text-white hover:border-scada-accent transition-colors"
+                  >
+                      Clear
+                  </button>
+              </div>
           </div>
       )}
 

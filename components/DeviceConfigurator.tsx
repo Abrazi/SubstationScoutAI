@@ -1,3 +1,4 @@
+
 import React, { useState } from 'react';
 import { IEDNode, IEDConfig, NodeType, ModbusRegister, ModbusRegisterType, PollingTask } from '../types';
 import { Icons } from './Icons';
@@ -12,6 +13,29 @@ interface DeviceConfiguratorProps {
 
 type Step = 'source' | 'configure' | 'network' | 'review';
 type ImportMode = 'modbus-slave' | 'modbus-master' | 'modbus-client' | 'scl' | 'demo';
+
+// Helper to increment IP address
+const incrementIp = (baseIp: string, offset: number): string => {
+    const parts = baseIp.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(isNaN)) return baseIp;
+    parts[3] = parts[3] + offset; 
+    return parts.join('.');
+};
+
+// Helper to increment Device Name
+const incrementName = (baseName: string, offset: number): string => {
+    if (offset === 0) return baseName;
+    // If ends in digits, increment them preserving padding
+    const match = baseName.match(/(\d+)$/);
+    if (match) {
+        const numStr = match[1];
+        const num = parseInt(numStr, 10) + offset;
+        const newNumStr = num.toString().padStart(numStr.length, '0');
+        return baseName.slice(0, match.index) + newNumStr;
+    }
+    // Else append _N
+    return `${baseName}_${offset + 1}`;
+};
 
 export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, onCancel, existingIEDs }) => {
   const [step, setStep] = useState<Step>('source');
@@ -38,7 +62,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
 
   // Modbus Configuration State
   const [modbusSettings, setModbusSettings] = useState({
-      name: 'New_Device',
+      name: 'New_Device_01',
       description: 'Configured Device',
       port: 502,
       unitId: 1
@@ -78,6 +102,9 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
     isDHCP: false,
     role: 'server'
   });
+
+  // Bulk Creation State
+  const [deviceCount, setDeviceCount] = useState<number>(1);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -241,12 +268,13 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
       setPollingTasks(prev => prev.filter(t => t.id !== id));
   };
 
-  const createModbusIED = (): IEDNode => {
-      const id = `modbus-${Date.now()}`;
+  const createModbusIED = (instanceName: string, instanceIp: string, instanceIdx: number): IEDNode => {
+      const id = `modbus-${Date.now()}-${instanceIdx}`;
       const isMaster = importMode === 'modbus-master' || importMode === 'modbus-client';
       
       const finalConfig: IEDConfig = {
           ...netConfig,
+          ip: instanceIp,
           modbusMap: isMaster ? undefined : registers,
           pollingList: isMaster ? pollingTasks : undefined
       };
@@ -258,14 +286,14 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
               id: `${id}-ld0`,
               name: 'ModbusMap',
               type: NodeType.LDevice,
-              path: `${modbusSettings.name}ModbusMap`,
+              path: `${instanceName}ModbusMap`,
               description: `Port: ${modbusSettings.port}, ID: ${modbusSettings.unitId}`,
               children: [
                   {
                       id: `${id}-ln-holding`,
                       name: 'Registers',
                       type: NodeType.LN,
-                      path: `${modbusSettings.name}ModbusMap/Registers`,
+                      path: `${instanceName}ModbusMap/Registers`,
                       description: `Mapped Registers (${registers.length})`,
                       children: [] 
                   }
@@ -277,7 +305,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
               id: `${id}-scanner`,
               name: 'Scanner',
               type: NodeType.LDevice,
-              path: `${modbusSettings.name}/Scanner`,
+              path: `${instanceName}/Scanner`,
               description: `Polling Engine (${pollingTasks.length} tasks)`,
               children: []
           });
@@ -285,33 +313,57 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
 
       return {
           id: id,
-          name: modbusSettings.name,
+          name: instanceName,
           type: NodeType.IED,
           description: modbusSettings.description,
-          path: modbusSettings.name,
+          path: instanceName,
           config: finalConfig,
           children
       };
   };
 
   const finalize = () => {
-    let finalIED: IEDNode;
+    const baseName = (importMode === 'scl' || importMode === 'demo') ? (draftIED?.name || 'Device') : modbusSettings.name;
+    const baseIp = netConfig.ip;
 
-    if (importMode === 'scl' || importMode === 'demo') {
-        if (!draftIED) return;
-        const filteredChildren = draftIED.children?.filter(c => selectedLDs.includes(c.id)) || [];
+    for (let i = 0; i < deviceCount; i++) {
+        const instanceName = incrementName(baseName, i);
+        const instanceIp = incrementIp(baseIp, i);
         
-        finalIED = {
-            ...draftIED,
-            children: filteredChildren,
-            config: netConfig,
-            description: draftIED.description + (netConfig.role === 'client' ? ' [Client/Remote]' : ' [Server/Simulated]')
-        };
-    } else {
-        finalIED = createModbusIED();
+        let finalIED: IEDNode;
+
+        if (importMode === 'scl' || importMode === 'demo') {
+            if (!draftIED) return;
+            const filteredChildren = draftIED.children?.filter(c => selectedLDs.includes(c.id)) || [];
+            
+            // Deep clone to separate instances
+            const clonedIED = JSON.parse(JSON.stringify(draftIED));
+            clonedIED.id = `imported-${Date.now()}-${i}`;
+            clonedIED.name = instanceName;
+            clonedIED.path = instanceName;
+            clonedIED.config = { ...netConfig, ip: instanceIp };
+            clonedIED.description = draftIED.description + (netConfig.role === 'client' ? ' [Client/Remote]' : ' [Server/Simulated]');
+            clonedIED.children = filteredChildren;
+
+            // Fix internal paths if name changed (Simple replacement for now)
+            // This ensures IEDName/LD/LN paths are consistent with the new device name
+            if (instanceName !== draftIED.name) {
+                const updatePaths = (nodes: IEDNode[]) => {
+                    nodes.forEach(n => {
+                        if (n.path) n.path = n.path.replace(draftIED.name, instanceName);
+                        if (n.children) updatePaths(n.children);
+                    });
+                };
+                updatePaths(clonedIED.children || []);
+            }
+
+            finalIED = clonedIED;
+        } else {
+            finalIED = createModbusIED(instanceName, instanceIp, i);
+        }
+        
+        onSave(finalIED);
     }
-    
-    onSave(finalIED);
   };
 
   return (
@@ -798,6 +850,33 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                         <input type="checkbox" checked={netConfig.isDHCP} onChange={e => setNetConfig({...netConfig, isDHCP: e.target.checked})} id="dhcp" className="rounded bg-scada-panel border-scada-border text-scada-accent"/>
                         <label htmlFor="dhcp" className="text-sm text-scada-muted cursor-pointer">Enable DHCP (Dynamic Assignment)</label>
                     </div>
+
+                    <div className="border-t border-scada-border pt-4 mt-6">
+                        <h4 className="text-sm font-bold text-white mb-3 flex items-center gap-2">
+                            <Icons.Box className="w-4 h-4 text-yellow-400" /> Bulk Creation Options
+                        </h4>
+                        <div className="p-4 bg-scada-panel/30 border border-scada-border rounded-lg flex items-center gap-6">
+                            <div>
+                                <label className="text-xs font-bold text-scada-muted uppercase block mb-1">Instance Count</label>
+                                <input 
+                                    type="number" 
+                                    min="1" max="50" 
+                                    value={deviceCount} 
+                                    onChange={(e) => setDeviceCount(Math.max(1, Math.min(50, parseInt(e.target.value) || 1)))}
+                                    className="w-24 bg-scada-bg border border-scada-border rounded p-2 text-white font-mono focus:border-scada-accent outline-none text-center"
+                                />
+                            </div>
+                            <div className="flex-1 border-l border-scada-border pl-6">
+                                <div className="text-xs text-scada-muted uppercase font-bold mb-1">IP Allocation Preview</div>
+                                <div className="font-mono text-sm text-scada-accent">
+                                    {netConfig.ip} <span className="text-scada-muted">→</span> {incrementIp(netConfig.ip, deviceCount - 1)}
+                                </div>
+                                <div className="text-xs text-scada-muted mt-1">
+                                    Creating {deviceCount} unique devices with incremented IP addresses and names.
+                                </div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             )}
 
@@ -857,6 +936,21 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                 </div>
                              </div>
                         </div>
+
+                        {deviceCount > 1 && (
+                            <div className="mt-4 p-3 bg-blue-500/10 border border-blue-500/30 rounded flex items-center gap-3">
+                                <div className="p-2 bg-blue-500/20 rounded-full text-blue-400">
+                                    <Icons.Box className="w-5 h-5" />
+                                </div>
+                                <div>
+                                    <div className="font-bold text-white text-sm">Bulk Creation Active</div>
+                                    <div className="text-xs text-gray-300">
+                                        Generating <span className="text-white font-mono font-bold">{deviceCount}</span> instances. 
+                                        Names will be suffixed (e.g., _01, _02) and IPs incremented.
+                                    </div>
+                                </div>
+                            </div>
+                        )}
                     </div>
                  </div>
             )}
@@ -891,7 +985,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                         onClick={finalize}
                         className="px-8 py-2 bg-scada-success text-white rounded font-medium hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-900/20 flex items-center gap-2"
                     >
-                        <Icons.Run className="w-4 h-4" /> Deploy Device
+                        <Icons.Run className="w-4 h-4" /> {deviceCount > 1 ? `Deploy ${deviceCount} Devices` : 'Deploy Device'}
                     </button>
                 )}
             </div>

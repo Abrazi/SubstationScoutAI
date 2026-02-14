@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+
+import React, { useState, useEffect, useRef, Component, ErrorInfo } from 'react';
 import { Icons } from './components/Icons';
 import { TreeExplorer } from './components/TreeExplorer';
 import { Dashboard } from './components/Dashboard';
@@ -13,12 +14,49 @@ import { NetworkTap } from './components/NetworkTap';
 import { WatchListPanel } from './components/WatchListPanel';
 import { ClientMasterPanel } from './components/ClientMasterPanel';
 import { DeviceList } from './components/DeviceList';
-import { generateMockIED } from './utils/mockGenerator';
+import { generateFleet } from './utils/mockGenerator';
+import { GENERATOR_LOGIC_SCRIPT } from './utils/generatorLogic';
 import { analyzeSCLFile } from './services/geminiService';
 import { parseSCL, validateSCL } from './utils/sclParser';
 import { IEDNode, ViewMode, LogEntry, WatchItem } from './types';
-import { MOCK_IED_NAMES } from './constants';
 import { engine } from './services/SimulationEngine';
+
+// --- Error Boundary Component ---
+class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean, error: Error | null }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex flex-col items-center justify-center h-screen bg-scada-bg text-scada-danger p-8 text-center">
+          <Icons.Alert className="w-16 h-16 mb-4" />
+          <h1 className="text-2xl font-bold mb-2">Something went wrong.</h1>
+          <p className="text-scada-muted mb-4 max-w-md bg-black/30 p-4 rounded font-mono text-sm break-words">
+            {this.state.error?.message}
+          </p>
+          <button 
+            onClick={() => window.location.reload()} 
+            className="px-4 py-2 bg-scada-panel border border-scada-border rounded text-white hover:bg-white/10"
+          >
+            Reload Application
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Helper to recursively find GSE nodes
 const findGooseNodes = (node: IEDNode, results: IEDNode[] = []) => {
@@ -53,11 +91,10 @@ const collectDataAttributes = (node: IEDNode, map: Map<string, any>) => {
     }
 };
 
-const App = () => {
+const AppContent = () => {
   const [viewMode, setViewMode] = useState<ViewMode | 'devices'>('dashboard');
   
-  // Initialize IEDs lazily to ensure stable IDs and references
-  // CHANGED: Start with empty list to remove mock devices
+  // Initialize IEDs with the full generator fleet
   const [iedList, setIedList] = useState<IEDNode[]>([]);
   
   const [selectedIED, setSelectedIED] = useState<IEDNode | null>(null);
@@ -76,34 +113,77 @@ const App = () => {
   const [fileAnalysis, setFileAnalysis] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Initialize Engine Logging & Discovery
+  const fileInputRef = useRef<HTMLInputElement>(null); // For Open Project
+
+  // --- Engine Initialization Logic ---
+  const initializeSimulation = (nodes: IEDNode[]) => {
+      try {
+          // 1. Initialize Engine Data Model
+          const initialData = new Map<string, any>();
+          nodes.forEach(ied => collectDataAttributes(ied, initialData));
+          engine.initializeData(initialData);
+
+          // 2. Register Devices
+          nodes.forEach(ied => {
+              engine.registerDevice(ied.id, ied.name);
+          });
+
+          // 3. Scan for GOOSE controls
+          nodes.forEach(ied => {
+              const gooseControls = findGooseNodes(ied);
+              gooseControls.forEach(gse => {
+                  if (gse.gooseConfig) {
+                      const dsName = gse.gooseConfig.datSet.split('.').pop() || '';
+                      const dataset = findDataset(ied, dsName);
+                      if (dataset && dataset.children) {
+                          const entries = dataset.children.map(c => c.path || '');
+                          engine.registerDeviceGoose(gse.path!, gse.gooseConfig, entries);
+                      }
+                  }
+              });
+          });
+      } catch (e) {
+          console.error("Failed to initialize simulation engine:", e);
+      }
+  };
+
+  // Initialize Engine Logging & Discovery (One time)
   useEffect(() => {
+    // Load Fleet
+    const fleet = generateFleet();
+    setIedList(fleet);
+    
+    // Default select G1
+    if (fleet.length > 0) {
+        setSelectedIED(fleet[0]);
+        setSelectedNode(fleet[0]);
+    }
+
     engine.subscribeToLogs((log) => {
         setLogs(prev => [...prev.slice(-99), log]);
     });
 
-    // 1. Initialize Engine Data Model
-    const initialData = new Map<string, any>();
-    iedList.forEach(ied => collectDataAttributes(ied, initialData));
-    engine.initializeData(initialData);
+    initializeSimulation(fleet);
 
-    // 2. Scan initial IEDs for GOOSE controls and register them to engine
-    iedList.forEach(ied => {
-        const gooseControls = findGooseNodes(ied);
-        gooseControls.forEach(gse => {
-            if (gse.gooseConfig) {
-                // Find associated dataset
-                const dsName = gse.gooseConfig.datSet.split('.').pop() || '';
-                const dataset = findDataset(ied, dsName);
-                if (dataset && dataset.children) {
-                    const entries = dataset.children.map(c => c.path || '');
-                    engine.registerDeviceGoose(gse.path!, gse.gooseConfig, entries);
+    // AUTO-LOAD GENERATOR LOGIC (Specific to Mock Fleet)
+    // Run this in a timeout to allow UI to render first
+    setTimeout(() => {
+        try {
+            fleet.forEach(ied => {
+                if (ied.id.startsWith('G') && !isNaN(parseInt(ied.id.substring(1)))) {
+                    engine.updateScriptConfig({
+                        deviceId: ied.id,
+                        code: GENERATOR_LOGIC_SCRIPT,
+                        tickRate: 100
+                    });
                 }
-            }
-        });
-    });
+            });
+            engine.start(); 
+        } catch (e) {
+            console.error("Error auto-loading scripts:", e);
+        }
+    }, 100);
 
-    // Auto-adjust layout for smaller screens
     if (window.innerWidth < 1280) {
         setRightSidebarOpen(false);
     }
@@ -124,6 +204,130 @@ const App = () => {
     }, 1000);
     return () => clearInterval(interval);
   }, []);
+
+  // --- Project Management Functions ---
+
+  const handleNewProject = () => {
+      if (confirm("Are you sure you want to create a new project? All unsaved changes will be lost.")) {
+          engine.stop();
+          // Unregister all current
+          iedList.forEach(ied => engine.unregisterDevice(ied.id));
+          
+          setIedList([]);
+          setWatchList([]);
+          setLogs([]);
+          setSelectedIED(null);
+          setSelectedNode(null);
+          
+          setLogs(prev => [...prev, {
+              id: Date.now().toString(),
+              timestamp: new Date().toISOString(),
+              source: 'System',
+              level: 'info',
+              message: 'New Project Created'
+          }]);
+      }
+  };
+
+  const handleSaveProject = () => {
+      // 1. Gather Scripts from Engine (they are not in iedList)
+      const scripts: Record<string, any> = {};
+      iedList.forEach(ied => {
+          const config = engine.getScriptConfig(ied.id);
+          if (config) scripts[ied.id] = config;
+      });
+
+      const projectData = {
+          version: '1.0',
+          timestamp: new Date().toISOString(),
+          iedList,
+          watchList,
+          scripts
+      };
+
+      const blob = new Blob([JSON.stringify(projectData, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `scout-project-${new Date().toISOString().split('T')[0]}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      
+      setLogs(prev => [...prev, {
+          id: Date.now().toString(),
+          timestamp: new Date().toISOString(),
+          source: 'System',
+          level: 'info',
+          message: 'Project Saved Successfully'
+      }]);
+  };
+
+  const handleOpenProject = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+          try {
+              const content = ev.target?.result as string;
+              const data = JSON.parse(content);
+              
+              if (!data.iedList || !Array.isArray(data.iedList)) {
+                  throw new Error("Invalid project file format: missing iedList");
+              }
+
+              // Cleanup current state
+              engine.stop();
+              iedList.forEach(ied => engine.unregisterDevice(ied.id));
+
+              // Load State
+              setIedList(data.iedList);
+              setWatchList(data.watchList || []);
+              
+              // Restore Engine Devices & Data
+              initializeSimulation(data.iedList);
+              
+              // Restore Scripts
+              if (data.scripts) {
+                  Object.values(data.scripts).forEach((scriptConfig: any) => {
+                      engine.updateScriptConfig(scriptConfig);
+                  });
+              }
+
+              // Reset selection
+              if (data.iedList.length > 0) {
+                  setSelectedIED(data.iedList[0]);
+                  setSelectedNode(data.iedList[0]);
+              } else {
+                  setSelectedIED(null);
+                  setSelectedNode(null);
+              }
+
+              setLogs(prev => [...prev, {
+                  id: Date.now().toString(),
+                  timestamp: new Date().toISOString(),
+                  source: 'System',
+                  level: 'info',
+                  message: `Project Loaded: ${file.name}`
+              }]);
+
+          } catch (err: any) {
+              setLogs(prev => [...prev, {
+                  id: Date.now().toString(),
+                  timestamp: new Date().toISOString(),
+                  source: 'System',
+                  level: 'error',
+                  message: `Failed to load project: ${err.message}`
+              }]);
+              alert(`Failed to load project file: ${err.message}`);
+          }
+      };
+      reader.readAsText(file);
+      // Reset input so same file can be selected again
+      if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  // --- Handlers ---
 
   const handleNodeSelect = (node: IEDNode) => {
     setSelectedNode(node);
@@ -147,12 +351,11 @@ const App = () => {
     setSelectedNode(ied);
     setViewMode('network');
     
-    // Register data with engine immediately
     const newData = new Map<string, any>();
     collectDataAttributes(ied, newData);
     engine.initializeData(newData);
+    engine.registerDevice(ied.id, ied.name); // Ensure script engine knows about it
 
-    // Log creation
     setLogs(prev => [...prev, {
         id: Date.now().toString(),
         timestamp: new Date().toISOString(),
@@ -167,7 +370,6 @@ const App = () => {
       if (selectedIED?.id === updatedIED.id) {
           setSelectedIED(updatedIED);
       }
-      // Also update selectedNode if it is the IED itself being inspected
       if (selectedNode?.id === updatedIED.id) {
           setSelectedNode(updatedIED);
       }
@@ -183,20 +385,13 @@ const App = () => {
 
   const handleRemoveIED = (id: string) => {
       const iedToRemove = iedList.find(i => i.id === id);
-      if (!iedToRemove) {
-          console.error(`Attempted to delete non-existent IED: ${id}`);
-          return;
-      }
+      if (!iedToRemove) return;
 
-      // CHANGED: Direct deletion without window.confirm
-      // Remove from engine logic
       engine.unregisterDevice(iedToRemove.id); 
       
-      // Remove from list
       const newList = iedList.filter(i => i.id !== id);
       setIedList(newList);
       
-      // Log
       setLogs(prev => [...prev, {
           id: Date.now().toString(),
           timestamp: new Date().toISOString(),
@@ -205,12 +400,10 @@ const App = () => {
           message: `Device removed: ${iedToRemove.name}`
       }]);
 
-      // Adjust selection if needed - ensure we don't hold onto a dead reference
       if (selectedIED?.id === id) {
           const next = newList.length > 0 ? newList[0] : null;
           setSelectedIED(next);
           setSelectedNode(next);
-          // If we are on a specific device view, maybe fallback to dashboard
           if (viewMode === 'modbus' || viewMode === 'explorer') {
               if(!next) setViewMode('dashboard');
           }
@@ -224,7 +417,7 @@ const App = () => {
           setSelectedNode(ied);
           
           if (mode === 'configure' && ied.config?.modbusMap) {
-              setViewMode('modbus'); // Or handle config view specifically
+              setViewMode('modbus'); 
           } else if (ied.config?.modbusMap) {
                setViewMode('modbus');
           } else {
@@ -235,7 +428,7 @@ const App = () => {
 
   const handleAddToWatch = (item: WatchItem) => {
     setWatchList(prev => {
-        if (prev.some(i => i.id === item.id)) return prev; // Avoid duplicates
+        if (prev.some(i => i.id === item.id)) return prev;
         
         setLogs(prevLogs => [...prevLogs, {
             id: Date.now().toString(),
@@ -247,7 +440,6 @@ const App = () => {
         
         return [...prev, item];
     });
-    // Auto-open the panel to show the user the watch list
     setRightSidebarOpen(true);
   };
 
@@ -277,10 +469,10 @@ const App = () => {
         setSelectedNode(parsedIED);
         setViewMode('network');
         
-        // Register data
         const newData = new Map<string, any>();
         collectDataAttributes(parsedIED, newData);
         engine.initializeData(newData);
+        engine.registerDevice(parsedIED.id, parsedIED.name);
         
         setFileAnalysis("SCL Imported Successfully. Running AI Analysis...");
         const analysis = await analyzeSCLFile(text);
@@ -301,10 +493,6 @@ const App = () => {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-scada-bg text-scada-text font-sans">
-      {/* Debug mount indicator (visible for troubleshooting) */}
-      <div className="fixed top-3 right-3 z-50 rounded bg-scada-accent/10 text-scada-accent text-xs px-2 py-1 font-medium pointer-events-none">
-        Mounted • {viewMode} • {simulationTime}s
-      </div>
       
       {/* 1. Left Sidebar: Navigation & Project Structure */}
       <div className={`${sidebarOpen ? 'w-64' : 'w-16'} transition-all duration-300 flex flex-col border-r border-scada-border bg-scada-bg z-30`}>
@@ -315,7 +503,7 @@ const App = () => {
           </span>
         </div>
 
-        <nav className="flex-1 py-4 space-y-1 px-2">
+        <nav className="flex-1 py-4 space-y-1 px-2 overflow-y-auto">
            <NavItem icon={Icons.Dashboard} label="Dashboard" active={viewMode === 'dashboard'} onClick={() => setViewMode('dashboard')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.List} label="Device List" active={viewMode === 'devices'} onClick={() => setViewMode('devices')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Wifi} label="Network Topology" active={viewMode === 'network'} onClick={() => setViewMode('network')} collapsed={!sidebarOpen} />
@@ -330,18 +518,35 @@ const App = () => {
            <NavItem icon={Icons.Code} label="Logic Editor" active={viewMode === 'logic'} onClick={() => setViewMode('logic')} collapsed={!sidebarOpen} />
         </nav>
 
-        {/* File Upload in Sidebar */}
-        {sidebarOpen && (
-            <div className="p-4 border-t border-scada-border">
-                <label className="flex items-center gap-2 text-xs text-scada-muted hover:text-white cursor-pointer transition-colors p-2 rounded hover:bg-white/5 border border-dashed border-scada-border">
-                    <Icons.Upload className="w-4 h-4" />
-                    <span>Import SCL/CID</span>
-                    <input type="file" className="hidden" accept=".xml,.scd,.cid,.icd" onChange={handleFileUpload} />
-                </label>
+        {/* Project Management & Files */}
+        <div className="p-4 border-t border-scada-border space-y-3 bg-scada-panel/30">
+            {sidebarOpen && <div className="text-[10px] font-bold text-scada-muted uppercase tracking-wider">Project Files</div>}
+            
+            <div className={`grid ${sidebarOpen ? 'grid-cols-3' : 'grid-cols-1'} gap-2`}>
+                <button onClick={handleNewProject} className="flex flex-col items-center justify-center p-2 rounded hover:bg-white/5 text-scada-muted hover:text-white transition-colors bg-scada-bg border border-scada-border hover:border-scada-muted group" title="New Project">
+                    <Icons.File className="w-4 h-4 mb-1 group-hover:text-scada-accent" />
+                    {sidebarOpen && <span className="text-[9px]">New</span>}
+                </button>
+                <button onClick={() => fileInputRef.current?.click()} className="flex flex-col items-center justify-center p-2 rounded hover:bg-white/5 text-scada-muted hover:text-white transition-colors bg-scada-bg border border-scada-border hover:border-scada-muted group" title="Open Project">
+                    <Icons.Tree className="w-4 h-4 mb-1 group-hover:text-yellow-400" />
+                    {sidebarOpen && <span className="text-[9px]">Open</span>}
+                </button>
+                <button onClick={handleSaveProject} className="flex flex-col items-center justify-center p-2 rounded hover:bg-white/5 text-scada-muted hover:text-white transition-colors bg-scada-bg border border-scada-border hover:border-scada-muted group" title="Save Project">
+                    <Icons.Save className="w-4 h-4 mb-1 group-hover:text-scada-success" />
+                    {sidebarOpen && <span className="text-[9px]">Save</span>}
+                </button>
             </div>
-        )}
+            {/* Hidden Input for Open Project */}
+            <input type="file" ref={fileInputRef} className="hidden" accept=".json" onChange={handleOpenProject} />
 
-        <div className="p-2">
+            <label className={`flex items-center gap-2 text-xs text-scada-muted hover:text-white cursor-pointer transition-colors p-2 rounded hover:bg-white/5 border border-dashed border-scada-border hover:border-scada-accent ${!sidebarOpen ? 'justify-center' : ''}`} title="Import SCL/CID Definition">
+                <Icons.Upload className="w-4 h-4" />
+                {sidebarOpen && <span>Import SCL/CID</span>}
+                <input type="file" className="hidden" accept=".xml,.scd,.cid,.icd" onChange={handleFileUpload} />
+            </label>
+        </div>
+
+        <div className="p-2 border-t border-scada-border">
             <button onClick={() => setSidebarOpen(!sidebarOpen)} className="w-full flex justify-center p-2 hover:bg-white/5 rounded text-scada-muted">
                 <Icons.Activity className={`transition-transform duration-300 ${sidebarOpen ? 'rotate-0' : 'rotate-180'}`} />
             </button>
@@ -536,6 +741,12 @@ const NavItem = ({ icon: Icon, label, active, onClick, collapsed }: any) => (
     <Icon className="w-5 h-5" />
     {!collapsed && <span className="font-medium text-sm">{label}</span>}
   </button>
+);
+
+const App = () => (
+  <ErrorBoundary>
+    <AppContent />
+  </ErrorBoundary>
 );
 
 export default App;

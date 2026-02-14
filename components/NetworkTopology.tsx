@@ -1,3 +1,4 @@
+
 import React, { useMemo, useState, useEffect } from 'react';
 import { IEDNode, NetworkLink, NetworkNode, NetworkPacket } from '../types';
 import { Icons } from './Icons';
@@ -32,6 +33,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
       name: 'Core Switch (RSTP)'
   });
   const [isEditingSwitch, setIsEditingSwitch] = useState(false);
+  const [activeVlanFilter, setActiveVlanFilter] = useState<'all' | number>('all');
 
   // Transform IEDs into Network Nodes for visualization
   const { nodes, links } = useMemo(() => {
@@ -60,9 +62,17 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
           // Fallback heuristic
           const isProcessBus = index % 2 !== 0; 
           vlanId = isProcessBus ? 20 : 10;
+      }
+      
+      // Safety check for unknown VLANs
+      if (!Object.keys(VLAN_CONFIG).includes(String(vlanId))) {
+          vlanId = 10;
+      }
+
+      if (!ip) {
           const config = VLAN_CONFIG[vlanId as keyof typeof VLAN_CONFIG];
           const host = 100 + index;
-          ip = `${config.subnet}.${host}`;
+          ip = `${config.subnet}.${100 + index}`;
       }
       
       const angle = (index / ieds.length) * 2 * Math.PI - (Math.PI / 2); // Start from top
@@ -172,6 +182,9 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
     if (Math.random() > 0.3) return; // Reduce noise
 
     const link = links[Math.floor(Math.random() * links.length)];
+    // Filter noise based on VLAN visibility
+    if (activeVlanFilter !== 'all' && link.vlan !== activeVlanFilter) return;
+
     const color = '#64748b'; // Grey for noise
 
     const sourceNode = nodes.find(n => n.id === link.sourceId);
@@ -186,25 +199,34 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
             progress: 0
         }]);
     }
-  }, [simulationTime, links, nodes]);
+  }, [simulationTime, links, nodes, activeVlanFilter]);
 
   return (
     <div className="w-full h-full bg-scada-bg relative overflow-hidden">
       
       {/* Network Legend Panel */}
-      <div className="absolute top-4 left-4 z-10 bg-scada-panel/90 p-3 rounded-lg border border-scada-border backdrop-blur shadow-lg w-64">
+      <div className="absolute top-4 left-4 z-10 bg-scada-panel/90 p-3 rounded-lg border border-scada-border backdrop-blur shadow-lg w-72">
         <div className="flex justify-between items-center mb-3">
             <h3 className="text-xs font-bold uppercase text-scada-muted flex items-center gap-2">
-                <Icons.Wifi className="w-3 h-3" /> Network Segments
+                <Icons.Wifi className="w-3 h-3" /> VLAN Segments
             </h3>
-            {/* Core Switch Edit Trigger */}
-            <button 
-                onClick={() => setIsEditingSwitch(!isEditingSwitch)}
-                className={`p-1 rounded hover:bg-white/10 ${isEditingSwitch ? 'text-scada-accent' : 'text-scada-muted'}`}
-                title="Configure Core Switch"
-            >
-                <Icons.Settings className="w-3 h-3" />
-            </button>
+            <div className="flex gap-2">
+                {activeVlanFilter !== 'all' && (
+                    <button 
+                        onClick={() => setActiveVlanFilter('all')}
+                        className="text-[10px] text-scada-accent hover:underline"
+                    >
+                        Show All
+                    </button>
+                )}
+                <button 
+                    onClick={() => setIsEditingSwitch(!isEditingSwitch)}
+                    className={`p-1 rounded hover:bg-white/10 ${isEditingSwitch ? 'text-scada-accent' : 'text-scada-muted'}`}
+                    title="Configure Core Switch"
+                >
+                    <Icons.Settings className="w-3 h-3" />
+                </button>
+            </div>
         </div>
 
         {/* Switch Config Panel */}
@@ -232,17 +254,23 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
         )}
 
         <div className="space-y-2">
-            {Object.entries(VLAN_CONFIG).map(([vlanId, config]) => (
-                 vlanId !== '1' && (
-                    <div key={vlanId} className="flex items-center justify-between text-xs">
+            {Object.entries(VLAN_CONFIG).map(([vlanId, config]) => {
+                 const id = parseInt(vlanId);
+                 const isActive = activeVlanFilter === 'all' || activeVlanFilter === id;
+                 return (
+                    <div 
+                        key={vlanId} 
+                        className={`flex items-center justify-between text-xs cursor-pointer p-1 rounded transition-colors ${isActive ? 'hover:bg-white/5' : 'opacity-50 grayscale hover:opacity-100 hover:grayscale-0'}`}
+                        onClick={() => setActiveVlanFilter(activeVlanFilter === id ? 'all' : id)}
+                    >
                         <div className="flex items-center gap-2">
-                            <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: config.color }}></span>
-                            <span className="text-gray-300 font-medium">{config.name}</span>
+                            <span className="w-2.5 h-2.5 rounded-full shadow-sm" style={{ backgroundColor: config.color }}></span>
+                            <span className={`font-medium ${isActive ? 'text-gray-200' : 'text-scada-muted'}`}>{config.name}</span>
                         </div>
-                        <span className="font-mono text-scada-muted opacity-75">VLAN {vlanId}</span>
+                        <span className="font-mono text-[10px] text-scada-muted bg-black/20 px-1.5 rounded">ID {vlanId}</span>
                     </div>
-                 )
-            ))}
+                 );
+            })}
         </div>
         
         <div className="my-3 border-t border-scada-border/50"></div>
@@ -274,20 +302,24 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
              const source = nodes.find(n => n.id === link.sourceId)!;
              const target = nodes.find(n => n.id === link.targetId)!;
              const intensity = linkActivity[link.id] || 0;
-             const vlanColor = VLAN_CONFIG[link.vlan as keyof typeof VLAN_CONFIG]?.color || '#64748b';
+             const vlanConfig = VLAN_CONFIG[link.vlan as keyof typeof VLAN_CONFIG];
+             const vlanColor = vlanConfig?.color || '#64748b';
              
              // Dynamic Style
              const isActive = intensity > 0.01;
              
+             // Filter Logic
+             const isDimmed = activeVlanFilter !== 'all' && link.vlan !== activeVlanFilter;
+             
              return (
-                 <g key={link.id}>
+                 <g key={link.id} style={{ opacity: isDimmed ? 0.1 : 1, transition: 'opacity 0.3s' }}>
                      {/* Base Line (Darker) */}
                      <line 
                         x1={source.x} y1={source.y}
                         x2={target.x} y2={target.y}
                         stroke={vlanColor}
                         strokeWidth={isActive ? 2 : 1}
-                        strokeOpacity={0.2}
+                        strokeOpacity={0.4} // Higher base opacity for better visibility of colors
                         strokeLinecap="round"
                      />
                      {/* Active Highlight Overlay (Brighter) */}
@@ -305,6 +337,9 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
 
         {/* Traffic Packets */}
         {packets.map(p => {
+             const link = links.find(l => l.id === p.linkId);
+             if (activeVlanFilter !== 'all' && link && link.vlan !== activeVlanFilter) return null;
+
              const parts = p.path.split(' ');
              const x1 = parseFloat(parts[1]);
              const y1 = parseFloat(parts[2]);
@@ -329,12 +364,18 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
       {nodes.map(node => {
         const vlanConfig = node.vlan ? VLAN_CONFIG[node.vlan as keyof typeof VLAN_CONFIG] : null;
         const isOnline = node.status === 'online';
+        const isDimmed = activeVlanFilter !== 'all' && node.vlan !== activeVlanFilter && node.type !== 'switch';
         
         return (
             <div 
                 key={node.id}
                 className={`absolute -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all duration-300 group z-20`}
-                style={{ left: node.x, top: node.y }}
+                style={{ 
+                    left: node.x, 
+                    top: node.y, 
+                    opacity: isDimmed ? 0.2 : 1,
+                    pointerEvents: isDimmed ? 'none' : 'auto'
+                }}
                 onClick={() => {
                     if (node.type === 'ied') onSelectIED(node.id);
                     if (node.type === 'switch') setIsEditingSwitch(true); // Open config on click

@@ -1,3 +1,4 @@
+
 import { IDeviceContext, LogEntry, NetworkPacket, ModbusRegister, BridgeStatus, NetworkAdapter, ControlSession, DebugState, ScriptConfig, GooseState, GooseConfig } from '../types';
 
 interface ScriptInstance {
@@ -644,17 +645,28 @@ export class SimulationEngine {
 
       script.code = sourceCode;
 
-      // 1. Line-by-Line Instrumentation
+      // 1. Line-by-Line Instrumentation and Syntax Translation
       const lines = sourceCode.split('\n');
       const instrumentedLines = lines.map((line, idx) => {
           const lineNum = idx + 1;
-          let jsLine = line
+          
+          // Remove IEC 61131-3 Comments (* ... *) before processing line
+          // Note: Multi-line comments are tricky with line-by-line processing, 
+          // assumes single line comments for this regex or ignores them
+          let jsLine = line.replace(/\(\*[\s\S]*?\*\)/g, ""); 
+          
+          jsLine = jsLine
             .replace(/Device\.ReadInput\('(\d+)'\)/g, "ctx.readInput($1)")
             .replace(/Device\.WriteCoil\('(\d+)',\s*(.*)\)/g, "ctx.writeCoil($1, $2)")
             .replace(/Device\.SetDA\('([^']+)',\s*(.*)\)/g, "ctx.setDAValue('$1', $2)")
             .replace(/Device\.GetDA\('([^']+)'\)/g, "ctx.getDAValue('$1')")
             .replace(/Device\.Log\((.*)\)/g, "ctx.Log($1)")
-            .replace(/:=/g, "=")
+            .replace(/Device\.ReadRegister\('(\d+)'\)/g, "ctx.readRegister($1)")
+            .replace(/Device\.WriteRegister\('(\d+)',\s*(.*)\)/g, "ctx.writeRegister($1, $2)")
+            
+            // IEC 61131-3 ST Syntax to JS conversions
+            .replace(/:=/g, "=") // Assignment
+            .replace(/<>/g, "!==") // Inequality
             .replace(/\bTRUE\b/g, "true")
             .replace(/\bFALSE\b/g, "false")
             .replace(/\bAND\b/g, "&&")
@@ -664,8 +676,23 @@ export class SimulationEngine {
             .replace(/\bELSIF\s+(.*)\s+THEN/g, "} else if ($1) {")
             .replace(/\bELSE\b/g, "} else {")
             .replace(/\bEND_IF;/g, "}")
+            .replace(/\bWHILE\s+(.*)\s+DO/g, "while ($1) {")
+            .replace(/\bEND_WHILE;/g, "}")
+            
+            // Math Functions mapping
+            .replace(/\bSQRT\(/g, "Math.sqrt(")
+            .replace(/\bABS\(/g, "Math.abs(")
+            .replace(/\bTO_INT\(/g, "Math.floor(")
+            .replace(/\bTRUNC\(/g, "Math.trunc(")
+            .replace(/\bREAL_TO_INT\(/g, "Math.floor(")
+            .replace(/\bMOD\b/g, "%")
+            
+            // Variable Declaration Stripping (Simulated Scope)
             .replace(/\bVAR\s+([a-zA-Z0-9_]+)(\s*:\s*[a-zA-Z0-9_]+)?\s*;/g, "") // remove var decls without init
             .replace(/\bVAR\s+([a-zA-Z0-9_]+)/g, "scope.$1") // replace var X with scope.X
+            .replace(/\bEND_VAR\b/g, "") // remove block end
+            
+            // Function Blocks (Cleanup)
             .replace(/FUNCTION_BLOCK.*$/gm, "")
             .replace(/END_FUNCTION_BLOCK/gm, "");
 

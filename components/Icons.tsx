@@ -1,0 +1,43 @@
+import { 
+  Activity, 
+  Server, 
+  Cpu, 
+  FolderTree, 
+  Zap, 
+  Shield, 
+  Settings, 
+  Search, 
+  FileText, 
+  Terminal,
+  Wifi,
+  AlertTriangle,
+  PlayCircle,
+  StopCircle,
+  Upload,
+  Bot,
+  MessageSquare,
+  ChevronRight,
+  ChevronDown,
+  LayoutDashboard,
+  Database,
+  Code,
+  Save,
+  RefreshCw,
+  Play,
+  Box,
+  Filter,
+  Trash2,
+  Eye,
+  PauseCircle,
+  List,
+  CheckCircle
+} from 'lucide-react';
+
+export const Icons = {
+  Activity, Server, Cpu, Tree: FolderTree, Zap, Shield, Settings, Search, 
+  File: FileText, Terminal, Wifi, Alert: AlertTriangle, Play: PlayCircle, 
+  Stop: StopCircle, Upload, AI: Bot, Chat: MessageSquare, ChevronRight, 
+  ChevronDown, Dashboard: LayoutDashboard, Database, Code, Save, 
+  Refresh: RefreshCw, Run: Play, Box, Filter, Trash: Trash2, Eye, Pause: PauseCircle, List,
+  CheckCircle, FileText
+};

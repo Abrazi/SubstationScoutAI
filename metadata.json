@@ -1,0 +1,5 @@
+{
+  "name": "Substation Scout AI",
+  "description": "Next-gen IEC 61850 IED Explorer and SCL Analyzer powered by Gemini. Visualize, simulate, and understand substation automation networks.",
+  "requestFramePermissions": []
+}

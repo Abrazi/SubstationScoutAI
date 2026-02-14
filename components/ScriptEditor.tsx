@@ -522,6 +522,11 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   const [newTransTarget, setNewTransTarget] = useState('');
   const [newTransCond, setNewTransCond] = useState('TRUE');
 
+  // --- Modal state for prompt/confirm replacements ---
+  const [renameModal, setRenameModal] = useState<{ isOpen: boolean; nodeId?: string; value: string }>({ isOpen: false, nodeId: undefined, value: '' });
+  const [deleteModal, setDeleteModal] = useState<{ isOpen: boolean; nodeId?: string; label?: string }>({ isOpen: false, nodeId: undefined });
+  const [forceModal, setForceModal] = useState<{ isOpen: boolean; nodeId?: string; label?: string }>({ isOpen: false, nodeId: undefined });
+
   // Debug State
   const [debugState, setDebugState] = useState<DebugState>({
       isRunning: false,
@@ -834,6 +839,63 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
       setConsoleOutput(prev => [...prev, `> Added Transition: ${node.label} -> ${newTransTarget.replace('STATE_', '')}`]);
   };
 
+  // --- Rename / Delete / Force modal handlers ---
+  const handleRenameStep = (node: SFCNode) => {
+      setRenameModal({ isOpen: true, nodeId: node.id, value: node.label });
+  };
+
+  const applyRenameStep = () => {
+      if (!renameModal.nodeId) return setRenameModal({ isOpen: false, nodeId: undefined, value: '' });
+      const clean = renameModal.value.trim().toUpperCase().replace(/\s+/g, '_');
+      const newStateId = clean.startsWith('STATE_') ? clean : `STATE_${clean}`;
+      if (!/^[A-Z0-9_]+$/.test(clean)) {
+          // simple inline validation — keep modal open
+          return;
+      }
+      const node = sfcNodes.find(n => n.id === renameModal.nodeId);
+      if (!node) return;
+      if (newStateId === node.id) {
+          setRenameModal({ isOpen: false, nodeId: undefined, value: '' });
+          return;
+      }
+      const newCode = renameStateInCode(code, node.id, newStateId);
+      setCode(newCode);
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Renamed ${node.id} -> ${newStateId}`]);
+      setRenameModal({ isOpen: false, nodeId: undefined, value: '' });
+  };
+
+  const handleDeleteStep = (node: SFCNode) => {
+      if (node.type === 'init') {
+          // show small error modal instead of alert
+          setConsoleOutput(prev => [...prev, `> Cannot delete initial step: ${node.label}`]);
+          return;
+      }
+      setDeleteModal({ isOpen: true, nodeId: node.id, label: node.label });
+  };
+
+  const confirmDeleteStep = () => {
+      if (!deleteModal.nodeId) return setDeleteModal({ isOpen: false, nodeId: undefined });
+      const node = sfcNodes.find(n => n.id === deleteModal.nodeId);
+      if (!node) return setDeleteModal({ isOpen: false, nodeId: undefined });
+      const newCode = removeStateFromCode(code, node.id, detectedStateVar);
+      setCode(newCode);
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Deleted step ${node.id}`]);
+      setDeleteModal({ isOpen: false, nodeId: undefined });
+  };
+
+  const handleForceStep = (node: SFCNode) => {
+      setForceModal({ isOpen: true, nodeId: node.id, label: node.label });
+  };
+
+  const confirmForceStep = () => {
+      if (!forceModal.nodeId) return setForceModal({ isOpen: false, nodeId: undefined });
+      const id = forceModal.nodeId;
+      setForcedSteps(prev => { const next = { ...prev, [id]: !prev[id] }; setConsoleOutput(c => [...c, `> Force ${next[id] ? 'APPLIED' : 'CLEARED'}: ${forceModal.label || id}`]); return next; });
+      setForceModal({ isOpen: false, nodeId: undefined });
+  };
+
   // --- SFC Edit Helpers: rename / delete step, reorder transitions ---
   const handleRenameStep = (node: SFCNode) => {
       const input = prompt('Rename step (enter new name, e.g. PARKED)', node.label);
@@ -1114,10 +1176,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                           <button title="Delete step" onClick={() => handleDeleteStep(node)} className="p-1 rounded text-[10px] bg-transparent hover:bg-white/5 text-scada-danger">
                                                               <Icons.Trash className="w-3 h-3" />
                                                           </button>
-                                                          <button title="Force step (UI-only)" onClick={() => {
-                                                              if (!confirm(`Force '${node.label}' active state? This simulates manual forcing (UI only).`)) return;
-                                                              setForcedSteps(prev => { const next = { ...prev, [node.id]: !prev[node.id] }; setConsoleOutput(c => [...c, `> Force ${next[node.id] ? 'APPLIED' : 'CLEARED'}: ${node.label}`]); return next; });
-                                                          }} className={`p-1 rounded text-[10px] ${isForced ? 'bg-scada-warning text-black' : 'bg-transparent text-scada-muted hover:bg-white/5'}`}>
+                                                          <button title="Force step (UI-only)" onClick={() => handleForceStep(node)} className={`p-1 rounded text-[10px] ${isForced ? 'bg-scada-warning text-black' : 'bg-transparent text-scada-muted hover:bg-white/5'}`}>
                                                               {isForced ? 'F' : 'f'}
                                                           </button>
                                                       </div>
@@ -1486,6 +1545,65 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                       >
                           {addModal.type === 'step' ? 'Create Step' : 'Add Link'}
                       </button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* Rename Modal */}
+      {renameModal.isOpen && (
+          <div className="absolute inset-0 z-50 bg-black/80 flex items-center justify-center p-8 backdrop-blur-sm animate-in fade-in">
+              <div className="bg-scada-panel border border-scada-border rounded-lg shadow-2xl w-full max-w-md flex flex-col overflow-hidden animate-in zoom-in-95">
+                  <div className="p-4 border-b border-scada-border bg-scada-bg/50 flex justify-between items-center">
+                      <h3 className="font-bold text-white">Rename Step</h3>
+                      <button onClick={() => setRenameModal({ isOpen: false, nodeId: undefined, value: '' })} className="text-scada-muted hover:text-white"><Icons.Close className="w-5 h-5" /></button>
+                  </div>
+                  <div className="p-6">
+                      <label className="text-xs font-bold text-scada-muted uppercase block mb-1">New Step Name</label>
+                      <input autoFocus value={renameModal.value} onChange={(e) => setRenameModal(r => ({ ...r, value: e.target.value }))} className="w-full bg-[#0d1117] border border-scada-border rounded p-2 text-white font-mono focus:border-scada-accent outline-none" />
+                      <div className="mt-3 text-xs text-scada-muted">Use letters, numbers and underscores only. 'STATE_' prefix will be added automatically.</div>
+                  </div>
+                  <div className="p-4 border-t border-scada-border bg-scada-bg/30 flex justify-end gap-3">
+                      <button onClick={() => setRenameModal({ isOpen: false, nodeId: undefined, value: '' })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
+                      <button onClick={applyRenameStep} className="px-4 py-2 bg-scada-accent text-white rounded text-sm font-bold hover:bg-cyan-600 transition-colors">Rename</button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {deleteModal.isOpen && (
+          <div className="absolute inset-0 z-50 bg-black/80 flex items-center justify-center p-8 backdrop-blur-sm animate-in fade-in">
+              <div className="bg-scada-panel border border-scada-border rounded-lg shadow-2xl w-full max-w-md flex flex-col overflow-hidden animate-in zoom-in-95">
+                  <div className="p-4 border-b border-scada-border bg-scada-bg/50 flex justify-between items-center">
+                      <h3 className="font-bold text-white">Delete Step</h3>
+                      <button onClick={() => setDeleteModal({ isOpen: false, nodeId: undefined })} className="text-scada-muted hover:text-white"><Icons.Close className="w-5 h-5" /></button>
+                  </div>
+                  <div className="p-6">
+                      <div className="text-sm text-scada-muted">Are you sure you want to delete <strong className="text-white">{deleteModal.label}</strong>? This will remove the state constant and any transitions targeting it.</div>
+                  </div>
+                  <div className="p-4 border-t border-scada-border bg-scada-bg/30 flex justify-end gap-3">
+                      <button onClick={() => setDeleteModal({ isOpen: false, nodeId: undefined })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
+                      <button onClick={confirmDeleteStep} className="px-4 py-2 bg-scada-danger text-white rounded text-sm font-bold hover:bg-red-600 transition-colors">Delete</button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* Force Confirmation Modal */}
+      {forceModal.isOpen && (
+          <div className="absolute inset-0 z-50 bg-black/80 flex items-center justify-center p-8 backdrop-blur-sm animate-in fade-in">
+              <div className="bg-scada-panel border border-scada-border rounded-lg shadow-2xl w-full max-w-md flex flex-col overflow-hidden animate-in zoom-in-95">
+                  <div className="p-4 border-b border-scada-border bg-scada-bg/50 flex justify-between items-center">
+                      <h3 className="font-bold text-white">Force Step</h3>
+                      <button onClick={() => setForceModal({ isOpen: false, nodeId: undefined })} className="text-scada-muted hover:text-white"><Icons.Close className="w-5 h-5" /></button>
+                  </div>
+                  <div className="p-6">
+                      <div className="text-sm text-scada-muted">Force <strong className="text-white">{forceModal.label}</strong> active? This simulates manual forcing (UI only).</div>
+                  </div>
+                  <div className="p-4 border-t border-scada-border bg-scada-bg/30 flex justify-end gap-3">
+                      <button onClick={() => setForceModal({ isOpen: false, nodeId: undefined })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
+                      <button onClick={confirmForceStep} className="px-4 py-2 bg-scada-accent text-white rounded text-sm font-bold hover:bg-cyan-600 transition-colors">Apply Force</button>
                   </div>
               </div>
           </div>

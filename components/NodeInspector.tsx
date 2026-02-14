@@ -1,3 +1,4 @@
+
 import React, { useState, useEffect } from 'react';
 import { IEDNode, NodeType, IEDConfig, WatchItem, ControlModel, ControlSession, GooseConfig } from '../types';
 import { Icons } from './Icons';
@@ -217,7 +218,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
       setIsGooseDirty(false);
   };
 
-  // Dataset Editing Logic
+  // --- Dataset Editing Logic (For NodeType.DataSet) ---
   const handleAddDatasetEntry = () => {
       if (!newDatasetEntry || !node.children) return;
       
@@ -251,6 +252,81 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
           engine.updateGooseDataset(node.path, updatedChildren.map(c => c.path || ''));
       }
   };
+
+  // --- Embedded Dataset Logic (For NodeType.GSE) ---
+  const handleCreateChildDataset = () => {
+      const dsName = 'DatSet1';
+      const dsPath = `${node.path}/${dsName}`;
+      
+      const newDataset: IEDNode = {
+          id: `ds-${Date.now()}`,
+          name: dsName,
+          type: NodeType.DataSet,
+          path: dsPath,
+          description: 'Embedded GOOSE Dataset',
+          children: []
+      };
+
+      const updatedChildren = [...(node.children || []), newDataset];
+      const updatedGooseConfig = { ...gooseForm, datSet: dsPath };
+      
+      setGooseForm(updatedGooseConfig); // Update local form
+      
+      const updatedNode = { 
+          ...node, 
+          children: updatedChildren,
+          gooseConfig: updatedGooseConfig
+      };
+
+      if (onUpdateNode) onUpdateNode(updatedNode);
+      if (node.path) {
+          engine.updateGooseConfig(node.path, updatedGooseConfig);
+      }
+  };
+
+  const handleAddEntryToChildDataset = (datasetNode: IEDNode) => {
+      if (!newDatasetEntry) return;
+
+      const newChild: IEDNode = {
+          id: `manual-da-${Date.now()}`,
+          name: newDatasetEntry.split('.').pop() || 'FCDA',
+          type: NodeType.DA,
+          path: newDatasetEntry,
+          description: `Ref: ${newDatasetEntry}`,
+          value: 'Reference'
+      };
+
+      const updatedDsChildren = [...(datasetNode.children || []), newChild];
+      const updatedDataset = { ...datasetNode, children: updatedDsChildren };
+
+      // Replace in parent children
+      const updatedChildren = (node.children || []).map(c => c.id === datasetNode.id ? updatedDataset : c);
+      
+      const updatedNode = { ...node, children: updatedChildren };
+      
+      if (onUpdateNode) onUpdateNode(updatedNode);
+      
+      // Update Engine
+      if (datasetNode.path) {
+          engine.updateGooseDataset(datasetNode.path, updatedDsChildren.map(c => c.path || ''));
+      }
+      setNewDatasetEntry('');
+  };
+
+  const handleRemoveEntryFromChildDataset = (datasetNode: IEDNode, entryId: string) => {
+      const updatedDsChildren = (datasetNode.children || []).filter(c => c.id !== entryId);
+      const updatedDataset = { ...datasetNode, children: updatedDsChildren };
+
+      const updatedChildren = (node.children || []).map(c => c.id === datasetNode.id ? updatedDataset : c);
+      const updatedNode = { ...node, children: updatedChildren };
+
+      if (onUpdateNode) onUpdateNode(updatedNode);
+
+      if (datasetNode.path) {
+          engine.updateGooseDataset(datasetNode.path, updatedDsChildren.map(c => c.path || ''));
+      }
+  };
+
 
   const addToWatchList = () => {
     if (onAddToWatch && node.path) {
@@ -310,6 +386,59 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
       }
   }, [controlSession]);
 
+  const renderDataSetTable = (children: IEDNode[], onAdd: () => void, onRemove: (id: string) => void) => (
+      <div className="p-0">
+          <table className="w-full text-left text-xs font-mono">
+              <thead className="bg-white/5 text-scada-muted uppercase">
+                  <tr>
+                      <th className="px-4 py-2">Index</th>
+                      <th className="px-4 py-2">Data Attribute Reference</th>
+                      <th className="px-4 py-2">Actions</th>
+                  </tr>
+              </thead>
+              <tbody className="divide-y divide-scada-border/30">
+                  {children.map((child, idx) => (
+                      <tr key={child.id} className="hover:bg-white/5 group">
+                          <td className="px-4 py-2 text-scada-muted">{idx + 1}</td>
+                          <td className="px-4 py-2 text-white">{child.path}</td>
+                          <td className="px-4 py-2">
+                              <button 
+                                  onClick={() => onRemove(child.id)}
+                                  className="text-scada-danger opacity-0 group-hover:opacity-100 transition-opacity hover:bg-scada-danger/10 p-1 rounded"
+                                  title="Remove Entry"
+                              >
+                                  <Icons.Trash className="w-3 h-3" />
+                              </button>
+                          </td>
+                      </tr>
+                  ))}
+                  <tr className="bg-scada-bg/30">
+                      <td className="px-4 py-2 text-scada-muted">+</td>
+                      <td className="px-4 py-2">
+                          <input 
+                              type="text" 
+                              placeholder="Enter full DA path (e.g. IED/LD/LN.DO.DA)" 
+                              className="w-full bg-transparent outline-none text-scada-accent placeholder-scada-muted/50"
+                              value={newDatasetEntry}
+                              onChange={(e) => setNewDatasetEntry(e.target.value)}
+                              onKeyDown={(e) => e.key === 'Enter' && onAdd()}
+                          />
+                      </td>
+                      <td className="px-4 py-2">
+                          <button 
+                              onClick={onAdd}
+                              disabled={!newDatasetEntry}
+                              className="text-scada-success hover:bg-scada-success/10 p-1 rounded disabled:opacity-30"
+                          >
+                              <Icons.Save className="w-3 h-3" />
+                          </button>
+                      </td>
+                  </tr>
+              </tbody>
+          </table>
+      </div>
+  );
+
   return (
     <div className="h-full flex flex-col bg-scada-bg text-scada-text animate-in fade-in duration-300">
       
@@ -365,69 +494,111 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
 
         {/* --- GOOSE Configuration Panel --- */}
         {node.type === NodeType.GSE && (
-            <div className="mb-8 bg-scada-panel border border-scada-border rounded-lg p-5 shadow-sm animate-in slide-in-from-bottom-2">
-                 <div className="flex justify-between items-center mb-4 border-b border-scada-border pb-3">
-                     <h3 className="text-sm font-bold uppercase text-white flex items-center gap-2">
-                        <Icons.Settings className="w-4 h-4 text-purple-400" /> GOOSE Publisher Settings
-                    </h3>
-                    {isGooseDirty && (
-                         <button onClick={saveGooseConfig} className="text-xs font-bold bg-scada-accent text-white px-3 py-1.5 rounded hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-900/20 flex items-center gap-2 animate-in fade-in">
-                             <Icons.Save className="w-3 h-3" /> Save Changes
-                         </button>
-                    )}
+            <>
+                <div className="mb-8 bg-scada-panel border border-scada-border rounded-lg p-5 shadow-sm animate-in slide-in-from-bottom-2">
+                     <div className="flex justify-between items-center mb-4 border-b border-scada-border pb-3">
+                         <h3 className="text-sm font-bold uppercase text-white flex items-center gap-2">
+                            <Icons.Settings className="w-4 h-4 text-purple-400" /> GOOSE Publisher Settings
+                        </h3>
+                        {isGooseDirty && (
+                             <button onClick={saveGooseConfig} className="text-xs font-bold bg-scada-accent text-white px-3 py-1.5 rounded hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-900/20 flex items-center gap-2 animate-in fade-in">
+                                 <Icons.Save className="w-3 h-3" /> Save Changes
+                             </button>
+                        )}
+                    </div>
+                    
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div className="space-y-1">
+                            <label className="text-xs font-bold text-scada-muted uppercase">AppID</label>
+                            <input 
+                                className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
+                                value={gooseForm.appID}
+                                onChange={(e) => handleGooseChange('appID', e.target.value)}
+                                placeholder="0001"
+                            />
+                        </div>
+                         <div className="space-y-1">
+                            <label className="text-xs font-bold text-scada-muted uppercase">Config Revision</label>
+                            <input 
+                                type="number"
+                                className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
+                                value={gooseForm.confRev}
+                                onChange={(e) => handleGooseChange('confRev', parseInt(e.target.value))}
+                            />
+                        </div>
+                         <div className="space-y-1">
+                            <label className="text-xs font-bold text-scada-muted uppercase">Min Time (ms)</label>
+                            <input 
+                                type="number"
+                                className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
+                                value={gooseForm.minTime}
+                                onChange={(e) => handleGooseChange('minTime', parseInt(e.target.value))}
+                            />
+                        </div>
+                         <div className="space-y-1">
+                            <label className="text-xs font-bold text-scada-muted uppercase">Max Time (ms)</label>
+                            <input 
+                                type="number"
+                                className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
+                                value={gooseForm.maxTime}
+                                onChange={(e) => handleGooseChange('maxTime', parseInt(e.target.value))}
+                            />
+                        </div>
+                        <div className="space-y-1 md:col-span-2">
+                            <label className="text-xs font-bold text-scada-muted uppercase">Dataset Reference</label>
+                            <input 
+                                className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-gray-400 cursor-not-allowed"
+                                value={gooseForm.datSet}
+                                disabled
+                                title="Dataset reference is currently read-only"
+                            />
+                        </div>
+                    </div>
                 </div>
-                
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div className="space-y-1">
-                        <label className="text-xs font-bold text-scada-muted uppercase">AppID</label>
-                        <input 
-                            className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
-                            value={gooseForm.appID}
-                            onChange={(e) => handleGooseChange('appID', e.target.value)}
-                            placeholder="0001"
-                        />
-                    </div>
-                     <div className="space-y-1">
-                        <label className="text-xs font-bold text-scada-muted uppercase">Config Revision</label>
-                        <input 
-                            type="number"
-                            className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
-                            value={gooseForm.confRev}
-                            onChange={(e) => handleGooseChange('confRev', parseInt(e.target.value))}
-                        />
-                    </div>
-                     <div className="space-y-1">
-                        <label className="text-xs font-bold text-scada-muted uppercase">Min Time (ms)</label>
-                        <input 
-                            type="number"
-                            className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
-                            value={gooseForm.minTime}
-                            onChange={(e) => handleGooseChange('minTime', parseInt(e.target.value))}
-                        />
-                    </div>
-                     <div className="space-y-1">
-                        <label className="text-xs font-bold text-scada-muted uppercase">Max Time (ms)</label>
-                        <input 
-                            type="number"
-                            className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-white"
-                            value={gooseForm.maxTime}
-                            onChange={(e) => handleGooseChange('maxTime', parseInt(e.target.value))}
-                        />
-                    </div>
-                    <div className="space-y-1 md:col-span-2">
-                        <label className="text-xs font-bold text-scada-muted uppercase">Dataset Reference</label>
-                        <input 
-                            className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-sm font-mono focus:border-scada-accent outline-none text-gray-400 cursor-not-allowed"
-                            value={gooseForm.datSet}
-                            disabled
-                            title="Dataset reference is currently read-only"
-                        />
-                    </div>
-                </div>
-            </div>
+
+                {/* --- Embedded Dataset Manager --- */}
+                {(() => {
+                    const childDataset = node.children?.find(c => c.type === NodeType.DataSet);
+                    if (childDataset) {
+                        return (
+                            <div className="mb-8 bg-scada-panel border border-scada-border rounded-lg overflow-hidden shadow-sm animate-in slide-in-from-bottom-2">
+                                <div className="px-4 py-3 bg-gradient-to-r from-scada-panel to-scada-bg border-b border-scada-border flex justify-between items-center">
+                                    <h3 className="text-sm font-bold uppercase text-white flex items-center gap-2">
+                                        <Icons.List className="w-4 h-4 text-scada-success" /> Dataset Definition (Linked)
+                                    </h3>
+                                    <div className="text-xs text-scada-muted bg-white/5 px-2 py-1 rounded border border-white/10">
+                                        {childDataset.children?.length || 0} Entries
+                                    </div>
+                                </div>
+                                {renderDataSetTable(
+                                    childDataset.children || [],
+                                    () => handleAddEntryToChildDataset(childDataset),
+                                    (id) => handleRemoveEntryFromChildDataset(childDataset, id)
+                                )}
+                            </div>
+                        );
+                    } else {
+                        return (
+                            <div className="mb-8 bg-scada-panel border border-scada-border border-dashed rounded-lg p-8 flex flex-col items-center justify-center text-center">
+                                <Icons.List className="w-10 h-10 text-scada-muted mb-3 opacity-50" />
+                                <h3 className="text-sm font-bold text-white mb-1">No Dataset Linked</h3>
+                                <p className="text-xs text-scada-muted mb-4 max-w-sm">
+                                    This GOOSE Control Block does not have a child DataSet definition. Create one to define the FCDAs transmitted in the payload.
+                                </p>
+                                <button 
+                                    onClick={handleCreateChildDataset}
+                                    className="px-4 py-2 bg-scada-success text-white rounded font-bold hover:bg-emerald-600 transition-colors shadow-lg shadow-emerald-900/20 flex items-center gap-2 text-sm"
+                                >
+                                    <Icons.Box className="w-4 h-4" /> Create Local DataSet
+                                </button>
+                            </div>
+                        );
+                    }
+                })()}
+            </>
         )}
 
-        {/* --- Dataset Editor Panel --- */}
+        {/* --- Dataset Editor Panel (For Standalone DataSet) --- */}
         {node.type === NodeType.DataSet && (
             <div className="mb-8 bg-scada-panel border border-scada-border rounded-lg overflow-hidden shadow-sm animate-in slide-in-from-bottom-2">
                 <div className="px-4 py-3 bg-gradient-to-r from-scada-panel to-scada-bg border-b border-scada-border flex justify-between items-center">
@@ -438,57 +609,11 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
                         {node.children?.length || 0} Entries
                     </div>
                 </div>
-                
-                <div className="p-0">
-                    <table className="w-full text-left text-xs font-mono">
-                        <thead className="bg-white/5 text-scada-muted uppercase">
-                            <tr>
-                                <th className="px-4 py-2">Index</th>
-                                <th className="px-4 py-2">Data Attribute Reference</th>
-                                <th className="px-4 py-2">Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody className="divide-y divide-scada-border/30">
-                            {node.children && node.children.map((child, idx) => (
-                                <tr key={child.id} className="hover:bg-white/5 group">
-                                    <td className="px-4 py-2 text-scada-muted">{idx + 1}</td>
-                                    <td className="px-4 py-2 text-white">{child.path}</td>
-                                    <td className="px-4 py-2">
-                                        <button 
-                                            onClick={() => handleRemoveDatasetEntry(child.id)}
-                                            className="text-scada-danger opacity-0 group-hover:opacity-100 transition-opacity hover:bg-scada-danger/10 p-1 rounded"
-                                            title="Remove Entry"
-                                        >
-                                            <Icons.Trash className="w-3 h-3" />
-                                        </button>
-                                    </td>
-                                </tr>
-                            ))}
-                            <tr className="bg-scada-bg/30">
-                                <td className="px-4 py-2 text-scada-muted">+</td>
-                                <td className="px-4 py-2">
-                                    <input 
-                                        type="text" 
-                                        placeholder="Enter full DA path (e.g. IED/LD/LN.DO.DA)" 
-                                        className="w-full bg-transparent outline-none text-scada-accent placeholder-scada-muted/50"
-                                        value={newDatasetEntry}
-                                        onChange={(e) => setNewDatasetEntry(e.target.value)}
-                                        onKeyDown={(e) => e.key === 'Enter' && handleAddDatasetEntry()}
-                                    />
-                                </td>
-                                <td className="px-4 py-2">
-                                    <button 
-                                        onClick={handleAddDatasetEntry}
-                                        disabled={!newDatasetEntry}
-                                        className="text-scada-success hover:bg-scada-success/10 p-1 rounded disabled:opacity-30"
-                                    >
-                                        <Icons.Save className="w-3 h-3" />
-                                    </button>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
+                {renderDataSetTable(
+                    node.children || [],
+                    handleAddDatasetEntry,
+                    handleRemoveDatasetEntry
+                )}
             </div>
         )}
 
@@ -770,7 +895,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
         )}
 
         {/* Children List for IED, LD, LN, DO */}
-        {node.children && node.children.length > 0 && node.type !== NodeType.DataSet && (
+        {node.children && node.children.length > 0 && node.type !== NodeType.DataSet && node.type !== NodeType.GSE && (
           <div>
             <h3 className="text-sm font-bold uppercase text-scada-muted mb-3 flex items-center gap-2">
               <Icons.Tree className="w-4 h-4" /> Contained Objects

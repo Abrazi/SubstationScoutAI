@@ -208,7 +208,14 @@ export const validateSCL = (xmlText: string): { valid: boolean; error?: string; 
     }
 };
 
-export const extractIEDs = (xmlText: string): { name: string; desc: string; manufacturer: string }[] => {
+export const extractIEDs = (xmlText: string): { 
+    name: string; 
+    desc: string; 
+    manufacturer: string; 
+    type: string;
+    configVersion: string;
+    accessPoints: number;
+}[] => {
     const parser = new DOMParser();
     const xmlDoc = parser.parseFromString(xmlText, "text/xml");
     if (xmlDoc.getElementsByTagName('parsererror').length > 0) return [];
@@ -216,7 +223,10 @@ export const extractIEDs = (xmlText: string): { name: string; desc: string; manu
     return Array.from(xmlDoc.querySelectorAll('IED')).map(ied => ({
         name: ied.getAttribute('name') || 'Unknown',
         desc: ied.getAttribute('desc') || '',
-        manufacturer: ied.getAttribute('manufacturer') || ''
+        manufacturer: ied.getAttribute('manufacturer') || 'Generic',
+        type: ied.getAttribute('type') || 'IED',
+        configVersion: ied.getAttribute('configVersion') || '',
+        accessPoints: ied.querySelectorAll('AccessPoint').length
     }));
 };
 

@@ -26,17 +26,24 @@ const VLAN_CONFIG = {
 };
 
 export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelectIED, onDeleteIED, simulationTime }) => {
+  // Configurable Core Switch State
+  const [switchConfig, setSwitchConfig] = useState({
+      ip: '10.0.0.1',
+      name: 'Core Switch (RSTP)'
+  });
+  const [isEditingSwitch, setIsEditingSwitch] = useState(false);
+
   // Transform IEDs into Network Nodes for visualization
   const { nodes, links } = useMemo(() => {
     // Central Switch Configuration
     const centerNode: NetworkNode = { 
         id: 'switch-01', 
-        name: 'Core Switch (RSTP)', 
+        name: switchConfig.name, 
         type: 'switch', 
         x: 400, 
         y: 350, 
         status: 'online',
-        ip: '10.0.0.1',
+        ip: switchConfig.ip,
         vlan: 1
     };
     
@@ -81,7 +88,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
     }));
 
     return { nodes: [centerNode, ...iedNodes], links: generatedLinks };
-  }, [ieds]);
+  }, [ieds, switchConfig]);
 
   const [packets, setPackets] = useState<Packet[]>([]);
   const [linkActivity, setLinkActivity] = useState<Record<string, number>>({});
@@ -186,9 +193,44 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
       
       {/* Network Legend Panel */}
       <div className="absolute top-4 left-4 z-10 bg-scada-panel/90 p-3 rounded-lg border border-scada-border backdrop-blur shadow-lg w-64">
-        <h3 className="text-xs font-bold uppercase text-scada-muted mb-3 flex items-center gap-2">
-            <Icons.Wifi className="w-3 h-3" /> Network Segments
-        </h3>
+        <div className="flex justify-between items-center mb-3">
+            <h3 className="text-xs font-bold uppercase text-scada-muted flex items-center gap-2">
+                <Icons.Wifi className="w-3 h-3" /> Network Segments
+            </h3>
+            {/* Core Switch Edit Trigger */}
+            <button 
+                onClick={() => setIsEditingSwitch(!isEditingSwitch)}
+                className={`p-1 rounded hover:bg-white/10 ${isEditingSwitch ? 'text-scada-accent' : 'text-scada-muted'}`}
+                title="Configure Core Switch"
+            >
+                <Icons.Settings className="w-3 h-3" />
+            </button>
+        </div>
+
+        {/* Switch Config Panel */}
+        {isEditingSwitch && (
+            <div className="mb-4 bg-scada-bg/50 p-2 rounded border border-scada-accent/30 text-xs animate-in slide-in-from-left-2">
+                <div className="mb-2">
+                    <label className="text-[10px] text-scada-muted uppercase font-bold block mb-1">Switch IP</label>
+                    <input 
+                        type="text" 
+                        value={switchConfig.ip}
+                        onChange={(e) => setSwitchConfig({...switchConfig, ip: e.target.value})}
+                        className="w-full bg-scada-panel border border-scada-border rounded px-2 py-1 text-white font-mono focus:border-scada-accent outline-none"
+                    />
+                </div>
+                <div>
+                    <label className="text-[10px] text-scada-muted uppercase font-bold block mb-1">Switch Name</label>
+                    <input 
+                        type="text" 
+                        value={switchConfig.name}
+                        onChange={(e) => setSwitchConfig({...switchConfig, name: e.target.value})}
+                        className="w-full bg-scada-panel border border-scada-border rounded px-2 py-1 text-white font-mono focus:border-scada-accent outline-none"
+                    />
+                </div>
+            </div>
+        )}
+
         <div className="space-y-2">
             {Object.entries(VLAN_CONFIG).map(([vlanId, config]) => (
                  vlanId !== '1' && (
@@ -293,7 +335,10 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                 key={node.id}
                 className={`absolute -translate-x-1/2 -translate-y-1/2 cursor-pointer transition-all duration-300 group z-20`}
                 style={{ left: node.x, top: node.y }}
-                onClick={() => node.type === 'ied' && onSelectIED(node.id)}
+                onClick={() => {
+                    if (node.type === 'ied') onSelectIED(node.id);
+                    if (node.type === 'switch') setIsEditingSwitch(true); // Open config on click
+                }}
             >
                 <div className={`
                     w-12 h-12 rounded-lg flex items-center justify-center border-2 shadow-[0_0_15px_rgba(0,0,0,0.5)]
@@ -346,6 +391,9 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                             >
                                 <Icons.Trash className="w-3 h-3" />
                             </button>
+                        )}
+                        {node.type === 'switch' && (
+                             <div className="text-[10px] bg-white/10 px-1 rounded text-gray-300 ml-2">CORE</div>
                         )}
                     </div>
                     

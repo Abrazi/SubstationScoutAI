@@ -21,7 +21,14 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
   const [parseError, setParseError] = useState<string | null>(null);
   
   // SCL Import State
-  const [availableIEDs, setAvailableIEDs] = useState<{name: string, desc: string, manufacturer: string}[]>([]);
+  const [availableIEDs, setAvailableIEDs] = useState<{
+      name: string; 
+      desc: string; 
+      manufacturer: string; 
+      type: string;
+      configVersion: string;
+      accessPoints: number;
+  }[]>([]);
   const [selectedImportIED, setSelectedImportIED] = useState<string>('');
   const [sclRole, setSclRole] = useState<'server' | 'client'>('server');
   
@@ -48,7 +55,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
   const [newTask, setNewTask] = useState<PollingTask>({
       id: '',
       name: 'Read Status',
-      targetIp: '192.168.1.10',
+      targetIp: '10.0.10.105',
       port: 502,
       unitId: 1,
       functionCode: 3,
@@ -64,9 +71,9 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
 
   // Network Config State
   const [netConfig, setNetConfig] = useState<IEDConfig>({
-    ip: '192.168.1.100',
+    ip: '10.0.10.100', // Default Station Bus IP
     subnet: '255.255.255.0',
-    gateway: '192.168.1.1',
+    gateway: '10.0.10.1',
     vlan: 10,
     isDHCP: false,
     role: 'server'
@@ -147,7 +154,8 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
         const ied = generateMockIED(mockName);
         setDraftIED(ied);
         setSelectedLDs(ied.children?.map(c => c.id) || []);
-        setNetConfig(prev => ({ ...prev, ip: '192.168.1.200', role: 'server' }));
+        // Default demo to Station Bus
+        setNetConfig(prev => ({ ...prev, ip: '10.0.10.101', subnet: '255.255.255.0', gateway: '10.0.10.1', vlan: 10, role: 'server' }));
         setStep('configure');
     } else {
         // Modbus Modes
@@ -165,6 +173,40 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
         setNetConfig(prev => ({ ...prev, role: def.role }));
         setStep('configure');
     }
+  };
+
+  const handleVlanChange = (newVlan: number) => {
+      // Heuristic to update subnet if the user hasn't heavily customized the IP
+      // or if they are switching between standard VLANs
+      let newIp = netConfig.ip;
+      let newGw = netConfig.gateway;
+      
+      const subnets: Record<number, string> = {
+          1: '192.168.1.',
+          10: '10.0.10.',
+          20: '10.0.20.'
+      };
+
+      const currentSubnetBase = subnets[netConfig.vlan];
+      const newSubnetBase = subnets[newVlan];
+
+      if (currentSubnetBase && newSubnetBase && netConfig.ip.startsWith(currentSubnetBase)) {
+          // Replace base but keep host part
+          const hostPart = netConfig.ip.substring(currentSubnetBase.length);
+          newIp = newSubnetBase + hostPart;
+          newGw = newSubnetBase + '1';
+      } else if (newSubnetBase) {
+          // Reset to default for that VLAN
+          newIp = newSubnetBase + '100';
+          newGw = newSubnetBase + '1';
+      }
+
+      setNetConfig(prev => ({
+          ...prev,
+          vlan: newVlan,
+          ip: newIp,
+          gateway: newGw
+      }));
   };
 
   const toggleLD = (id: string, e: React.MouseEvent) => {
@@ -401,9 +443,13 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                                 </div>
                                                 <h5 className="font-bold text-white truncate" title={ied.name}>{ied.name}</h5>
                                                 <p className="text-xs text-scada-muted mt-1 truncate">{ied.desc || 'No description'}</p>
-                                                <div className="mt-3 flex items-center gap-2 text-[10px] text-gray-400 font-mono">
-                                                    <Icons.Cpu className="w-3 h-3" />
-                                                    <span>{ied.manufacturer || 'Unknown Mfg'}</span>
+                                                
+                                                {/* Detailed Metadata Grid */}
+                                                <div className="mt-3 grid grid-cols-2 gap-2 text-[10px] text-gray-400 font-mono">
+                                                    <div className="flex items-center gap-1" title="Manufacturer"><Icons.Cpu className="w-3 h-3"/> {ied.manufacturer}</div>
+                                                    <div className="flex items-center gap-1" title="Device Type"><Icons.Box className="w-3 h-3"/> {ied.type}</div>
+                                                    <div className="flex items-center gap-1" title="Access Points"><Icons.Wifi className="w-3 h-3"/> {ied.accessPoints} APs</div>
+                                                    <div className="flex items-center gap-1" title="Config Version"><Icons.FileText className="w-3 h-3"/> v{ied.configVersion || '1.0'}</div>
                                                 </div>
                                             </div>
                                         ))}
@@ -460,6 +506,7 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
             {/* Step 2: Configure (Preview) */}
             {step === 'configure' && (
                 <div className="space-y-6">
+                    {/* ... (Existing Config Step Logic - No Changes) ... */}
                     {importMode !== 'scl' && importMode !== 'demo' ? (
                          <>
                             <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2">Device Parameters</h3>
@@ -504,12 +551,12 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                             </div>
 
                             {/* ... Modbus Editors ... */}
-                            {/* --- Slave: Register Map Editor --- */}
                             {importMode === 'modbus-slave' && (
                                 <>
                                     <h3 className="text-lg font-medium text-white border-b border-scada-border pb-2 mt-4">Local Register Map</h3>
                                     
                                     <div className="bg-scada-panel/50 p-4 rounded border border-scada-border flex flex-wrap gap-4 items-end">
+                                        {/* ... (Register Inputs) ... */}
                                         <div className="flex-1 min-w-[120px]">
                                             <label className="text-xs font-bold text-scada-muted uppercase">Type</label>
                                             <select 
@@ -737,12 +784,12 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                             <label className="text-sm font-bold text-scada-muted">VLAN ID</label>
                              <select 
                                 value={netConfig.vlan} 
-                                onChange={e => setNetConfig({...netConfig, vlan: parseInt(e.target.value)})}
+                                onChange={e => handleVlanChange(parseInt(e.target.value))}
                                 className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
                             >
+                                <option value="1">VLAN 1 (Management)</option>
                                 <option value="10">VLAN 10 (Station Bus)</option>
                                 <option value="20">VLAN 20 (Process Bus)</option>
-                                <option value="1">VLAN 1 (Management)</option>
                             </select>
                          </div>
                     </div>

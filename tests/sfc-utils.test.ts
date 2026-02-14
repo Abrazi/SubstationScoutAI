@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseSFC, renameStateInCode, removeStateFromCode, reorderTransitionBlocks } from '../components/ScriptEditor';
+import { parseSFC, renameStateInCode, removeStateFromCode, reorderTransitionBlocks, analyzeSFC } from '../components/ScriptEditor';
 import { GENERATOR_LOGIC_SCRIPT } from '../utils/generatorLogic';
 
 describe('SFC helpers & parsing', () => {
@@ -37,5 +37,22 @@ describe('SFC helpers & parsing', () => {
     const out = reorderTransitionBlocks(code, 'STATE_A', 1, 0);
     // now y=1 block should appear before x=1
     expect(out.indexOf('y = 1')).toBeLessThan(out.indexOf('x = 1'));
+  });
+
+  it('detects initial step when state variable is initialized in VAR', () => {
+    const code = `VAR\n  STATE_A : INT := 0;\n  STATE_B : INT := 1;\n  CurrentState : INT := 1;\nEND_VAR\n\nIF CurrentState = STATE_A THEN\n  (* A *)\nEND_IF;\nIF CurrentState = STATE_B THEN\n  (* B *)\nEND_IF;`;
+    const nodes = parseSFC(code);
+    const initial = nodes.find(n => n.type === 'init');
+    expect(initial).toBeDefined();
+    expect(initial!.id).toBe('STATE_B');
+  });
+
+  it('parses explicit PRI comment on transitions and suppresses IEC-SFC-007', () => {
+    const code = `VAR\n  STATE_A : INT := 0;\n  STATE_B : INT := 1;\n  STATE_C : INT := 2;\nEND_VAR\n\nIF state = STATE_A THEN\n  (* PRI: 10 *) IF x = 1 THEN state := STATE_B; END_IF;\n  IF y = 1 THEN state := STATE_C; END_IF;\nEND_IF;`;
+    const nodes = parseSFC(code);
+    const node = nodes.find(n => n.id === 'STATE_A')!;
+    expect(node.transitions.some(t => (t as any).explicitPriority)).toBeTruthy();
+    const diags = analyzeSFC(nodes, code);
+    expect(diags.find(d => d.code === 'IEC-SFC-007')).toBeUndefined();
   });
 });

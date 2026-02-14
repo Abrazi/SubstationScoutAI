@@ -1,362 +1,467 @@
 
-export const GENERATOR_LOGIC_SCRIPT = `(* 
-   Generator Controller Simulation 
-   Standard: IEC 61131-3 Structured Text (ST) 
-   State Machine: Standstill -> Pre-Lube -> Cranking -> Running -> Cooldown -> Stop
+export const GENERATOR_LOGIC_SCRIPT = `(*
+   GeneratorController - adapted for SubstationScoutAI simulation runtime
+   Notes: converted TON/CASE/TIME to integer timers and IF/ELSIF so it runs in
+   the in-browser ST -> JS translator used by SimulationEngine.
 *)
 
-(* --- Variable Declaration Block --- *)
 VAR
-  (* State Constants *)
-  STATE_STANDSTILL : INT := 0;
-  STATE_STARTING   : INT := 1;
-  STATE_RUNNING    : INT := 2;
-  STATE_SHUTDOWN   : INT := 3;
-  STATE_FAULT      : INT := 4;
-  STATE_FAST_TRANSFER : INT := 5;
+  (* Configuration Constants *)
+  VOLTAGE_EPSILON       : REAL := 10.0;
+  FREQUENCY_EPSILON     : REAL := 0.1;
+  POWER_EPSILON         : REAL := 10.0;
 
-  (* Physics Constants *)
-  NOMINAL_VOLT     : REAL := 10500.0;
-  NOMINAL_FREQ     : REAL := 50.0;
-  NOMINAL_RPM      : REAL := 1500.0;
-  NOMINAL_POWER    : REAL := 3500.0;
-  NOMINAL_REACTIVE : REAL := 2100.0;
+  DeExcitedVoltage      : REAL := 3500.0;
+  ExcitedVoltage        : REAL := 10500.0;
+  NominalFrequency      : REAL := 50.0;
+  NominalPower          : REAL := 3500.0;
+  NominalReactivePower  : REAL := 2100.0;
 
-  (* Ramp Rates *)
-  RAMP_RPM_START : REAL := 50.0;
-  RAMP_RPM_RUN   : REAL := 100.0;
-  RAMP_V         : REAL := 200.0;
-  RAMP_P         : REAL := 50.0;
-  RAMP_Q         : REAL := 30.0;
-  DT             : INT  := 100; (* ms *)
+  RampRateVoltage       : REAL := 10000.0; (* V/s equivalent when scaled by DT *)
+  RampRateFrequency     : REAL := 200.0;   (* Hz/s *)
+  RampRatePowerUp       : REAL := 10000.0; (* kW/s *)
+  RampRatePowerDown     : REAL := 10000.0; (* kW/s *)
+
+  StartDelayMs          : INT := 100;      (* ms *)
+  StopDelayMs           : INT := 100;      (* ms *)
+  DeadBusWindowMs       : INT := 3000;     (* ms *)
+  CycleInterval         : INT := 100;      (* ms - matches engine tick used for generators *)
+
+  (* State Ids *)
+  STATE_STANDSTILL      : INT := 0;
+  STATE_STARTING        : INT := 1;
+  STATE_RUNNING         : INT := 2;
+  STATE_SHUTDOWN        : INT := 3;
+  STATE_FAULT           : INT := 4;
+  STATE_FAST_TRANSFER   : INT := 5;
+
+  (* Internal state *)
+  CurrentState          : INT := 0;
+  LastProcessedState    : INT := -1;
+
+  (* Timers implemented as ms counters (increment by CycleInterval) *)
+  StartTimerElapsedMs   : INT := 0;
+  StopTimerElapsedMs    : INT := 0;
+  DeadBusWindowElapsedMs: INT := 0;
+
+  (* Simulation physics/state *)
+  rVoltage              : REAL := 0.0; (* desired setpoint *)
+  SimulatedVoltage      : REAL := 0.0; (* analog output R78 *)
+  SimulatedFrequency    : REAL := 0.0; (* analog output R76 (x100) *)
+  SimulatedCurrent      : REAL := 0.0; (* R77 *)
+  SimulatedActivePower  : REAL := 0.0; (* R129 kW *)
+  SimulatedReactivePower: REAL := 0.0; (* R130 kVAr *)
+
+  (* Command registers read *)
+  r95                   : INT := 0;    (* holding register 95 *)
+  r192                  : INT := 0;    (* holding register 192 *)
+
+  (* Parsed command bits *)
+  SimulateFailToStart   : BOOL := FALSE;
+  FailRampUp            : BOOL := FALSE;
+  FailRampDown          : BOOL := FALSE;
+  FailStartTime         : BOOL := FALSE;
+  ResetFaultCmd         : BOOL := FALSE;
+
+  SSL701_DemandModule_CMD          : BOOL := FALSE;
+  SSL703_MainsCBClosed_CMD         : BOOL := FALSE;
+  SSL704_EnGenBreakerActToDeadBus_CMD : BOOL := FALSE;
+  SSL705_LoadRejectGenCBOpen_CMD   : BOOL := FALSE;
+  SSL709_GenExcitationOff_CMD      : BOOL := FALSE;
+  SSL710_OthGCBClosedandExcitOn_CMD : BOOL := FALSE;
+
+  (* SSL Status flags (internal) - select subset used by UI/register packing *)
+  SSL429_GenCBClosed     : BOOL := FALSE;
+  SSL430_GenCBOpen       : BOOL := TRUE;
+  SSL431_OperOn          : BOOL := FALSE;
+  SSL432_OperOff         : BOOL := TRUE;
+  SSL443_EngineInStartingPhase : BOOL := FALSE;
+  SSL444_ReadyforAutoDem : BOOL := TRUE;
+  SSL447_unused          : BOOL := FALSE;
+  SSL448_ModuleisDemanded: BOOL := FALSE;
+  SSL547_GenDeexcited    : BOOL := FALSE;
+  SSL550_GenSyncLoadReleas: BOOL := FALSE;
+  SSL592_EngineAtStandStill : BOOL := TRUE;
+
+  (* Helpers/flags *)
+  VoltageInRange        : BOOL := FALSE;
+  FrequencyInRange      : BOOL := FALSE;
+  BusIsLive             : BOOL := FALSE;
+  PhaseAngleOK          : BOOL := TRUE;
+  PowerBelow10Percent   : BOOL := FALSE;
+  FaultDetected         : BOOL := FALSE;
+
+  (* Temporary counters *)
+  CycleCount            : UDINT := 0;
+  timer_seq             : INT := 0; (* used for sequences requiring ms accumulation *)
+
+  (* Register packing helpers *)
+  r14                   : INT := 0;
+  r15                   : INT := 0;
+  r29                   : INT := 0;
+  r31                   : INT := 0;
 END_VAR
 
-(* --- Initialization --- *)
-IF state = undefined THEN
-  state := STATE_STANDSTILL;
-  
-  (* Physics State *)
-  rpm := 0.0;
-  voltage := 0.0;
-  frequency := 0.0;
-  power := 0.0;
-  reactive := 0.0;
-  current := 0.0;
-  
-  (* Mechanical State *)
-  oil_pressure := 0.0;
-  coolant_temp := 25.0;
-  
-  (* Timers *)
-  timer_seq := 0;
-  
-  (* Flags *)
-  flg_GcbClosed := FALSE;
-  flg_Ready := TRUE;
-  flg_Alarm := FALSE;
-  flg_Excitation := FALSE;
-END_IF;
+(* ----------------------------- *)
+(* Main execution - runs every CycleInterval *)
+(* ----------------------------- *)
 
-(* --- Inputs Mapping --- *)
-(* Read Word 192 and mask bits *)
-r192 := Device.ReadRegister('192');
-cmd_Start   := (r192 AND 1) > 0;
-cmd_DeadBus := (r192 AND 8) > 0;
-cmd_LoadRej := (r192 AND 16) > 0;
-cmd_BusLive := (r192 AND 512) > 0;
+CycleCount := CycleCount + 1;
 
+(* Read inputs *)
 r95 := Device.ReadRegister('95');
-sim_FailStart := (r95 AND 1) > 0;
-sim_Reset     := (r95 AND 16) > 0;
+r192 := Device.ReadRegister('192');
 
-(* --- Physics Simulation --- *)
-frequency := (rpm / NOMINAL_RPM) * NOMINAL_FREQ;
+SimulateFailToStart := (r95 AND 1) > 0;
+FailRampUp := (r95 AND 2) > 0;
+FailRampDown := (r95 AND 4) > 0;
+FailStartTime := (r95 AND 8) > 0;
+ResetFaultCmd := (r95 AND 16) > 0;
 
-(* Oil Pressure Logic *)
-IF rpm > 100.0 THEN
-    IF oil_pressure < 5.0 THEN 
-        oil_pressure := oil_pressure + 0.5; 
-    END_IF;
-ELSE
-    IF oil_pressure > 0.0 THEN 
-        oil_pressure := oil_pressure - 0.1; 
-    END_IF;
+SSL701_DemandModule_CMD := (r192 AND 1) > 0;
+SSL703_MainsCBClosed_CMD := (r192 AND 4) > 0;
+SSL704_EnGenBreakerActToDeadBus_CMD := (r192 AND 8) > 0;
+SSL705_LoadRejectGenCBOpen_CMD := (r192 AND 16) > 0;
+SSL709_GenExcitationOff_CMD := (r192 AND 256) > 0;
+SSL710_OthGCBClosedandExcitOn_CMD := (r192 AND 512) > 0;
+
+(* Fault reset *)
+IF ResetFaultCmd AND FaultDetected THEN
+  FaultDetected := FALSE;
+  Device.Log('info', 'Fault cleared (reset command)');
 END_IF;
 
-(* Temperature Logic *)
-target_temp := 25.0;
-IF rpm > 100.0 THEN 
-    target_temp := 85.0 + (power / NOMINAL_POWER) * 15.0; 
+(* Validate mutually exclusive service modes simplified: ensure defaults *)
+IF SSL592_EngineAtStandStill THEN
+  SSL449_OperEngineisRunning := FALSE;
+  SSL443_EngineInStartingPhase := FALSE;
 END_IF;
 
-IF coolant_temp < target_temp THEN 
-    coolant_temp := coolant_temp + 0.05; 
+(* ----------------------------- *)
+(* State machine (IF/ELSIF style)
+   - adapted from provided IEC ST, timers implemented as ms counters
+*)
+(* ----------------------------- *)
+
+(* Update simple timers used in decisions *)
+IF SSL710_OthGCBClosedandExcitOn_CMD THEN
+  DeadBusWindowElapsedMs := 0; (* start window on command rising elsewhere in app *)
 END_IF;
-IF coolant_temp > target_temp THEN 
-    coolant_temp := coolant_temp - 0.02; 
+
+(* Advance sequence timer for START/STOP sequences *)
+timer_seq := timer_seq + CycleInterval;
+
+(* State transitions and actions *)
+IF FaultDetected AND (CurrentState <> STATE_FAULT) THEN
+  CurrentState := STATE_FAULT;
 END_IF;
 
+IF CurrentState = STATE_STANDSTILL THEN
+  (* Entry actions *)
+  IF LastProcessedState <> STATE_STANDSTILL THEN
+    SimulatedVoltage := 0.0;
+    SimulatedFrequency := 0.0;
+    SimulatedCurrent := 0.0;
+    SimulatedActivePower := 0.0;
+    SimulatedReactivePower := 0.0;
+    rVoltage := 0.0;
+    SSL429_GenCBClosed := FALSE;
+    SSL430_GenCBOpen := TRUE;
+    SSL431_OperOn := FALSE;
+    SSL432_OperOff := TRUE;
+    SSL444_ReadyforAutoDem := TRUE;
+    SSL448_ModuleisDemanded := FALSE;
+    SSL547_GenDeexcited := FALSE;
+    SSL592_EngineAtStandStill := TRUE;
+    LastProcessedState := STATE_STANDSTILL;
+  END_IF;
 
-(* --- State Machine --- *)
-
-IF state = STATE_FAULT THEN
-    (* 1. FAULT STATE *)
-    flg_GcbClosed := FALSE;
-    flg_Excitation := FALSE;
-    
-    (* Coast Down *)
-    IF rpm > 0.0 THEN rpm := rpm - RAMP_RPM_RUN; END_IF;
-    IF rpm < 0.0 THEN rpm := 0.0; END_IF;
-    
-    (* Voltage Decay *)
-    IF voltage > 0.0 THEN voltage := voltage - 500.0; END_IF;
-    IF voltage < 0.0 THEN voltage := 0.0; END_IF;
-    
-    power := 0.0;
-    reactive := 0.0;
-
-    IF sim_Reset THEN
-        state := STATE_STANDSTILL;
-        flg_Alarm := FALSE;
-        Device.Log('info', 'Fault Reset. Ready to Start.');
-    END_IF;
-
-ELSIF state = STATE_STANDSTILL THEN
-    (* 2. STANDSTILL *)
-    rpm := 0.0;
-    voltage := 0.0;
-    power := 0.0;
+  IF SSL701_DemandModule_CMD THEN
+    CurrentState := STATE_STARTING;
     timer_seq := 0;
-    flg_GcbClosed := FALSE;
-    
-    IF cmd_Start AND NOT flg_Alarm THEN
-        state := STATE_STARTING;
-        timer_seq := 0;
-        Device.Log('info', 'Sequence Initiated: Pre-Lube...');
-    END_IF;
+  END_IF;
 
-ELSIF state = STATE_STARTING THEN
-    (* 3. STARTING SEQUENCE *)
-    timer_seq := timer_seq + DT;
-    
-    (* A. Pre-Lube (0-2s) *)
-    IF timer_seq < 2000 THEN
-       IF sim_FailStart AND timer_seq > 1500 THEN
-           state := STATE_FAULT;
-           flg_Alarm := TRUE;
-           Device.Log('error', 'Start Fail: Pre-lube timeout');
-       END_IF;
-    
-    (* B. Cranking (2-4s) *)
-    ELSIF timer_seq < 4000 THEN
-       IF rpm < 300.0 THEN 
-           rpm := rpm + RAMP_RPM_START; 
-       END_IF;
-    
-    (* C. Firing & Run-up (4s+) *)
-    ELSE
-       IF rpm < NOMINAL_RPM THEN 
-           rpm := rpm + RAMP_RPM_RUN; 
-       END_IF;
-       IF rpm > NOMINAL_RPM THEN 
-           rpm := NOMINAL_RPM; 
-       END_IF;
-       
-       (* Excitation Logic *)
-       IF rpm > (NOMINAL_RPM * 0.9) THEN
-           flg_Excitation := TRUE;
-       END_IF;
-       
-       IF flg_Excitation THEN
-           IF voltage < NOMINAL_VOLT THEN 
-               voltage := voltage + RAMP_V; 
-           END_IF;
-           IF voltage > NOMINAL_VOLT THEN 
-               voltage := NOMINAL_VOLT; 
-           END_IF;
-       END_IF;
-       
-       (* Ready for Load? *)
-       IF voltage >= (NOMINAL_VOLT * 0.98) AND frequency >= (NOMINAL_FREQ * 0.98) THEN
-            (* Sync Check *)
-            can_close := FALSE;
-            
-            IF cmd_DeadBus THEN 
-                can_close := TRUE; 
-            END_IF;
-            
-            IF cmd_BusLive THEN
-                (* Wait for Sync *)
-                IF timer_seq > 8000 THEN 
-                    can_close := TRUE; 
-                END_IF;
-            ELSE
-                can_close := TRUE; (* Island Mode *)
-            END_IF;
-            
-            IF can_close THEN
-                state := STATE_RUNNING;
-                flg_GcbClosed := TRUE;
-                Device.Log('success', 'Synchronized. GCB Closed.');
-            END_IF;
-       END_IF;
-    END_IF;
-    
-    IF NOT cmd_Start THEN 
-        state := STATE_SHUTDOWN; 
-        timer_seq := 0; 
-    END_IF;
+ELSIF CurrentState = STATE_STARTING THEN
+  IF LastProcessedState <> STATE_STARTING THEN
+    StartTimerElapsedMs := 0;
+    SSL431_OperOn := TRUE;
+    SSL432_OperOff := FALSE;
+    SSL448_ModuleisDemanded := TRUE;
+    SSL592_EngineAtStandStill := FALSE;
+    SSL443_EngineInStartingPhase := TRUE;
+    LastProcessedState := STATE_STARTING;
+  END_IF;
 
-ELSIF state = STATE_RUNNING THEN
-    (* 4. RUNNING *)
-    rpm := NOMINAL_RPM;
-    voltage := NOMINAL_VOLT;
+  (* emulate start timer via timer_seq *)
+  StartTimerElapsedMs := StartTimerElapsedMs + CycleInterval;
 
-    (* Load Ramping *)
-    IF power < NOMINAL_POWER THEN 
-        power := power + RAMP_P; 
-    END_IF;
-    IF reactive < NOMINAL_REACTIVE THEN 
-        reactive := reactive + RAMP_Q; 
-    END_IF;
-    
-    (* Limits *)
-    IF power > NOMINAL_POWER THEN 
-        power := NOMINAL_POWER; 
-    END_IF;
-    IF reactive > NOMINAL_REACTIVE THEN 
-        reactive := NOMINAL_REACTIVE; 
-    END_IF;
+  (* If demand removed -> shutdown *)
+  IF NOT SSL701_DemandModule_CMD THEN
+    CurrentState := STATE_SHUTDOWN;
+  ELSE
+    VoltageInRange := ABS(SimulatedVoltage - rVoltage) < VOLTAGE_EPSILON;
+    FrequencyInRange := ABS(SimulatedFrequency - NominalFrequency) < FREQUENCY_EPSILON;
 
-    (* Load Rejection *)
-    IF cmd_LoadRej THEN
-        state := STATE_FAST_TRANSFER;
-        flg_GcbClosed := FALSE;
-        power := 0.0;
-        reactive := 0.0;
-        Device.Log('warning', 'Load Rejection! Breaker Trip.');
-    END_IF;
-    
-    IF NOT cmd_Start THEN 
-        state := STATE_SHUTDOWN; 
-        timer_seq := 0;
-        Device.Log('info', 'Stop received. Unloading...');
-    END_IF;
-
-ELSIF state = STATE_SHUTDOWN THEN
-    (* 5. SHUTDOWN *)
-    timer_seq := timer_seq + DT;
-
-    (* A. Soft Unload *)
-    IF power > 0.0 THEN 
-        power := power - RAMP_P; 
-        IF power < 0.0 THEN power := 0.0; END_IF;
-    END_IF;
-    
-    (* Open Breaker at low load *)
-    IF power < (NOMINAL_POWER * 0.05) AND flg_GcbClosed THEN
-        flg_GcbClosed := FALSE;
-        Device.Log('info', 'Breaker Open. Entering Cooldown.');
-        timer_seq := 0;
-    END_IF;
-    
-    (* B. Cooldown *)
-    IF NOT flg_GcbClosed THEN
-        power := 0.0;
-        reactive := 0.0;
-        
-        IF timer_seq > 5000 THEN
-            (* C. Stop *)
-            flg_Excitation := FALSE;
-            voltage := voltage - 500.0;
-            rpm := rpm - RAMP_RPM_RUN;
-            
-            IF rpm <= 0.0 THEN
-                rpm := 0.0;
-                voltage := 0.0;
-                state := STATE_STANDSTILL;
-                Device.Log('info', 'Engine Stopped.');
-            END_IF;
+    IF (StartTimerElapsedMs >= StartDelayMs OR FailStartTime) AND VoltageInRange AND FrequencyInRange THEN
+      IF SimulateFailToStart THEN
+        (* block start; stay in STARTING *)
+      ELSE
+        BusIsLive := SSL710_OthGCBClosedandExcitOn_CMD;
+        IF SSL709_GenExcitationOff_CMD THEN
+          SSL448_ModuleisDemanded := TRUE;
+          SSL547_GenDeexcited := TRUE;
+          SSL550_GenSyncLoadReleas := TRUE;
         END_IF;
-    END_IF;
-    
-    IF cmd_Start AND NOT flg_Alarm THEN 
-        state := STATE_STARTING; 
-    END_IF;
 
-ELSIF state = STATE_FAST_TRANSFER THEN
-    (* 6. FAST TRANSFER (Island) *)
-    rpm := NOMINAL_RPM;
-    voltage := NOMINAL_VOLT;
-    power := 0.0;
-    
-    IF NOT cmd_LoadRej AND cmd_Start THEN
-        state := STATE_STARTING;
-        Device.Log('info', 'Load Rejection Reset. Resyncing.');
+            (* PRI: 10 *) IF SSL704_EnGenBreakerActToDeadBus_CMD AND NOT BusIsLive AND SSL430_GenCBOpen THEN
+          SSL429_GenCBClosed := TRUE;
+          SSL430_GenCBOpen := FALSE;
+          SSL431_OperOn := TRUE;
+          SSL432_OperOff := FALSE;
+          CurrentState := STATE_RUNNING;
+        (* PRI: 20 *) ELSIF BusIsLive AND NOT SSL709_GenExcitationOff_CMD AND SSL430_GenCBOpen THEN
+          SSL441_SyncGenActivated := TRUE;
+          SSL547_GenDeexcited := FALSE;
+          SSL3630_ReleaseLoadAfterGenExcit := TRUE;
+          IF PhaseAngleOK THEN
+            SSL429_GenCBClosed := TRUE;
+            SSL430_GenCBOpen := FALSE;
+            SSL431_OperOn := TRUE;
+            SSL432_OperOff := FALSE;
+            CurrentState := STATE_RUNNING;
+          END_IF;
+        END_IF;
+      END_IF;
     END_IF;
-    
-    IF NOT cmd_Start THEN 
-        state := STATE_SHUTDOWN; 
+  END_IF;
+
+ELSIF CurrentState = STATE_RUNNING THEN
+  IF LastProcessedState <> STATE_RUNNING THEN
+    SSL550_GenSyncLoadReleas := TRUE;
+    SSL547_GenDeexcited := TRUE;
+    SSL448_ModuleisDemanded := TRUE;
+    SSL444_ReadyforAutoDem := FALSE;
+    SSL449_OperEngineisRunning := TRUE;
+    SSL592_EngineAtStandStill := FALSE;
+    SSL443_EngineInStartingPhase := FALSE;
+    LastProcessedState := STATE_RUNNING;
+  END_IF;
+
+  IF SSL705_LoadRejectGenCBOpen_CMD THEN
+    CurrentState := STATE_FAST_TRANSFER;
+  ELSIF NOT SSL701_DemandModule_CMD THEN
+    CurrentState := STATE_SHUTDOWN;
+  END_IF;
+
+  IF SSL703_MainsCBClosed_CMD AND SSL430_GenCBOpen THEN
+    VoltageInRange := ABS(SimulatedVoltage - ExcitedVoltage) < VOLTAGE_EPSILON;
+    FrequencyInRange := ABS(SimulatedFrequency - NominalFrequency) < FREQUENCY_EPSILON;
+    IF VoltageInRange AND FrequencyInRange THEN
+      SSL429_GenCBClosed := TRUE;
+      SSL430_GenCBOpen := FALSE;
     END_IF;
+  END_IF;
+
+ELSIF CurrentState = STATE_SHUTDOWN THEN
+  IF LastProcessedState <> STATE_SHUTDOWN THEN
+    StopTimerElapsedMs := 0;
+    SSL448_ModuleisDemanded := FALSE;
+    LastProcessedState := STATE_SHUTDOWN;
+  END_IF;
+
+  StopTimerElapsedMs := StopTimerElapsedMs + CycleInterval;
+
+  PowerBelow10Percent := SimulatedActivePower < (NominalPower * 0.1);
+  IF PowerBelow10Percent AND SSL429_GenCBClosed THEN
+    SSL429_GenCBClosed := FALSE;
+    SSL430_GenCBOpen := TRUE;
+    SSL448_ModuleisDemanded := FALSE;
+    SSL431_OperOn := FALSE;
+    SSL432_OperOff := TRUE;
+  END_IF;
+
+  IsPowerZero := ABS(SimulatedActivePower) < POWER_EPSILON;
+  (* PRI: 10 *) IF IsPowerZero AND (StopTimerElapsedMs >= StopDelayMs) THEN
+    CurrentState := STATE_STANDSTILL;
+  END_IF;
+
+  (* PRI: 20 *) IF FaultDetected THEN
+    CurrentState := STATE_FAULT;
+  END_IF;
+
+ELSIF CurrentState = STATE_FAULT THEN
+  IF LastProcessedState <> STATE_FAULT THEN
+    SimulatedVoltage := 0.0;
+    SimulatedFrequency := 0.0;
+    SimulatedCurrent := 0.0;
+    SimulatedActivePower := 0.0;
+    SimulatedReactivePower := 0.0;
+    rVoltage := 0.0;
+    SSL429_GenCBClosed := FALSE;
+    SSL430_GenCBOpen := TRUE;
+    SSL449_OperEngineisRunning := FALSE;
+    LastProcessedState := STATE_FAULT;
+  END_IF;
+
+  (* PRI: 10 *) IF NOT FaultDetected THEN
+    CurrentState := STATE_STANDSTILL;
+  END_IF;
+
+  (* PRI: 20 *) IF NOT SSL701_DemandModule_CMD THEN
+    CurrentState := STATE_SHUTDOWN;
+  END_IF;
+
+ELSIF CurrentState = STATE_FAST_TRANSFER THEN
+  IF LastProcessedState <> STATE_FAST_TRANSFER THEN
+    SSL429_GenCBClosed := FALSE;
+    SSL430_GenCBOpen := TRUE;
+    SimulatedFrequency := NominalFrequency;
+    SimulatedVoltage := ExcitedVoltage;
+    SimulatedActivePower := 0.0;
+    SimulatedReactivePower := 0.0;
+    LastProcessedState := STATE_FAST_TRANSFER;
+  END_IF;
+
+  IF SSL429_GenCBClosed THEN
+    SSL429_GenCBClosed := FALSE;
+    SSL430_GenCBOpen := TRUE;
+  END_IF;
+
+  IF NOT SSL705_LoadRejectGenCBOpen_CMD THEN
+    SSL429_GenCBClosed := TRUE;
+    SSL430_GenCBOpen := FALSE;
+    CurrentState := STATE_RUNNING;
+  ELSIF NOT SSL701_DemandModule_CMD THEN
+    CurrentState := STATE_SHUTDOWN;
+  ELSIF FaultDetected THEN
+    CurrentState := STATE_FAULT;
+  END_IF;
+
 END_IF;
 
-(* --- Calculations --- *)
-IF voltage > 100.0 THEN
-    (* Apparent Power S = SQRT(P^2 + Q^2) *)
-    s_mag := SQRT((power * power) + (reactive * reactive));
-    current := (s_mag * 1000.0) / (voltage * 1.732);
+(* ----------------------------- *)
+(* Update dynamics / ramping *)
+(* ----------------------------- *)
+
+(* Determine rVoltage setpoint by state *)
+IF CurrentState = STATE_STANDSTILL OR CurrentState = STATE_FAULT THEN
+  rVoltage := 0.0;
+ELSIF CurrentState = STATE_STARTING THEN
+  IF SSL547_GenDeexcited THEN
+    rVoltage := DeExcitedVoltage;
+  ELSE
+    IF (ABS(SimulatedVoltage - DeExcitedVoltage) < VOLTAGE_EPSILON) OR (SimulatedVoltage > DeExcitedVoltage) THEN
+      rVoltage := ExcitedVoltage;
+    ELSE
+      rVoltage := DeExcitedVoltage;
+    END_IF;
+  END_IF;
+ELSIF CurrentState = STATE_RUNNING THEN
+  IF SSL547_GenDeexcited THEN rVoltage := DeExcitedVoltage; ELSE rVoltage := ExcitedVoltage; END_IF;
+ELSIF CurrentState = STATE_SHUTDOWN THEN
+  rVoltage := 0.0;
+ELSIF CurrentState = STATE_FAST_TRANSFER THEN
+  rVoltage := ExcitedVoltage;
 ELSE
-    current := 0.0;
+  rVoltage := 0.0;
 END_IF;
 
-(* --- Write Output Registers --- *)
+(* Ramp voltage toward rVoltage (respecting FailRampUp) *)
+IF NOT FailRampUp THEN
+  Delta := rVoltage - SimulatedVoltage;
+  MaxStep := RampRateVoltage * (CycleInterval / 1000.0);
+  IF Delta > MaxStep THEN SimulatedVoltage := SimulatedVoltage + MaxStep;
+  ELSIF Delta < -MaxStep THEN SimulatedVoltage := SimulatedVoltage - MaxStep;
+  ELSE SimulatedVoltage := rVoltage; END_IF;
+  IF SimulatedVoltage < 0.0 THEN SimulatedVoltage := 0.0; ELSIF SimulatedVoltage > ExcitedVoltage THEN SimulatedVoltage := ExcitedVoltage; END_IF;
+END_IF;
 
-(* Analog Values (Convert REAL to INT) *)
-Device.WriteRegister('78', TO_INT(voltage));
-Device.WriteRegister('76', TO_INT(frequency * 100.0));
-Device.WriteRegister('129', TO_INT(power));
-Device.WriteRegister('130', TO_INT(reactive));
-Device.WriteRegister('77', TO_INT(current));
+(* Frequency ramping - simplified *)
+IF CurrentState = STATE_STARTING OR CurrentState = STATE_RUNNING OR CurrentState = STATE_FAST_TRANSFER THEN
+  NewValue := NominalFrequency;
+ELSE
+  NewValue := 0.0;
+END_IF;
+IF NOT FailRampUp THEN
+  Delta := NewValue - SimulatedFrequency;
+  MaxStep := RampRateFrequency * (CycleInterval / 1000.0);
+  IF Delta > MaxStep THEN SimulatedFrequency := SimulatedFrequency + MaxStep;
+  ELSIF Delta < -MaxStep THEN SimulatedFrequency := SimulatedFrequency - MaxStep;
+  ELSE SimulatedFrequency := NewValue; END_IF;
+  IF SimulatedFrequency < 0.0 THEN SimulatedFrequency := 0.0; ELSIF SimulatedFrequency > (NominalFrequency * 1.1) THEN SimulatedFrequency := NominalFrequency * 1.1; END_IF;
+END_IF;
+IF CurrentState = STATE_STANDSTILL OR CurrentState = STATE_FAULT THEN SimulatedFrequency := 0.0; END_IF;
 
-(* R14: Status Word 1 *)
+(* Active power setpoint & ramping *)
+IF (CurrentState = STATE_RUNNING) AND SSL429_GenCBClosed THEN NewValue := rSetpointPower ELSE NewValue := 0.0; END_IF;
+IF (SimulatedActivePower > NewValue) AND (NewValue = 0.0) THEN CurrentRampRate := RampRatePowerDown; FailRampFlag := FailRampDown;
+ELSIF CurrentState = STATE_SHUTDOWN THEN CurrentRampRate := RampRatePowerDown; FailRampFlag := FailRampDown;
+ELSE CurrentRampRate := RampRatePowerUp; FailRampFlag := FailRampUp; END_IF;
+IF NOT FailRampFlag THEN
+  Delta := NewValue - SimulatedActivePower;
+  MaxStep := CurrentRampRate * (CycleInterval / 1000.0);
+  IF Delta > MaxStep THEN SimulatedActivePower := SimulatedActivePower + MaxStep; ELSIF Delta < -MaxStep THEN SimulatedActivePower := SimulatedActivePower - MaxStep; ELSE SimulatedActivePower := NewValue; END_IF;
+  IF SimulatedActivePower < 0.0 THEN SimulatedActivePower := 0.0; ELSIF SimulatedActivePower > NominalPower THEN SimulatedActivePower := NominalPower; END_IF;
+END_IF;
+IF (SSL430_GenCBOpen AND (CurrentState <> STATE_STARTING)) OR (CurrentState = STATE_STANDSTILL) OR (CurrentState = STATE_FAULT) THEN SimulatedActivePower := 0.0; END_IF;
+
+(* Reactive power ramping (mirror active power logic) *)
+IF (CurrentState = STATE_RUNNING) AND SSL429_GenCBClosed THEN NewValue := rSetpointReactivePower ELSE NewValue := 0.0; END_IF;
+IF (SimulatedReactivePower > NewValue) AND (NewValue = 0.0) THEN CurrentRampRate := RampRatePowerDown; FailRampFlag := FailRampDown;
+ELSIF CurrentState = STATE_SHUTDOWN THEN CurrentRampRate := RampRatePowerDown; FailRampFlag := FailRampDown;
+ELSE CurrentRampRate := RampRatePowerUp; FailRampFlag := FailRampUp; END_IF;
+IF NOT FailRampFlag THEN
+  Delta := NewValue - SimulatedReactivePower;
+  MaxStep := CurrentRampRate * (CycleInterval / 1000.0);
+  IF Delta > MaxStep THEN SimulatedReactivePower := SimulatedReactivePower + MaxStep; ELSIF Delta < -MaxStep THEN SimulatedReactivePower := SimulatedReactivePower - MaxStep; ELSE SimulatedReactivePower := NewValue; END_IF;
+  IF SimulatedReactivePower < -NominalReactivePower THEN SimulatedReactivePower := -NominalReactivePower; ELSIF SimulatedReactivePower > NominalReactivePower THEN SimulatedReactivePower := NominalReactivePower; END_IF;
+END_IF;
+IF (SSL430_GenCBOpen AND (CurrentState <> STATE_STARTING)) OR (CurrentState = STATE_STANDSTILL) OR (CurrentState = STATE_FAULT) THEN SimulatedReactivePower := 0.0; END_IF;
+
+(* Current calc *)
+P_kW := SimulatedActivePower; Q_kVAr := SimulatedReactivePower; S_kVA := SQRT(P_kW * P_kW + Q_kVAr * Q_kVAr);
+IF SimulatedVoltage > VOLTAGE_EPSILON THEN SimulatedCurrent := (S_kVA * 1000.0) / (SimulatedVoltage * 1.732); ELSE SimulatedCurrent := 0.0; END_IF;
+
+(* Dead bus window: simple timer based on DeadBusWindowMs *)
+IF (NOT SSL710_OthGCBClosedandExcitOn_CMD) AND SSL710_OthGCBClosedandExcitOn_CMD THEN DeadBusWindowElapsedMs := 0; END_IF; (* noop but placeholder - external signals control start *)
+IF DeadBusWindowElapsedMs < DeadBusWindowMs THEN DeadBusWindowElapsedMs := DeadBusWindowElapsedMs + CycleInterval; END_IF;
+IF DeadBusWindowElapsedMs >= DeadBusWindowMs THEN (* expired *) END_IF;
+
+(* ----------------------------- *)
+(* Pack output registers *)
+(* ----------------------------- *)
+Device.WriteRegister('78', TO_INT(SimulatedVoltage));
+Device.WriteRegister('76', TO_INT(SimulatedFrequency * 100.0));
+Device.WriteRegister('129', TO_INT(SimulatedActivePower));
+Device.WriteRegister('130', TO_INT(SimulatedReactivePower));
+Device.WriteRegister('77', TO_INT(SimulatedCurrent));
+
+(* Status words *)
 r14 := 0;
-IF state = STATE_STANDSTILL THEN r14 := r14 OR 1; END_IF;
+IF CurrentState = STATE_STANDSTILL THEN r14 := r14 OR 1; END_IF;
 r14 := r14 OR 4; (* Auto *)
-IF flg_GcbClosed THEN 
-    r14 := r14 OR 16; 
-ELSE 
-    r14 := r14 OR 32; 
-END_IF;
-
-IF state = STATE_RUNNING OR state = STATE_FAST_TRANSFER THEN 
-    r14 := r14 OR 256; 
-END_IF;
-
-IF state = STATE_FAULT THEN 
-    r14 := r14 OR 2048; 
-END_IF;
+IF SSL429_GenCBClosed THEN r14 := r14 OR 16; ELSE r14 := r14 OR 32; END_IF;
+IF CurrentState = STATE_RUNNING OR CurrentState = STATE_FAST_TRANSFER THEN r14 := r14 OR 256; END_IF;
+IF CurrentState = STATE_FAULT THEN r14 := r14 OR 2048; END_IF;
 Device.WriteRegister('14', r14);
 
-(* R15: Status Word 2 *)
 r15 := 0;
-IF state = STATE_STARTING THEN r15 := r15 OR 4; END_IF;
-IF flg_Ready THEN r15 := r15 OR 8; END_IF;
-IF rpm > 100.0 THEN r15 := r15 OR 256; END_IF;
+IF CurrentState = STATE_STARTING THEN r15 := r15 OR 4; END_IF;
+IF SSL444_ReadyforAutoDem THEN r15 := r15 OR 8; END_IF;
+IF SimulatedCurrent > 0.0 THEN r15 := r15 OR 256; END_IF;
 Device.WriteRegister('15', r15);
 
-(* R31: Engine Status Enum *)
 r31 := 0;
-IF state = STATE_STANDSTILL THEN r31 := 1; END_IF;
-IF state = STATE_STARTING THEN r31 := 2; END_IF;
-IF state = STATE_RUNNING AND NOT flg_GcbClosed THEN r31 := 3; END_IF;
-IF state = STATE_RUNNING AND flg_GcbClosed THEN r31 := 4; END_IF;
-IF state = STATE_SHUTDOWN AND flg_GcbClosed THEN r31 := 5; END_IF;
-IF state = STATE_SHUTDOWN AND NOT flg_GcbClosed THEN r31 := 6; END_IF;
-IF state = STATE_FAULT THEN r31 := 7; END_IF;
+IF CurrentState = STATE_STANDSTILL THEN r31 := 1; END_IF;
+IF CurrentState = STATE_STARTING THEN r31 := 2; END_IF;
+IF CurrentState = STATE_RUNNING AND NOT SSL429_GenCBClosed THEN r31 := 3; END_IF;
+IF CurrentState = STATE_RUNNING AND SSL429_GenCBClosed THEN r31 := 4; END_IF;
+IF CurrentState = STATE_SHUTDOWN AND SSL429_GenCBClosed THEN r31 := 5; END_IF;
+IF CurrentState = STATE_SHUTDOWN AND NOT SSL429_GenCBClosed THEN r31 := 6; END_IF;
+IF CurrentState = STATE_FAULT THEN r31 := 7; END_IF;
 Device.WriteRegister('31', r31);
 
-(* R29: Alarms *)
 r29 := 0;
-IF flg_Alarm THEN r29 := r29 OR 1; END_IF;
+IF FaultDetected THEN r29 := r29 OR 1; END_IF;
 Device.WriteRegister('29', r29);
 `;

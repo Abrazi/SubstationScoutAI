@@ -51,6 +51,7 @@ interface SFCTransition {
     target: string;
     condition: string;
     priority: number;
+    explicitPriority?: boolean;
     fullText: string;
     lineIndex: number; 
     blockEndIndex: number;
@@ -74,6 +75,7 @@ interface SFCNode {
     id: string;
     label: string;
     type: 'init' | 'step';
+    value?: number;
     actions: SFCAction[];
     transitions: SFCTransition[];
     stepStartLine: number;
@@ -104,15 +106,17 @@ export const parseSFC = (code: string): SFCNode[] => {
 
     // 1. Find States Constants
     // Looks for patterns like: STATE_NAME : INT := 0;
-    const constRegex = /^\s*(STATE_\w+)\s*:\s*INT\s*:=\s*\d+;/;
+    const constRegex = /^\s*(STATE_\w+)\s*:\s*INT\s*:=\s*(\d+);/;
     
     lines.forEach(line => {
         const match = line.match(constRegex);
         if (match) {
-            stateNames.set(match[1], match[1]);
+            // store numeric value as string (used later for initial-step heuristics)
+            stateNames.set(match[1], match[2]);
             nodes.push({ 
                 id: match[1], 
                 label: match[1].replace('STATE_', ''), 
+                value: parseInt(match[2], 10),
                 type: (initialStepId === match[1]) ? 'init' : 'step',
                 transitions: [],
                 actions: [],
@@ -121,6 +125,21 @@ export const parseSFC = (code: string): SFCNode[] => {
             });
         }
     });
+
+    // If no explicit initial 'IF ... undefined' pattern found, try to detect initial from the
+    // state variable default value inside the VAR block (e.g. `CurrentState : INT := 0;`).
+    if (!initialStepId) {
+        const varInitRe = new RegExp(`^\\s*${stateVarName}\\s*:\\s*INT\\s*:=\\s*(\\d+);`, 'mi');
+        const varInitMatch = code.match(varInitRe);
+        if (varInitMatch) {
+            const initVal = parseInt(varInitMatch[1], 10);
+            const initialNode = nodes.find(n => (n as any).value === initVal);
+            if (initialNode) {
+                initialNode.type = 'init';
+                initialStepId = initialNode.id;
+            }
+        }
+    }
 
     if (nodes.length === 0) return [];
 
@@ -166,10 +185,14 @@ export const parseSFC = (code: string): SFCNode[] => {
             // Check for inline transition: IF cond THEN <stateVar> := TARGET; END_IF;
             const inlineTrans = trimmed.match(new RegExp(`^IF\\s+(.+)\\s+THEN\\s+${stateVarName}\\s*:=\\s*(STATE_\\w+);\\s*END_IF;`, 'i'));
             if (inlineTrans && stateNames.has(inlineTrans[2])) {
+                 const blockText = line;
+                 const priMatch = blockText.match(/\(\*\s*PRI(?:ORITY)?\s*:\s*(\d+)\s*\*\)/i);
+                 const prio = priMatch ? parseInt(priMatch[1], 10) : transitionPriorityCounter++;
                  node.transitions.push({
                     target: inlineTrans[2],
                     condition: inlineTrans[1].replace(/\(\*.*\*\)/g, '').trim(),
-                    priority: transitionPriorityCounter++,
+                    priority: prio,
+                    explicitPriority: !!priMatch,
                     fullText: line,
                     lineIndex: i,
                     blockEndIndex: i
@@ -209,11 +232,15 @@ export const parseSFC = (code: string): SFCNode[] => {
 
                 if (foundAssign && stateNames.has(targetState)) {
                     isTransition = true;
+                    const blockText = lines.slice(i, blockEnd + 1).join('\n');
+                    const priMatch = blockText.match(/\(\*\s*PRI(?:ORITY)?\s*:\s*(\d+)\s*\*\)/i);
+                    const prio = priMatch ? parseInt(priMatch[1], 10) : transitionPriorityCounter++;
                     node.transitions.push({
                         target: targetState,
                         condition: transStartMatch[1].replace(/\(\*.*\*\)/g, '').trim(),
-                        priority: transitionPriorityCounter++,
-                        fullText: lines.slice(i, blockEnd + 1).join('\n'),
+                        priority: prio,
+                        explicitPriority: !!priMatch,
+                        fullText: blockText,
                         lineIndex: i,
                         blockEndIndex: blockEnd
                     });
@@ -228,10 +255,16 @@ export const parseSFC = (code: string): SFCNode[] => {
             if (simpleAssign) {
                  const target = simpleAssign[1];
                  if (stateNames.has(target)) {
+                    // detect priority comment on same or previous line
+                    const prev = (lines[i - 1] || '').trim();
+                    const blockText = `${prev}\n${line}`;
+                    const priMatch = blockText.match(/\(\*\s*PRI(?:ORITY)?\s*:\s*(\d+)\s*\*\)/i);
+                    const prio = priMatch ? parseInt(priMatch[1], 10) : transitionPriorityCounter++;
                     node.transitions.push({ 
                         target, 
                         condition: "TRUE",
-                        priority: transitionPriorityCounter++,
+                        priority: prio,
+                        explicitPriority: !!priMatch,
                         fullText: line,
                         lineIndex: i,
                         blockEndIndex: i
@@ -275,7 +308,7 @@ export const parseSFC = (code: string): SFCNode[] => {
 };
 
 // --- SFC Analyzer & Helpers (basic, fast checks used by the UI) ---
-const analyzeSFC = (nodes: SFCNode[], code: string) => {
+export const analyzeSFC = (nodes: SFCNode[], code: string) => {
     const diagnostics: Array<{severity: 'error'|'warning'|'info', code: string, message: string, nodes?: string[]}> = [];
     if (nodes.length === 0) return diagnostics;
 
@@ -330,9 +363,11 @@ const analyzeSFC = (nodes: SFCNode[], code: string) => {
         if (n.transitions.length > 1) {
             const priorities = n.transitions.map(t => t.priority);
             const unique = new Set(priorities);
+            const hasExplicit = n.transitions.some(t => (t as any).explicitPriority);
             if (unique.size !== priorities.length) {
                 diagnostics.push({ severity: 'warning', code: 'IEC-SFC-006', message: `Duplicate transition priorities in step '${n.label}'.` , nodes: [n.id] });
-            } else {
+            } else if (!hasExplicit) {
+                // Only prompt to verify OR/AND semantics when explicit priorities are NOT present
                 diagnostics.push({ severity: 'info', code: 'IEC-SFC-007', message: `Branching detected in step '${n.label}' — verify OR/AND semantics and explicit priorities.`, nodes: [n.id] });
             }
         }

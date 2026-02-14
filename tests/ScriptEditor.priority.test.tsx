@@ -46,4 +46,80 @@ describe('SFC priority inline edit', () => {
     const codeArea = await screen.findByRole('textbox');
     expect(codeArea.value).toContain('(* PRI: 10 *)');
   });
+
+  it('detects duplicate inline priority and auto-resolves on request', async () => {
+    render(<ScriptEditor ieds={[{ id: 'P1', name: 'Device P1', type: 'IED' } as any]} initialDeviceId="P1" />);
+    userEvent.click(screen.getByRole('button', { name: /SFC Diagram/i }));
+    await screen.findByText('A');
+
+    // second transition priority button should be [2]
+    const secondPriorityBtn = screen.getAllByText(/\[2\]/)[0];
+    userEvent.click(secondPriorityBtn);
+
+    const spin = await screen.findByRole('spinbutton', { name: /edit-priority-STATE_A-1/i });
+    await userEvent.clear(spin);
+    await userEvent.type(spin, '1');
+
+    // duplicate warning & Auto-resolve shown
+    expect(screen.getByText(/Duplicate priority/)).toBeInTheDocument();
+    const autoBtn = screen.getByText(/Auto-resolve/);
+    userEvent.click(autoBtn);
+
+    // After auto-resolve, both PRI comments must exist and be unique
+    userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
+    const codeArea = await screen.findByRole('textbox');
+    expect(codeArea.value).toMatch(/\(\* PRI: 1 \*\)/);
+    expect(codeArea.value).toMatch(/\(\* PRI: 2 \*\)/);
+  });
+
+  it('allows editing priority from transition modal and prevents duplicates until auto-resolve', async () => {
+    render(<ScriptEditor ieds={[{ id: 'P1', name: 'Device P1', type: 'IED' } as any]} initialDeviceId="P1" />);
+    userEvent.click(screen.getByRole('button', { name: /SFC Diagram/i }));
+    await screen.findByText('A');
+
+    // open transition modal for second transition
+    const transBars = screen.getAllByTitle('Click to edit condition');
+    userEvent.click(transBars[1]);
+
+    // modal priority input present
+    const priInput = await screen.findByLabelText('transition-priority');
+    await userEvent.clear(priInput);
+    await userEvent.type(priInput, '1');
+
+    // Apply should be disabled due to duplicate
+    const applyBtn = screen.getByRole('button', { name: /Apply Changes/i });
+    expect(applyBtn).toBeDisabled();
+
+    // Use Auto-resolve in modal
+    const modalAuto = screen.getByText(/Auto-resolve/);
+    userEvent.click(modalAuto);
+
+    // Now Apply should be enabled
+    expect(screen.getByRole('button', { name: /Apply Changes/i })).not.toBeDisabled();
+
+    // Save changes
+    userEvent.click(screen.getByRole('button', { name: /Apply Changes/i }));
+
+    // Check ST contains PRI comments
+    userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
+    const codeArea = await screen.findByRole('textbox');
+    expect(codeArea.value).toMatch(/\(\* PRI: 1 \*\)/);
+    expect(codeArea.value).toMatch(/\(\* PRI: 2 \*\)/);
+  });
+
+  it('normalizes priorities for a step to tidy spacing (10,20,30...)', async () => {
+    render(<ScriptEditor ieds={[{ id: 'P1', name: 'Device P1', type: 'IED' } as any]} initialDeviceId="P1" />);
+    userEvent.click(screen.getByRole('button', { name: /SFC Diagram/i }));
+    await screen.findByText('A');
+
+    // click Normalize button for the step
+    const normalizeBtn = screen.getAllByTitle('Normalize priorities')[0];
+    userEvent.click(normalizeBtn);
+
+    // Check ST contains normalized PRI comments
+    userEvent.click(screen.getByRole('button', { name: /ST Code/i }));
+    const codeArea = await screen.findByRole('textbox');
+    expect(codeArea.value).toMatch(/\(\* PRI: 10 \*\)/);
+    expect(codeArea.value).toMatch(/\(\* PRI: 20 \*\)/);
+  });
 });

@@ -522,6 +522,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
       type: 'transition';
       nodeId: string;
       transitionIdx?: number;
+      priority?: number;
   }>({ isOpen: false, title: '', content: '', type: 'transition', nodeId: '' });
 
   // Creation Modal State
@@ -733,7 +734,8 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
           content: trans.condition,
           type: 'transition',
           nodeId: node.id,
-          transitionIdx: transIdx
+          transitionIdx: transIdx,
+          priority: trans.priority
       });
   };
 
@@ -806,6 +808,53 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
           const line = lines[trans.lineIndex];
           const newLine = line.replace(/IF\s+(.+)\s+THEN/, `IF ${newContent} THEN`);
           lines[trans.lineIndex] = newLine;
+
+          // handle priority change from modal if provided
+          if (typeof editModal.priority === 'number') {
+              const currentPriority = trans.priority;
+              const desired = Math.max(0, Math.floor(editModal.priority));
+              // If desired equals another transition's priority, show validation and don't apply here
+              const conflict = node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === desired);
+              if (!conflict) {
+                  // update single transition priority in-place
+                  const priRe = /\(\*\s*PRI(?:ORITY)?\s*:\s*\d+\s*\*\)/i;
+                  const blockStart = trans.lineIndex;
+                  const blockEnd = trans.blockEndIndex;
+                  const blockText = lines.slice(blockStart, blockEnd + 1).join('\n');
+                  if (priRe.test(blockText)) {
+                      const newBlock = blockText.replace(priRe, `(* PRI: ${desired} *)`);
+                      const newLines = newBlock.split('\n');
+                      lines.splice(blockStart, blockEnd - blockStart + 1, ...newLines);
+                  } else {
+                      lines.splice(blockStart, 0, `   (* PRI: ${desired} *)`);
+                  }
+              } else {
+                  // conflict: attempt auto-resolve by renumbering node's transitions
+                  const updated = node.transitions.map((t, i) => t.priority);
+                  updated[editModal.transitionIdx] = desired;
+                  // auto-resolve duplicates by scanning and assigning next free number
+                  const used = new Set<number>();
+                  const resolved: number[] = [];
+                  for (let i = 0; i < updated.length; i++) {
+                      let p = updated[i];
+                      if (!p || p <= 0) p = 1;
+                      if (!used.has(p)) {
+                          used.add(p);
+                          resolved.push(p);
+                      } else {
+                          let candidate = Math.max(...Array.from(used)) + 1;
+                          while (used.has(candidate)) candidate++;
+                          used.add(candidate);
+                          resolved.push(candidate);
+                      }
+                  }
+                  setNodeTransitionPriorities(node.id, resolved);
+                  setCode(lines.join('\n'));
+                  setIsDirty(true);
+                  setEditModal({ ...editModal, isOpen: false });
+                  return;
+              }
+          }
       }
 
       setCode(lines.join('\n'));
@@ -979,6 +1028,58 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
       setCode(lines.join('\n'));
       setIsDirty(true);
       setConsoleOutput(prev => [...prev, `> Set priority ${newPriority} on transition ${node.label} -> ${trans.target.replace('STATE_', '')}`]);
+  };
+
+  // Replace all transition priorities for a node in one pass (used by auto-resolve)
+  const setNodeTransitionPriorities = (nodeId: string, newPriorities: number[]) => {
+      const nodes = parseSFC(code);
+      const node = nodes.find(n => n.id === nodeId);
+      if (!node) return;
+      const lines = code.split('\n');
+      const start = node.stepStartLine + 1;
+      const end = node.stepEndLine;
+      // collect action lines (non-transition lines inside the step)
+      const actionLines: string[] = [];
+      let i = start;
+      while (i <= end) {
+          const inTransition = node.transitions.some(t => i >= t.lineIndex && i <= t.blockEndIndex);
+          if (inTransition) {
+              // skip the whole transition block
+              const t = node.transitions.find(t => i >= t.lineIndex && i <= t.blockEndIndex) as any;
+              i = (t.blockEndIndex || i) + 1;
+              continue;
+          }
+          actionLines.push(lines[i].trim());
+          i++;
+      }
+
+      const transitionsText = node.transitions.map((t, idx) => {
+          // remove existing PRI comments from block text
+          const blockText = t.fullText.replace(/\(\*\s*PRI(?:ORITY)?\s*:\s*\d+\s*\*\)/i, '').trim();
+          const pri = newPriorities[idx];
+          return `   (* PRI: ${pri} *) ${blockText}`;
+      });
+
+      const newBodyLines = [
+          ...actionLines.filter(l => l !== ''),
+          '',
+          ...transitionsText
+      ];
+
+      // Replace the step body in the original lines array
+      lines.splice(node.stepStartLine + 1, node.stepEndLine - node.stepStartLine, ...newBodyLines);
+      setCode(lines.join('\n'));
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Reassigned priorities for ${node.label}`]);
+  };
+
+  // Normalize priorities for a step to tidy spacing (10,20,30...)
+  const normalizePriorities = (nodeId: string, step = 10) => {
+      const nodes = parseSFC(code);
+      const node = nodes.find(n => n.id === nodeId);
+      if (!node) return;
+      const normalized = node.transitions.map((_, i) => (i + 1) * step);
+      setNodeTransitionPriorities(nodeId, normalized);
   };
 
   const startEditPriority = (nodeId: string, idx: number, value: number) => {
@@ -1292,15 +1393,29 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                                           <button onClick={() => moveTransitionInCode(node.id, idx, 'up')} className="p-0.5 rounded bg-transparent hover:bg-white/5 text-scada-muted"><Icons.ChevronDown className="w-3 h-3 rotate-180" /></button>
                                                                           {/* priority display / inline editor */}
                                                                           {editingPriority.nodeId === node.id && editingPriority.idx === idx ? (
-                                                                              <input
-                                                                                  type="number"
-                                                                                  aria-label={`edit-priority-${node.id}-${idx}`}
-                                                                                  value={editingPriority.value}
-                                                                                  onChange={(e) => setEditingPriority(p => ({ ...p, value: parseInt(e.target.value || '0', 10) }))}
-                                                                                  onBlur={() => applyEditPriority()}
-                                                                                  onKeyDown={(e) => { if (e.key === 'Enter') applyEditPriority(); if (e.key === 'Escape') setEditingPriority({}); }}
-                                                                                  className="w-12 bg-[#0d1117] border border-scada-border rounded p-1 text-xs text-center"
-                                                                              />
+                                                                              <div className="flex flex-col items-center">
+                                                                                  <input
+                                                                                      type="number"
+                                                                                      aria-label={`edit-priority-${node.id}-${idx}`}
+                                                                                      value={editingPriority.value}
+                                                                                      onChange={(e) => setEditingPriority(p => ({ ...p, value: parseInt(e.target.value || '0', 10) }))}
+                                                                                      onBlur={() => applyEditPriority()}
+                                                                                      onKeyDown={(e) => { if (e.key === 'Enter') applyEditPriority(); if (e.key === 'Escape') setEditingPriority({}); }}
+                                                                                      className="w-12 bg-[#0d1117] border border-scada-border rounded p-1 text-xs text-center"
+                                                                                  />
+                                                                                  {/* conflict detection */}
+                                                                                  {(() => {
+                                                                                      const conflict = editingPriority.nodeId === node.id && editingPriority.idx === idx && sfcNodes.find(n => n.id === node.id)?.transitions.some((t, i2) => i2 !== idx && t.priority === (editingPriority.value || 0));
+                                                                                      if (conflict) {
+                                                                                          return (
+                                                                                              <div className="text-[10px] text-yellow-400 mt-1">
+                                                                                                  Duplicate priority — <button onClick={() => applyEditPriority(undefined /*auto-resolve*/)} className="underline">Auto-resolve</button>
+                                                                                              </div>
+                                                                                          );
+                                                                                      }
+                                                                                      return null;
+                                                                                  })()}
+                                                                              </div>
                                                                           ) : (
                                                                               <button onClick={() => startEditPriority(node.id, idx, trans.priority)} className="px-1 py-0.5 rounded hover:bg-white/5">[{trans.priority}]</button>
                                                                           )}
@@ -1325,14 +1440,17 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                           </div>
                                                       ))}
                                                       
-                                                      {/* Add Another Transition Button (Branching) */}
-                                                      <button 
-                                                          onClick={() => setAddModal({isOpen: true, type: 'transition', sourceId: node.id})}
-                                                          className="mt-2 w-6 h-6 rounded-full bg-scada-bg border border-scada-border flex items-center justify-center text-scada-muted hover:text-white hover:border-scada-accent transition-colors text-xs"
-                                                          title="Add Parallel Branch / Divergence"
-                                                      >
-                                                          +
-                                                      </button>
+                                                      {/* Normalize + Add Another Transition Button (Branching) */}
+                                                      <div className="mt-2 flex items-center gap-2">
+                                                          <button onClick={() => normalizePriorities(node.id)} className="px-2 py-1 text-xs bg-scada-bg border border-scada-border rounded text-scada-muted hover:text-white" title="Normalize priorities">Normalize</button>
+                                                          <button 
+                                                              onClick={() => setAddModal({isOpen: true, type: 'transition', sourceId: node.id})}
+                                                              className="w-6 h-6 rounded-full bg-scada-bg border border-scada-border flex items-center justify-center text-scada-muted hover:text-white hover:border-scada-accent transition-colors text-xs"
+                                                              title="Add Parallel Branch / Divergence"
+                                                          >
+                                                              +
+                                                          </button>
+                                                      </div>
                                                   </div>
                                               )}
 
@@ -1544,6 +1662,47 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                       />
                       <div className="mt-2 text-xs text-scada-muted">Boolean expression (e.g., x &gt; 10 AND y &lt; 5)</div>
 
+                      {/* Priority editor (in modal) */}
+                      {editModal.type === 'transition' && typeof editModal.transitionIdx === 'number' && (
+                          <div className="mt-3 flex items-center gap-3">
+                              <label className="text-xs font-bold text-scada-muted uppercase">Priority</label>
+                              <input
+                                  aria-label="transition-priority"
+                                  type="number"
+                                  value={editModal.priority ?? 0}
+                                  onChange={(e) => setEditModal(m => ({ ...m, priority: parseInt(e.target.value || '0', 10) }))}
+                                  className="w-24 bg-[#0d1117] border border-scada-border rounded p-1 text-xs text-center"
+                              />
+                              {/* conflict detection */}
+                              {(() => {
+                                  const node = sfcNodes.find(n => n.id === editModal.nodeId);
+                                  const conflict = node && typeof editModal.priority === 'number' && node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === editModal.priority);
+                                  if (conflict) {
+                                      return (
+                                          <div className="text-[11px] text-yellow-400">
+                                              Duplicate priority for this step — <button onClick={() => {
+                                                  // auto-resolve: compute new priorities and apply
+                                                  const current = node!.transitions.map(t => t.priority);
+                                                  current[editModal.transitionIdx!] = editModal.priority || 0;
+                                                  // resolve duplicates
+                                                  const used = new Set<number>();
+                                                  const resolved: number[] = [];
+                                                  for (let i = 0; i < current.length; i++) {
+                                                      let p = current[i] || 1;
+                                                      if (!used.has(p)) { used.add(p); resolved.push(p); }
+                                                      else { let candidate = Math.max(...Array.from(used)) + 1; while (used.has(candidate)) candidate++; used.add(candidate); resolved.push(candidate); }
+                                                  }
+                                                  setNodeTransitionPriorities(node!.id, resolved);
+                                                  setEditModal({ ...editModal, priority: resolved[editModal.transitionIdx!] });
+                                              }} className="underline">Auto-resolve</button>
+                                          </div>
+                                      );
+                                  }
+                                  return null;
+                              })()}
+                          </div>
+                      )}
+
                       {/* Variable browser (quick insert) */}
                       <div className="mt-3 text-xs text-scada-muted">Variables: {Array.from(new Set([...getVariablesFromCode(code), ...Object.keys(debugState.variables)])).slice(0,50).map(v => (
                           <button key={v} onClick={() => setEditModal(m => ({ ...m, content: (m.content ? m.content + ' ' : '') + v }))} className="ml-2 mt-2 px-2 py-1 bg-scada-bg border border-scada-border rounded text-[11px] hover:bg-white/5">{v}</button>
@@ -1551,7 +1710,12 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                   </div>
                   <div className="p-4 border-t border-scada-border bg-scada-bg/30 flex justify-end gap-3">
                       <button onClick={() => setEditModal({ ...editModal, isOpen: false })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
-                      <button onClick={() => saveEdit(editModal.content)} className="px-4 py-2 bg-scada-accent text-white rounded text-sm font-bold hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-900/20">Apply Changes</button>
+                      <button
+                          onClick={() => saveEdit(editModal.content)}
+                          disabled={editModal.type === 'transition' && (() => { const node = sfcNodes.find(n => n.id === editModal.nodeId); return !!(node && typeof editModal.priority === 'number' && node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === editModal.priority)); })()}
+                          className={`px-4 py-2 rounded text-sm font-bold transition-colors shadow-lg shadow-cyan-900/20 ${editModal.type === 'transition' && (() => { const node = sfcNodes.find(n => n.id === editModal.nodeId); return !!(node && typeof editModal.priority === 'number' && node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === editModal.priority)); })() ? 'bg-scada-bg text-scada-muted opacity-60 cursor-default' : 'bg-scada-accent text-white hover:bg-cyan-600'}`}>
+                          Apply Changes
+                      </button>
                   </div>
               </div>
           </div>

@@ -330,7 +330,19 @@ export const analyzeSFC = (nodes: SFCNode[], code: string) => {
             if (!node) continue;
             node.transitions.forEach(t => { if (!visited.has(t.target)) q.push(t.target); });
         }
-        nodes.filter(n => !visited.has(n.id)).forEach(n => diagnostics.push({ severity: 'warning', code: 'IEC-SFC-003', message: `Unreachable step: ${n.label}`, nodes: [n.id] }));
+        // Determine additional states referenced anywhere by assignment (e.g. `state := STATE_X`) —
+        // treat those as reachable to avoid false-positive unreachable diagnostics when parseSFC misses complex patterns.
+        const stateVarMatch = code.match(/IF\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*STATE_\w+/i) || code.match(/([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*STATE_\w+/i);
+        const possibleStateVar = (stateVarMatch && stateVarMatch[1]) || 'state';
+        const assignRe = new RegExp('\\b' + possibleStateVar.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '\\s*:=\\s*(STATE_\\w+)', 'gi');
+        const referencedTargets = new Set<string>();
+        let am: RegExpExecArray | null;
+        while ((am = assignRe.exec(code)) !== null) referencedTargets.add(am[1]);
+
+        nodes.filter(n => !visited.has(n.id)).forEach(n => {
+            if (referencedTargets.has(n.id)) return; // referenced somewhere — consider reachable
+            diagnostics.push({ severity: 'warning', code: 'IEC-SFC-003', message: `Unreachable step: ${n.label}`, nodes: [n.id] });
+        });
 
         // Deadlock detection (reachable step with no outgoing transitions and not obviously final)
         nodes.filter(n => visited.has(n.id)).forEach(n => {

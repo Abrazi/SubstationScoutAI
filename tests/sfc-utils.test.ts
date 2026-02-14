@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseSFC, renameStateInCode, removeStateFromCode, reorderTransitionBlocks, analyzeSFC } from '../components/ScriptEditor';
 import { GENERATOR_LOGIC_SCRIPT } from '../utils/generatorLogic';
+import { engine } from '../services/SimulationEngine';
 
 describe('SFC helpers & parsing', () => {
   it('parseSFC should detect states from generator script', () => {
@@ -54,5 +55,21 @@ describe('SFC helpers & parsing', () => {
     expect(node.transitions.some(t => (t as any).explicitPriority)).toBeTruthy();
     const diags = analyzeSFC(nodes, code);
     expect(diags.find(d => d.code === 'IEC-SFC-007')).toBeUndefined();
+  });
+
+  it('generator logic compiles and FAST_TRANSFER/STARTING diagnostics are OK', () => {
+    // ensure engine has a script instance for compile()
+    engine.registerDevice('TST', 'TST');
+    const res = engine.compile('TST', GENERATOR_LOGIC_SCRIPT);
+    expect(res.success).toBe(true);
+
+    const nodes = parseSFC(GENERATOR_LOGIC_SCRIPT);
+    const diags = analyzeSFC(nodes, GENERATOR_LOGIC_SCRIPT);
+
+    // FAST_TRANSFER should not be reported unreachable
+    expect(diags.find(d => d.code === 'IEC-SFC-003' && d.nodes?.includes('STATE_FAST_TRANSFER'))).toBeUndefined();
+
+    // STARTING should not have IEC-SFC-007 because explicit PRI comments are present
+    expect(diags.find(d => d.code === 'IEC-SFC-007' && d.nodes?.includes('STATE_STARTING'))).toBeUndefined();
   });
 });

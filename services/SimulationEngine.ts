@@ -645,15 +645,16 @@ export class SimulationEngine {
 
       script.code = sourceCode;
 
+      // 0. Strip PLC-style block comments globally (avoid leftover '(*' tokens)
+      const cleanedSource = sourceCode.replace(/\(\*[\s\S]*?\*\)/g, "");
+
       // 1. Line-by-Line Instrumentation and Syntax Translation
-      const lines = sourceCode.split('\n');
+      const lines = cleanedSource.split('\n');
       const instrumentedLines = lines.map((line, idx) => {
           const lineNum = idx + 1;
           
-          // Remove IEC 61131-3 Comments (* ... *) before processing line
-          // Note: Multi-line comments are tricky with line-by-line processing, 
-          // assumes single line comments for this regex or ignores them
-          let jsLine = line.replace(/\(\*[\s\S]*?\*\)/g, ""); 
+          // Per-line safety: remove any inline ST comments that survived global stripping
+          let jsLine = line.replace(/\(\*[\s\S]*?\*\)/g, "");
           
           jsLine = jsLine
             .replace(/Device\.ReadInput\('(\d+)'\)/g, "ctx.readInput($1)")

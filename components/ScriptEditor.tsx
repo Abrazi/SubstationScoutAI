@@ -1043,7 +1043,7 @@ ELSIF state = ${stepName} THEN
                           spellCheck={false} autoFocus
                       />
                       <div className="mt-2 text-xs text-scada-muted">
-                          Boolean expression (e.g., x > 10 AND y < 5)
+                          Boolean expression (e.g., x &gt; 10 AND y &lt; 5)
                       </div>
                   </div>
                   <div className="p-4 border-t border-scada-border bg-scada-bg/30 flex justify-end gap-3">

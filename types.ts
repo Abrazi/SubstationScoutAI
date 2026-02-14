@@ -55,12 +55,12 @@ export interface GooseConfig {
 
 export interface GooseState {
     enabled: boolean;
-    stNum: number;
-    sqNum: number;
+    stNum: number; // Status Number (increments on data change)
+    sqNum: number; // Sequence Number (increments on retransmission)
     timeAllowedToLive: number;
     timestamp: number;
-    nextTx: number;
-    currentInterval: number;
+    nextTx: number; // Timestamp for next transmission
+    currentInterval: number; // Current retransmission interval
     burstMode: boolean;
     data: Record<string, any>; // Cache of dataset values
 }

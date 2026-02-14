@@ -30,7 +30,9 @@ import {
   Eye,
   PauseCircle,
   List,
-  CheckCircle
+  CheckCircle,
+  HelpCircle,
+  X
 } from 'lucide-react';
 
 export const Icons = {
@@ -39,5 +41,5 @@ export const Icons = {
   Stop: StopCircle, Upload, AI: Bot, Chat: MessageSquare, ChevronRight, 
   ChevronDown, Dashboard: LayoutDashboard, Database, Code, Save, 
   Refresh: RefreshCw, Run: Play, Box, Filter, Trash: Trash2, Eye, Pause: PauseCircle, List,
-  CheckCircle, FileText
+  CheckCircle, FileText, Help: HelpCircle, Close: X
 };

@@ -285,6 +285,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
       {/* Interactive Nodes */}
       {nodes.map(node => {
         const vlanConfig = node.vlan ? VLAN_CONFIG[node.vlan as keyof typeof VLAN_CONFIG] : null;
+        const isOnline = node.status === 'online';
         
         return (
             <div 
@@ -298,12 +299,14 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                     transition-all duration-300 relative bg-scada-panel
                     ${node.type === 'switch' 
                         ? 'border-white/20' 
-                        : 'border-scada-border hover:border-scada-accent hover:shadow-[0_0_20px_rgba(6,182,212,0.4)]'}
+                        : isOnline 
+                            ? 'border-scada-border hover:border-scada-accent hover:shadow-[0_0_20px_rgba(6,182,212,0.4)]'
+                            : 'border-scada-danger hover:border-red-500'} 
                 `}>
                     {/* Icon */}
                     {node.type === 'switch' 
                         ? <Icons.Box className="text-white w-6 h-6" /> 
-                        : <Icons.Server className="text-scada-muted w-6 h-6 group-hover:text-scada-accent transition-colors" />}
+                        : <Icons.Server className={`w-6 h-6 transition-colors ${isOnline ? 'text-scada-muted group-hover:text-scada-accent' : 'text-scada-danger'}`} />}
 
                     {/* VLAN Indicator Badge */}
                     {vlanConfig && node.type !== 'switch' && (
@@ -313,6 +316,17 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                             title={`VLAN ${node.vlan}: ${vlanConfig.name}`}
                         />
                     )}
+                </div>
+                
+                {/* Status Indicator (Animated) */}
+                <div className="absolute -top-1.5 -right-1.5 flex h-3 w-3 pointer-events-none">
+                    {isOnline && (
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-scada-success opacity-75"></span>
+                    )}
+                    <span className={`relative inline-flex rounded-full h-3 w-3 border-2 border-scada-bg ${
+                        isOnline ? 'bg-scada-success' : 
+                        node.status === 'error' ? 'bg-scada-danger' : 'bg-scada-muted'
+                    }`}></span>
                 </div>
                 
                 {/* Enhanced Tooltip Label */}
@@ -333,14 +347,14 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                                 <span style={{ color: vlanConfig?.color }}>{node.vlan}</span>
                             </div>
                         )}
+                        <div className="flex items-center justify-between gap-4 text-[10px] font-mono text-scada-muted border-t border-scada-border/50 pt-1 mt-1">
+                            <span>Status:</span>
+                            <span className={isOnline ? 'text-scada-success' : 'text-scada-danger'}>
+                                {node.status.toUpperCase()}
+                            </span>
+                        </div>
                     </div>
                 </div>
-
-                {/* Status Dot */}
-                <div className={`
-                    absolute -top-1 -left-1 w-2.5 h-2.5 rounded-full border-2 border-scada-bg
-                    ${node.status === 'online' ? 'bg-scada-success' : 'bg-scada-danger'}
-                `}></div>
             </div>
         );
       })}

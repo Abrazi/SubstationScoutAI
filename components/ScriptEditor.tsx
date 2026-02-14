@@ -32,6 +32,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   const [tickRate, setTickRate] = useState(100);
   const [consoleOutput, setConsoleOutput] = useState<string[]>(['> System initialized.', '> Select a device to edit logic.']);
   const [isDirty, setIsDirty] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   
   // Debug State
   const [debugState, setDebugState] = useState<DebugState>({
@@ -156,7 +157,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   const lines = Array.from({ length: lineCount }, (_, i) => i + 1);
 
   return (
-    <div className="h-full flex flex-col bg-scada-bg animate-in fade-in duration-300">
+    <div className="h-full flex flex-col bg-scada-bg animate-in fade-in duration-300 relative">
        {/* Header */}
       <div className="h-16 border-b border-scada-border bg-scada-panel/50 flex justify-between items-center px-4 shrink-0 gap-4">
           
@@ -197,6 +198,18 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
           
           {/* Debug Toolbar */}
           <div className="flex gap-2 shrink-0">
+               {/* Help Button */}
+               <button 
+                  onClick={() => setShowHelp(true)}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-transparent hover:bg-white/5 border border-transparent hover:border-scada-border rounded text-sm transition-colors text-scada-accent"
+                  title="Documentation"
+               >
+                  <Icons.Help className="w-4 h-4" />
+                  <span className="hidden sm:inline">Help</span>
+               </button>
+
+               <div className="w-px h-6 bg-scada-border mx-1"></div>
+
                {/* Save Button */}
                <button 
                   onClick={handleSave}
@@ -354,6 +367,157 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
               </div>
           </div>
       </div>
+
+      {/* Help Modal */}
+      {showHelp && (
+        <div className="absolute inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-8 animate-in fade-in duration-200">
+            <div className="bg-scada-panel border border-scada-border rounded-xl shadow-2xl w-full max-w-4xl h-[90%] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
+                <div className="flex justify-between items-center p-6 border-b border-scada-border bg-scada-bg/50">
+                    <h2 className="text-xl font-bold text-white flex items-center gap-3">
+                        <Icons.File className="text-purple-400 w-6 h-6"/> Scripting Reference
+                    </h2>
+                    <button onClick={() => setShowHelp(false)} className="hover:text-white text-scada-muted transition-colors">
+                        <Icons.Close className="w-6 h-6"/>
+                    </button>
+                </div>
+                <div className="flex-1 overflow-y-auto p-8 space-y-10 text-sm">
+                    
+                    <section>
+                        <h3 className="text-lg font-bold text-scada-accent mb-3 flex items-center gap-2">
+                            <Icons.Code className="w-4 h-4"/> Basic Syntax
+                        </h3>
+                        <p className="text-scada-muted mb-4">The logic engine uses a Structured Text (ST) inspired syntax compatible with IEC 61131-3.</p>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div className="space-y-4">
+                                <div>
+                                    <strong className="text-gray-200 block mb-1">Variable Declaration</strong>
+                                    <div className="bg-black/40 p-2 rounded border border-scada-border font-mono text-xs">
+                                        <span className="text-purple-400">VAR</span> myVar = <span className="text-yellow-400">10</span>;<br/>
+                                        <span className="text-purple-400">VAR</span> isActive = <span className="text-purple-400">TRUE</span>;
+                                    </div>
+                                </div>
+                                <div>
+                                    <strong className="text-gray-200 block mb-1">Assignment</strong>
+                                    <div className="bg-black/40 p-2 rounded border border-scada-border font-mono text-xs">
+                                        myVar := <span className="text-yellow-400">20</span>; <span className="text-gray-500">// or =</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div>
+                                <strong className="text-gray-200 block mb-1">Control Flow</strong>
+                                <div className="bg-black/40 p-2 rounded border border-scada-border font-mono text-xs">
+                                    <span className="text-purple-400">IF</span> condition <span className="text-purple-400">THEN</span><br/>
+                                    &nbsp;&nbsp;<span className="text-gray-500">// Statements...</span><br/>
+                                    <span className="text-purple-400">ELSIF</span> other_cond <span className="text-purple-400">THEN</span><br/>
+                                    &nbsp;&nbsp;<span className="text-gray-500">// Statements...</span><br/>
+                                    <span className="text-purple-400">ELSE</span><br/>
+                                    &nbsp;&nbsp;<span className="text-gray-500">// Statements...</span><br/>
+                                    <span className="text-purple-400">END_IF</span>;
+                                </div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section>
+                        <h3 className="text-lg font-bold text-scada-accent mb-3 flex items-center gap-2">
+                            <Icons.Server className="w-4 h-4"/> Device Functions
+                        </h3>
+                        <div className="overflow-hidden border border-scada-border rounded-lg">
+                            <table className="w-full text-left font-mono text-xs">
+                                <thead className="bg-white/5 text-scada-muted">
+                                    <tr>
+                                        <th className="px-4 py-2 border-r border-scada-border/50 w-1/3">Function</th>
+                                        <th className="px-4 py-2">Description</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-scada-border/30">
+                                    <tr>
+                                        <td className="px-4 py-2 border-r border-scada-border/30 text-yellow-400">Device.ReadInput('addr')</td>
+                                        <td className="px-4 py-2">Read Modbus Input Register (3xxxx). Returns number.</td>
+                                    </tr>
+                                    <tr>
+                                        <td className="px-4 py-2 border-r border-scada-border/30 text-yellow-400">Device.ReadRegister('addr')</td>
+                                        <td className="px-4 py-2">Read Modbus Holding Register (4xxxx). Returns number.</td>
+                                    </tr>
+                                    <tr>
+                                        <td className="px-4 py-2 border-r border-scada-border/30 text-yellow-400">Device.WriteCoil('addr', val)</td>
+                                        <td className="px-4 py-2">Write Modbus Coil (0xxxx). <span className="text-purple-400">val</span> is TRUE/FALSE.</td>
+                                    </tr>
+                                    <tr>
+                                        <td className="px-4 py-2 border-r border-scada-border/30 text-yellow-400">Device.WriteRegister('addr', val)</td>
+                                        <td className="px-4 py-2">Write Modbus Holding Register.</td>
+                                    </tr>
+                                    <tr>
+                                        <td className="px-4 py-2 border-r border-scada-border/30 text-blue-400">Device.GetDA('path')</td>
+                                        <td className="px-4 py-2">Get IEC 61850 Data Attribute value. Path format: <code>IED/LD/LN.DO.DA</code></td>
+                                    </tr>
+                                    <tr>
+                                        <td className="px-4 py-2 border-r border-scada-border/30 text-blue-400">Device.SetDA('path', val)</td>
+                                        <td className="px-4 py-2">Set IEC 61850 Data Attribute value.</td>
+                                    </tr>
+                                    <tr>
+                                        <td className="px-4 py-2 border-r border-scada-border/30 text-scada-success">Device.Log(level, msg)</td>
+                                        <td className="px-4 py-2">Print to console. Level: 'info', 'warning', 'error'.</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </section>
+
+                    <section>
+                        <h3 className="text-lg font-bold text-scada-accent mb-3 flex items-center gap-2">
+                            <Icons.Wifi className="w-4 h-4"/> Cross-Device Access
+                        </h3>
+                        <p className="text-scada-muted mb-2">
+                            Scripts can access data from <strong>any</strong> device in the network by specifying the full path.
+                            This enables complex protection schemes involving multiple IEDs (e.g., Busbar protection).
+                        </p>
+                        <div className="bg-black/40 p-4 rounded border border-scada-border font-mono text-xs">
+<pre>{`// 1. Local Access (Relative to this device)
+// If running on IED_A, this reads local inputs
+VAR localCurrent = Device.ReadInput('30001');
+
+// 2. Remote Access (Full Path)
+// Read Breaker Status from IED_Bay_02
+VAR feeder2Status = Device.GetDA('IED_Bay_02/LD0/XCBR1.Pos.stVal');
+
+// Read Voltage from Busbar IED
+VAR busVolt = Device.GetDA('IED_Busbar_Prot/LD0/MMXU1.PhV.phsA.mag');
+
+// Logic using multiple devices
+IF feeder2Status == 'on' AND busVolt > 10.0 THEN
+    Device.Log('info', 'Interlock condition met via remote signals');
+END_IF;`}</pre>
+                        </div>
+                    </section>
+
+                    <section>
+                        <h3 className="text-lg font-bold text-scada-accent mb-3 flex items-center gap-2">
+                            <Icons.Terminal className="w-4 h-4"/> Example: Breaker Interlock
+                        </h3>
+                        <div className="bg-black/40 p-4 rounded border border-scada-border font-mono text-xs">
+<pre>{`// Read Breaker Status (Modbus Coil 2)
+VAR breakerClosed = Device.ReadCoil('2');
+
+// Read Voltage from IEC 61850 Model
+VAR voltage = Device.GetDA('IED_Bay_01_MainLD0/MMXU1.PhV.phsA.mag');
+
+// If Voltage is present, prevent closing
+IF voltage > 10.0 AND NOT breakerClosed THEN
+    // Block Close Command
+    Device.SetDA('IED_Bay_01_MainLD0/XCBR1.BlkCls.stVal', TRUE);
+    Device.Log('warning', 'Interlock Active: Voltage Present (' + voltage + 'kV)');
+ELSE
+    // Release Interlock
+    Device.SetDA('IED_Bay_01_MainLD0/XCBR1.BlkCls.stVal', FALSE);
+END_IF;`}</pre>
+                        </div>
+                    </section>
+
+                </div>
+            </div>
+        </div>
+      )}
     </div>
   );
 };

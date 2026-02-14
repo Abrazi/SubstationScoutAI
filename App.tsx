@@ -170,6 +170,36 @@ const App = () => {
     }]);
   };
 
+  const handleRemoveIED = (id: string) => {
+      const iedToRemove = iedList.find(i => i.id === id);
+      if (!iedToRemove) return;
+
+      if (window.confirm(`Are you sure you want to permanently remove device "${iedToRemove.name}"? This cannot be undone.`)) {
+          // Remove from engine logic
+          engine.unregisterDevice(iedToRemove.id); 
+          
+          // Remove from list
+          const newList = iedList.filter(i => i.id !== id);
+          setIedList(newList);
+          
+          // Log
+          setLogs(prev => [...prev, {
+              id: Date.now().toString(),
+              timestamp: new Date().toISOString(),
+              source: 'System',
+              level: 'warning',
+              message: `Device removed: ${iedToRemove.name}`
+          }]);
+
+          // Adjust selection if needed
+          if (selectedIED?.id === id) {
+              const next = newList.length > 0 ? newList[0] : null;
+              setSelectedIED(next);
+              setSelectedNode(next);
+          }
+      }
+  };
+
   const handleAddToWatch = (item: WatchItem) => {
     setWatchList(prev => {
         if (prev.some(i => i.id === item.id)) return prev; // Avoid duplicates
@@ -355,6 +385,7 @@ const App = () => {
                             node={selectedNode} 
                             onUpdateNode={handleUpdateIED}
                             onAddToWatch={handleAddToWatch}
+                            onDeleteNode={handleRemoveIED}
                         />
                     )}
                     

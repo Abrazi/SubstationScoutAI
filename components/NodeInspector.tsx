@@ -8,9 +8,10 @@ interface NodeInspectorProps {
   node: IEDNode;
   onUpdateNode?: (node: IEDNode) => void;
   onAddToWatch?: (item: WatchItem) => void;
+  onDeleteNode?: (id: string) => void;
 }
 
-export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode, onAddToWatch }) => {
+export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode, onAddToWatch, onDeleteNode }) => {
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   
@@ -46,11 +47,15 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
   });
   const [isGooseDirty, setIsGooseDirty] = useState(false);
 
+  // Dataset Editing State
+  const [newDatasetEntry, setNewDatasetEntry] = useState('');
+
   // Sync with engine and props when node changes
   useEffect(() => {
     setAiAnalysis(null);
     setCtlMessage(null);
     setCtlError(null);
+    setNewDatasetEntry('');
 
     // 1. Determine if this is a Controllable Object (Has ctlModel)
     if (node.type === NodeType.DO && node.children) {
@@ -212,6 +217,41 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
       setIsGooseDirty(false);
   };
 
+  // Dataset Editing Logic
+  const handleAddDatasetEntry = () => {
+      if (!newDatasetEntry || !node.children) return;
+      
+      // Construct new node simulating a DA reference
+      const newChild: IEDNode = {
+          id: `manual-da-${Date.now()}`,
+          name: newDatasetEntry.split('.').pop() || 'DA',
+          type: NodeType.DA,
+          path: newDatasetEntry,
+          description: `Ref: ${newDatasetEntry}`,
+          value: 'Reference'
+      };
+      
+      const updatedChildren = [...node.children, newChild];
+      const updatedNode = { ...node, children: updatedChildren };
+      
+      if (onUpdateNode) onUpdateNode(updatedNode);
+      if (node.path) {
+          engine.updateGooseDataset(node.path, updatedChildren.map(c => c.path || ''));
+      }
+      setNewDatasetEntry('');
+  };
+
+  const handleRemoveDatasetEntry = (childId: string) => {
+      if (!node.children) return;
+      const updatedChildren = node.children.filter(c => c.id !== childId);
+      const updatedNode = { ...node, children: updatedChildren };
+      
+      if (onUpdateNode) onUpdateNode(updatedNode);
+      if (node.path) {
+          engine.updateGooseDataset(node.path, updatedChildren.map(c => c.path || ''));
+      }
+  };
+
   const addToWatchList = () => {
     if (onAddToWatch && node.path) {
         onAddToWatch({
@@ -231,6 +271,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
       case NodeType.DO: return <Icons.Tree className="w-8 h-8 text-scada-muted" />;
       case NodeType.DA: return <Icons.Zap className="w-8 h-8 text-yellow-400" />;
       case NodeType.GSE: return <Icons.Wifi className="w-8 h-8 text-purple-400" />;
+      case NodeType.DataSet: return <Icons.List className="w-8 h-8 text-scada-success" />;
       default: return <Icons.File className="w-8 h-8" />;
     }
   };
@@ -296,6 +337,16 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
             <Icons.AI className={`w-4 h-4 ${loading ? 'animate-pulse text-scada-accent' : 'text-purple-400'}`} />
             {loading ? "Analyzing..." : "Explain Node"}
           </button>
+          {node.type === NodeType.IED && onDeleteNode && (
+            <button 
+              onClick={() => onDeleteNode(node.id)}
+              className="flex items-center gap-2 px-3 py-2 bg-scada-danger/10 hover:bg-scada-danger/20 border border-scada-danger/30 text-scada-danger rounded text-sm transition-colors ml-2"
+              title="Delete Device"
+            >
+              <Icons.Trash className="w-4 h-4" />
+              Delete IED
+            </button>
+          )}
         </div>
 
         {/* AI Analysis Result */}
@@ -312,7 +363,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-6">
 
-        {/* --- GOOSE Configuration Panel (New) --- */}
+        {/* --- GOOSE Configuration Panel --- */}
         {node.type === NodeType.GSE && (
             <div className="mb-8 bg-scada-panel border border-scada-border rounded-lg p-5 shadow-sm animate-in slide-in-from-bottom-2">
                  <div className="flex justify-between items-center mb-4 border-b border-scada-border pb-3">
@@ -372,6 +423,71 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
                             title="Dataset reference is currently read-only"
                         />
                     </div>
+                </div>
+            </div>
+        )}
+
+        {/* --- Dataset Editor Panel --- */}
+        {node.type === NodeType.DataSet && (
+            <div className="mb-8 bg-scada-panel border border-scada-border rounded-lg overflow-hidden shadow-sm animate-in slide-in-from-bottom-2">
+                <div className="px-4 py-3 bg-gradient-to-r from-scada-panel to-scada-bg border-b border-scada-border flex justify-between items-center">
+                    <h3 className="text-sm font-bold uppercase text-white flex items-center gap-2">
+                        <Icons.List className="w-4 h-4 text-scada-success" /> Dataset Definition (FCDAs)
+                    </h3>
+                    <div className="text-xs text-scada-muted bg-white/5 px-2 py-1 rounded border border-white/10">
+                        {node.children?.length || 0} Entries
+                    </div>
+                </div>
+                
+                <div className="p-0">
+                    <table className="w-full text-left text-xs font-mono">
+                        <thead className="bg-white/5 text-scada-muted uppercase">
+                            <tr>
+                                <th className="px-4 py-2">Index</th>
+                                <th className="px-4 py-2">Data Attribute Reference</th>
+                                <th className="px-4 py-2">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody className="divide-y divide-scada-border/30">
+                            {node.children && node.children.map((child, idx) => (
+                                <tr key={child.id} className="hover:bg-white/5 group">
+                                    <td className="px-4 py-2 text-scada-muted">{idx + 1}</td>
+                                    <td className="px-4 py-2 text-white">{child.path}</td>
+                                    <td className="px-4 py-2">
+                                        <button 
+                                            onClick={() => handleRemoveDatasetEntry(child.id)}
+                                            className="text-scada-danger opacity-0 group-hover:opacity-100 transition-opacity hover:bg-scada-danger/10 p-1 rounded"
+                                            title="Remove Entry"
+                                        >
+                                            <Icons.Trash className="w-3 h-3" />
+                                        </button>
+                                    </td>
+                                </tr>
+                            ))}
+                            <tr className="bg-scada-bg/30">
+                                <td className="px-4 py-2 text-scada-muted">+</td>
+                                <td className="px-4 py-2">
+                                    <input 
+                                        type="text" 
+                                        placeholder="Enter full DA path (e.g. IED/LD/LN.DO.DA)" 
+                                        className="w-full bg-transparent outline-none text-scada-accent placeholder-scada-muted/50"
+                                        value={newDatasetEntry}
+                                        onChange={(e) => setNewDatasetEntry(e.target.value)}
+                                        onKeyDown={(e) => e.key === 'Enter' && handleAddDatasetEntry()}
+                                    />
+                                </td>
+                                <td className="px-4 py-2">
+                                    <button 
+                                        onClick={handleAddDatasetEntry}
+                                        disabled={!newDatasetEntry}
+                                        className="text-scada-success hover:bg-scada-success/10 p-1 rounded disabled:opacity-30"
+                                    >
+                                        <Icons.Save className="w-3 h-3" />
+                                    </button>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
         )}
@@ -654,7 +770,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
         )}
 
         {/* Children List for IED, LD, LN, DO */}
-        {node.children && node.children.length > 0 && (
+        {node.children && node.children.length > 0 && node.type !== NodeType.DataSet && (
           <div>
             <h3 className="text-sm font-bold uppercase text-scada-muted mb-3 flex items-center gap-2">
               <Icons.Tree className="w-4 h-4" /> Contained Objects
@@ -680,7 +796,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({ node, onUpdateNode
           </div>
         )}
         
-        {(!node.children || node.children.length === 0) && node.type !== NodeType.DA && node.type !== NodeType.IED && node.type !== NodeType.GSE && (
+        {(!node.children || node.children.length === 0) && node.type !== NodeType.DA && node.type !== NodeType.IED && node.type !== NodeType.GSE && node.type !== NodeType.DataSet && (
             <div className="text-center py-10 text-scada-muted border-2 border-dashed border-scada-border rounded-lg">
                 <Icons.File className="w-12 h-12 mx-auto mb-2 opacity-20" />
                 <p>Empty Container</p>

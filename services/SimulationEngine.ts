@@ -312,6 +312,36 @@ export class SimulationEngine {
       }
   }
 
+  public updateGooseDataset(datasetPath: string, newEntries: string[]) {
+      let updatedCount = 0;
+      this.goosePublishers.forEach((state, controlPath) => {
+          // Check if this publisher uses the updated dataset
+          // Paths might vary slightly (absolute vs relative), checking for suffix match as fallback
+          if (state.config.datSet === datasetPath || datasetPath.endsWith(state.config.datSet) || state.config.datSet.endsWith(datasetPath)) {
+              state.datasetEntries = newEntries;
+              
+              // Trigger Burst
+              state.burstMode = true;
+              state.stNum++;
+              state.sqNum = 0;
+              state.currentInterval = state.config.minTime;
+              state.nextTx = Date.now();
+              
+              updatedCount++;
+              this.emitLog('info', `Dataset Updated for ${state.config.appID}. New Size: ${newEntries.length}`);
+              
+              // Refresh cache
+              newEntries.forEach(path => {
+                  state.data[path] = this.readMMS(path);
+              });
+          }
+      });
+      
+      if (updatedCount === 0) {
+          this.emitLog('warning', `No active GOOSE Control Blocks found using dataset: ${datasetPath}`);
+      }
+  }
+
   private checkGooseTriggers(changedPath: string, newValue: any) {
       // Find any GOOSE publisher that includes this path in its dataset
       this.goosePublishers.forEach((state, controlPath) => {
@@ -574,6 +604,13 @@ export class SimulationEngine {
           });
       }
       return this.scripts.get(id)!;
+  }
+  
+  public unregisterDevice(id: string) {
+      if (this.scripts.has(id)) {
+          this.scripts.delete(id);
+          this.emitLog('info', `Device unregistered: ${id}`);
+      }
   }
 
   public getScriptConfig(id: string): ScriptConfig | null {

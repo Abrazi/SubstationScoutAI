@@ -97,7 +97,7 @@ export interface SimulationData {
   breakerStatus: boolean; // true = closed, false = open
 }
 
-export type ViewMode = 'explorer' | 'dashboard' | 'ai-analysis' | 'network' | 'modbus' | 'logic' | 'config' | 'tap';
+export type ViewMode = 'explorer' | 'dashboard' | 'ai-analysis' | 'network' | 'modbus' | 'logic' | 'config' | 'tap' | 'client';
 
 export interface ChatMessage {
   id: string;
@@ -212,4 +212,15 @@ export interface ScriptConfig {
     deviceId: string;
     code: string;
     tickRate: number; // ms
+}
+
+// Client Master Types
+export interface ClientTransaction {
+    id: string;
+    timestamp: string;
+    type: 'request' | 'response' | 'error';
+    protocol: 'Modbus' | 'MMS';
+    details: string;
+    value?: any;
+    status: 'success' | 'timeout' | 'error';
 }

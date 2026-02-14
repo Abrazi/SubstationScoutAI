@@ -11,6 +11,7 @@ import { ScriptEditor } from './components/ScriptEditor';
 import { DeviceConfigurator } from './components/DeviceConfigurator';
 import { NetworkTap } from './components/NetworkTap';
 import { WatchListPanel } from './components/WatchListPanel';
+import { ClientMasterPanel } from './components/ClientMasterPanel';
 import { generateMockIED } from './utils/mockGenerator';
 import { analyzeSCLFile } from './services/geminiService';
 import { parseSCL, validateSCL } from './utils/sclParser';
@@ -279,6 +280,7 @@ const App = () => {
            
            <div className="my-2 border-t border-scada-border/50 mx-2"></div>
            
+           <NavItem icon={Icons.Cable} label="Client & Master" active={viewMode === 'client'} onClick={() => setViewMode('client')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Settings} label="Device Configurator" active={viewMode === 'config'} onClick={() => setViewMode('config')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Database} label="Modbus Slave" active={viewMode === 'modbus'} onClick={() => setViewMode('modbus')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Code} label="Logic Editor" active={viewMode === 'logic'} onClick={() => setViewMode('logic')} collapsed={!sidebarOpen} />
@@ -315,6 +317,7 @@ const App = () => {
                 {viewMode === 'modbus' && 'Modbus Gateway Configuration'}
                 {viewMode === 'logic' && 'Programmable Logic Controller'}
                 {viewMode === 'config' && 'IED Configuration Wizard'}
+                {viewMode === 'client' && 'Client & Master Simulator'}
             </h1>
             <div className="flex items-center gap-4">
                  {/* Simulation Controls */}
@@ -415,6 +418,10 @@ const App = () => {
                             onCancel={() => setViewMode('dashboard')} 
                             existingIEDs={iedList} 
                         />
+                    )}
+
+                    {viewMode === 'client' && (
+                        <ClientMasterPanel ieds={iedList} />
                     )}
 
                     {/* Error Overlay */}

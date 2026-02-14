@@ -80,7 +80,7 @@ interface SFCNode {
     stepEndLine: number;
 }
 
-const parseSFC = (code: string): SFCNode[] => {
+export const parseSFC = (code: string): SFCNode[] => {
     const nodes: SFCNode[] = [];
     if (!code) return nodes;
 
@@ -369,6 +369,50 @@ const getVariablesFromCode = (code: string) => {
     return vars;
 };
 
+// --- SFC Code-manipulation helpers (exported for testing and UI operations) ---
+export const renameStateInCode = (code: string, oldStateId: string, newStateId: string) => {
+    if (!oldStateId || !newStateId || oldStateId === newStateId) return code;
+    const escOld = oldStateId.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+    const wordRe = new RegExp('\\b' + escOld + '\\b', 'g');
+    return code.replace(wordRe, newStateId);
+};
+
+export const removeStateFromCode = (code: string, stateId: string, stateVarName = 'state') => {
+    if (!stateId) return code;
+    const escState = stateId.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&');
+    // Remove VAR constant line
+    const varRe = new RegExp('^\\s*' + escState + '\\s*:\\s*INT\\s*:=\\s*\\d+;\\s*\\n?', 'm');
+    let out = code.replace(varRe, '');
+    // Remove step block (IF/ELSIF <stateVarName> = STATE_X THEN ... up to next ELSIF or END_IF;)
+    const stepBlockRe = new RegExp('(?:IF|ELSIF)\\s+' + stateVarName + '\\s*=\\s*' + escState + '\\s+THEN[\\s\\S]*?(?=(?:\\n\\s*(?:ELSIF\\s+' + stateVarName + '|END_IF;)|$))', 'i');
+    out = out.replace(stepBlockRe, '');
+    // Remove direct assignments to the removed state
+    const assignRe = new RegExp('\\b' + stateVarName.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '\\s*:=\\s*' + escState + '\\b;?', 'g');
+    out = out.replace(assignRe, '');
+    return out;
+};
+
+export const reorderTransitionBlocks = (code: string, nodeId: string, fromIndex: number, toIndex: number) => {
+    const nodes = parseSFC(code);
+    const node = nodes.find(n => n.id === nodeId);
+    if (!node || node.transitions.length < 2) return code;
+    const lines = code.split('\n');
+    const blocks = node.transitions.map(t => ({ start: t.lineIndex, end: t.blockEndIndex, text: lines.slice(t.lineIndex, t.blockEndIndex + 1).join('\n') }));
+    blocks.sort((a,b) => a.start - b.start);
+    if (fromIndex < 0 || fromIndex >= blocks.length || toIndex < 0 || toIndex >= blocks.length) return code;
+    const moved = blocks.splice(fromIndex, 1)[0];
+    blocks.splice(toIndex, 0, moved);
+    // Remove original blocks from code (descending order)
+    const originalRanges = node.transitions.map(t => ({ start: t.lineIndex, end: t.blockEndIndex })).sort((a,b) => b.start - a.start);
+    for (const r of originalRanges) {
+        lines.splice(r.start, r.end - r.start + 1);
+    }
+    const insertAt = Math.min(...originalRanges.map(r => r.start));
+    const insertText = blocks.map(b => b.text).join('\n');
+    lines.splice(insertAt, 0, insertText);
+    return lines.join('\n');
+};
+
 const exportPLCopenXML = (nodes: SFCNode[], code: string) => {
     const pouName = 'SFC_POU';
     const xmlParts: string[] = [];
@@ -504,16 +548,23 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
       });
   }, []);
 
-  // Update transition trace when debugger reports a new 'state' value for the selected device
+  // Detect state variable name used in the ST source (e.g. `state`, `CurrentState`)
+  const detectedStateVar = useMemo(() => {
+      const m1 = code.match(/IF\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*STATE_\w+/i);
+      const m2 = code.match(/([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*STATE_\w+/i);
+      return (m1 && m1[1]) || (m2 && m2[1]) || 'state';
+  }, [code]);
+
+  // Update transition trace when debugger reports a new state value for the selected device
   useEffect(() => {
-      const stateVal = debugState.variables['state'];
+      const stateVal = debugState.variables[detectedStateVar];
       if (debugState.activeDeviceId === selectedDeviceId && stateVal !== undefined) {
           if (lastStateRef.current !== stateVal) {
               setTransitionTrace(prev => [{ timestamp: Date.now(), from: lastStateRef.current, to: stateVal, deviceId: selectedDeviceId }, ...prev].slice(0, 1000));
               lastStateRef.current = stateVal;
           }
       }
-  }, [debugState.variables, debugState.activeDeviceId, selectedDeviceId]); 
+  }, [debugState.variables, debugState.activeDeviceId, selectedDeviceId, detectedStateVar]); 
 
   // ... (Handlers for scroll, save, run, stop, breakpoint) ...
   const handleScroll = () => {
@@ -721,7 +772,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
       const lastEndIf = newCode.lastIndexOf('END_IF;');
       if (lastEndIf > 0) {
           const block = `
-ELSIF state = ${stepName} THEN
+ELSIF ${detectedStateVar} = ${stepName} THEN
    (* Actions for ${newStepName} *)
    (* Q:N *) ;
 `;
@@ -740,7 +791,7 @@ ELSIF state = ${stepName} THEN
       if (!node) return;
       const lines = code.split('\n');
       const insertIdx = node.stepEndLine + 1;
-      const transCode = `   IF ${newTransCond} THEN state := ${newTransTarget}; END_IF;`;
+      const transCode = `   IF ${newTransCond} THEN ${detectedStateVar} := ${newTransTarget}; END_IF;`;
       lines.splice(insertIdx, 0, transCode);
       setCode(lines.join('\n'));
       setIsDirty(true);
@@ -748,12 +799,53 @@ ELSIF state = ${stepName} THEN
       setConsoleOutput(prev => [...prev, `> Added Transition: ${node.label} -> ${newTransTarget.replace('STATE_', '')}`]);
   };
 
+  // --- SFC Edit Helpers: rename / delete step, reorder transitions ---
+  const handleRenameStep = (node: SFCNode) => {
+      const input = prompt('Rename step (enter new name, e.g. PARKED)', node.label);
+      if (!input) return;
+      const clean = input.trim().toUpperCase().replace(/\s+/g, '_');
+      const newStateId = clean.startsWith('STATE_') ? clean : `STATE_${clean}`;
+      if (!/^[A-Z0-9_]+$/.test(clean)) {
+          alert('Invalid step name. Use letters, numbers and underscores only.');
+          return;
+      }
+      if (newStateId === node.id) return;
+      const newCode = renameStateInCode(code, node.id, newStateId);
+      setCode(newCode);
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Renamed ${node.id} -> ${newStateId}`]);
+  };
+
+  const handleDeleteStep = (node: SFCNode) => {
+      if (node.type === 'init') {
+          alert('Cannot delete the initial step.');
+          return;
+      }
+      if (!confirm(`Delete step '${node.label}' and remove all transitions targeting it?`)) return;
+      const newCode = removeStateFromCode(code, node.id, detectedStateVar);
+      setCode(newCode);
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Deleted step ${node.id}`]);
+  };
+
+  const moveTransitionInCode = (nodeId: string, idx: number, direction: 'up' | 'down') => {
+      const nodes = parseSFC(code);
+      const node = nodes.find(n => n.id === nodeId);
+      if (!node) return;
+      const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+      if (targetIdx < 0 || targetIdx >= node.transitions.length) return;
+      const newCode = reorderTransitionBlocks(code, nodeId, idx, targetIdx);
+      setCode(newCode);
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Reordered transitions for ${node.label}`]);
+  };
+
   const isActiveDebugTarget = debugState.activeDeviceId === selectedDeviceId;
   const showDebugLine = debugState.isPaused && isActiveDebugTarget;
   
   const activeSFCStepId = useMemo(() => {
       if (!isActiveDebugTarget && !debugState.isRunning) return null;
-      const stateVal = debugState.variables['state'];
+      const stateVal = debugState.variables[detectedStateVar];
       if (stateVal === undefined) return null;
       const lines = code.split('\n');
       for (const line of lines) {
@@ -979,11 +1071,21 @@ ELSIF state = ${stepName} THEN
                                                           <div className="px-1 rounded bg-scada-bg/80 text-scada-muted">{node.label}_N: {activationCount}</div>
                                                       </div>
 
-                                                      {/* Force toggle */}
-                                                      <button title="Force step (UI-only)" onClick={() => {
-                                                          if (!confirm(`Force '${node.label}' active state? This simulates manual forcing (UI only).`)) return;
-                                                          setForcedSteps(prev => { const next = { ...prev, [node.id]: !prev[node.id] }; setConsoleOutput(c => [...c, `> Force ${next[node.id] ? 'APPLIED' : 'CLEARED'}: ${node.label}`]); return next; });
-                                                      }} className={`absolute top-1 right-1 p-1 rounded text-[10px] ${isForced ? 'bg-scada-warning text-black' : 'bg-transparent text-scada-muted hover:bg-white/5'}`}>{isForced ? 'F' : 'f'}</button>
+                                                      {/* Rename / Delete / Force controls */}
+                                                      <div className="absolute top-1 right-1 flex items-center gap-1">
+                                                          <button title="Rename step" onClick={() => handleRenameStep(node)} className="p-1 rounded text-[10px] bg-transparent hover:bg-white/5 text-scada-muted">
+                                                              <Icons.File className="w-3 h-3" />
+                                                          </button>
+                                                          <button title="Delete step" onClick={() => handleDeleteStep(node)} className="p-1 rounded text-[10px] bg-transparent hover:bg-white/5 text-scada-danger">
+                                                              <Icons.Trash className="w-3 h-3" />
+                                                          </button>
+                                                          <button title="Force step (UI-only)" onClick={() => {
+                                                              if (!confirm(`Force '${node.label}' active state? This simulates manual forcing (UI only).`)) return;
+                                                              setForcedSteps(prev => { const next = { ...prev, [node.id]: !prev[node.id] }; setConsoleOutput(c => [...c, `> Force ${next[node.id] ? 'APPLIED' : 'CLEARED'}: ${node.label}`]); return next; });
+                                                          }} className={`p-1 rounded text-[10px] ${isForced ? 'bg-scada-warning text-black' : 'bg-transparent text-scada-muted hover:bg-white/5'}`}>
+                                                              {isForced ? 'F' : 'f'}
+                                                          </button>
+                                                      </div>
 
                                                       {isActive && <div className="absolute -right-1.5 top-1.5 w-2 h-2 bg-scada-accent rounded-full animate-ping" />}
                                                   </div>
@@ -1036,7 +1138,13 @@ ELSIF state = ${stepName} THEN
                                                           <div key={idx} className="flex flex-col items-center w-full group relative">
                                                               <div className="w-0.5 h-6 bg-scada-border" />
                                                               <div className="w-24 h-1.5 bg-gray-500 relative flex items-center justify-center cursor-pointer transition-colors hover:bg-yellow-500 z-20 group/trans" onClick={() => handleEditTransition(node, idx)} title="Click to edit condition">
-                                                                  {node.transitions.length > 1 && <div className="absolute -left-6 text-[10px] font-bold text-yellow-500">[{trans.priority}]</div>}
+                                                                  {node.transitions.length > 1 && (
+                                                                      <div className="absolute -left-14 flex flex-col items-center space-y-1 text-[10px] font-bold text-yellow-500">
+                                                                          <button onClick={() => moveTransitionInCode(node.id, idx, 'up')} className="p-0.5 rounded bg-transparent hover:bg-white/5 text-scada-muted"><Icons.ChevronDown className="w-3 h-3 rotate-180" /></button>
+                                                                          <div>[{trans.priority}]</div>
+                                                                          <button onClick={() => moveTransitionInCode(node.id, idx, 'down')} className="p-0.5 rounded bg-transparent hover:bg-white/5 text-scada-muted"><Icons.ChevronDown className="w-3 h-3" /></button>
+                                                                      </div>
+                                                                  )}
                                                                   <div className="absolute left-full ml-3 top-1/2 -translate-y-1/2 bg-scada-bg border border-scada-border p-1.5 rounded shadow-lg min-w-[150px] max-w-[250px] z-50 transition-colors group-hover/trans:border-yellow-500">
                                                                       <div className="text-[9px] text-scada-muted uppercase font-bold flex justify-between">
                                                                           <span>Transition Condition</span>

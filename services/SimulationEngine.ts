@@ -1,5 +1,17 @@
 
-import { IDeviceContext, LogEntry, NetworkPacket, ModbusRegister, BridgeStatus, NetworkAdapter, ControlSession, DebugState, ScriptConfig, GooseState, GooseConfig, BreakpointDetails, DebugExecutionFrame } from '../types';
+import { IDeviceContext, LogEntry, NetworkPacket, ModbusRegister, BridgeStatus, NetworkAdapter, ControlSession, DebugState, ScriptConfig, GooseState, GooseConfig, BreakpointDetails, DebugExecutionFrame, IEDNode } from '../types';
+
+interface DeviceModbusProfile {
+    id: string;
+    name: string;
+    ip: string;
+    port: number;
+    unitId: number;
+    coils: Map<number, boolean>;
+    discreteInputs: Map<number, boolean>;
+    holdingRegisters: Map<number, number>;
+    inputRegisters: Map<number, number>;
+}
 
 interface BreakpointMeta {
     enabled: boolean;
@@ -14,6 +26,7 @@ interface ScriptInstance {
     code: string;
     tickRate: number;
     lastRun: number;
+    enabled: boolean; // whether this script is enabled (can run)
     generator: GeneratorFunction | null;
     iterator: Generator | null;
     breakpoints: Set<number>;
@@ -55,16 +68,21 @@ export class SimulationEngine {
     port: 502,
     unitId: 1
   };
+    private modbusProfilesByIp: Map<string, DeviceModbusProfile> = new Map();
+    private modbusProfileIpByName: Map<string, string> = new Map();
 
   // Bridge State
   private bridgeWs: WebSocket | null = null;
   private bridgeStatus: BridgeStatus = {
     connected: false,
-    url: 'ws://localhost:3001',
+        url: 'ws://127.0.0.1:34001',
     adapters: [],
     selectedAdapter: null,
     rxCount: 0,
-    txCount: 0
+        txCount: 0,
+        lastError: undefined,
+        lastRoute: undefined,
+        boundEndpoints: []
   };
   private bridgeCallback: ((status: BridgeStatus) => void) | null = null;
 
@@ -122,6 +140,63 @@ export class SimulationEngine {
     this.emitLog('info', `Engine profile loaded with ${registers.length} registers.`);
   }
 
+  private normalizeIp(ip: string | undefined): string {
+      return String(ip || '').replace(/^::ffff:/, '').trim();
+  }
+
+  public syncModbusDevices(devices: IEDNode[]) {
+      const byIp = new Map<string, DeviceModbusProfile>();
+      const ipByName = new Map<string, string>();
+
+      devices.forEach(device => {
+          const ip = this.normalizeIp(device.config?.ip);
+          if (!ip || !device.config?.modbusMap) return;
+
+          const profile: DeviceModbusProfile = {
+              id: device.id,
+              name: device.name,
+              ip,
+              port: device.config.modbusPort ?? 502,
+              unitId: device.config.modbusUnitId ?? 1,
+              coils: new Map(),
+              discreteInputs: new Map(),
+              holdingRegisters: new Map(),
+              inputRegisters: new Map()
+          };
+
+          device.config.modbusMap.forEach(reg => {
+              const addr = Number(reg.address);
+              const value = reg.value;
+              switch (reg.type) {
+                  case 'Coil': profile.coils.set(addr, Boolean(value)); break;
+                  case 'DiscreteInput': profile.discreteInputs.set(addr, Boolean(value)); break;
+                  case 'HoldingRegister': profile.holdingRegisters.set(addr, Number(value)); break;
+                  case 'InputRegister': profile.inputRegisters.set(addr, Number(value)); break;
+              }
+          });
+
+          byIp.set(ip, profile);
+          ipByName.set(device.name, ip);
+      });
+
+      this.modbusProfilesByIp = byIp;
+      this.modbusProfileIpByName = ipByName;
+      this.emitLog('info', `Synced ${this.modbusProfilesByIp.size} Modbus device profiles.`);
+
+      const endpoints = Array.from(this.modbusProfilesByIp.values()).map(profile => ({
+          ip: profile.ip,
+          port: profile.port,
+          name: profile.name,
+          unitId: profile.unitId
+      }));
+      this.sendBridgeMessage({ type: 'SET_DEVICE_ENDPOINTS', endpoints });
+  }
+
+  private getProfileBySource(source: string): DeviceModbusProfile | undefined {
+      const ip = this.modbusProfileIpByName.get(source);
+      return ip ? this.modbusProfilesByIp.get(ip) : undefined;
+  }
+
   // --- Network Bridge ---
   public subscribeToBridge(callback: (status: BridgeStatus) => void) {
     this.bridgeCallback = callback;
@@ -139,18 +214,24 @@ export class SimulationEngine {
       this.bridgeWs = new WebSocket(url);
       this.bridgeWs.onopen = () => {
         this.bridgeStatus.connected = true;
+                this.bridgeStatus.lastError = undefined;
         this.emitLog('info', `Bridge connected to ${url}`);
         this.updateBridgeStatus();
         this.sendBridgeMessage({ type: 'GET_ADAPTERS' });
       };
-      this.bridgeWs.onclose = () => {
+            this.bridgeWs.onclose = (event) => {
         this.bridgeStatus.connected = false;
         this.bridgeStatus.adapters = [];
+                if (event.code !== 1000) {
+                    this.bridgeStatus.lastError = `WebSocket closed (code ${event.code})`;
+                }
         this.emitLog('warning', 'Bridge disconnected');
         this.updateBridgeStatus();
       };
-      this.bridgeWs.onerror = () => {
-        this.emitLog('error', 'Bridge connection error. Ensure local relay is running.');
+            this.bridgeWs.onerror = () => {
+                this.bridgeStatus.lastError = 'Connection error. Check relay process and bridge URL.';
+                this.updateBridgeStatus();
+                this.emitLog('error', 'Bridge connection error. Ensure local relay is running.');
       };
       this.bridgeWs.onmessage = (event) => {
         try {
@@ -161,6 +242,8 @@ export class SimulationEngine {
         }
       };
     } catch (e: any) {
+            this.bridgeStatus.lastError = e.message;
+            this.updateBridgeStatus();
       this.emitLog('error', `Failed to connect bridge: ${e.message}`);
     }
   }
@@ -205,27 +288,101 @@ export class SimulationEngine {
           case 'MODBUS_CMD':
               this.processExternalModbusCommand(msg);
               break;
+          case 'MODBUS_TRACE':
+              this.emitLog('packet', `[Relay ${msg.direction || 'trace'}] ${msg.source || 'peer'} TID=${msg.transId} FC=${msg.fc} Unit=${msg.unitId}${msg.exceptionCode ? ` EX=${msg.exceptionCode}` : ''}`);
+              break;
+          case 'ENDPOINT_STATUS_LIST':
+              this.bridgeStatus.boundEndpoints = Array.isArray(msg.endpoints) ? msg.endpoints : [];
+              this.updateBridgeStatus();
+              break;
           default:
               break;
       }
   }
 
   private processExternalModbusCommand(cmd: any) {
-      const { transId, unitId, fc, addr, val, len } = cmd;
-      if (this.modbusConfig.unitId !== unitId && unitId !== 0) return;
+      const { transId, unitId, fc, addr, val, len, source, targetIp } = cmd;
+
+      const srcLabel = source || 'External Master';
+      const normalizedTargetIp = this.normalizeIp(targetIp);
+      const targetProfile = this.modbusProfilesByIp.get(normalizedTargetIp);
+    const targetDeviceName = targetProfile?.name || 'Default Engine Profile';
+    this.bridgeStatus.lastRoute = `${normalizedTargetIp || 'unknown-ip'} -> ${targetDeviceName}`;
+    this.updateBridgeStatus();
+      const expectedUnit = targetProfile?.unitId ?? this.modbusConfig.unitId;
+
+      if (expectedUnit !== unitId && unitId !== 0) {
+          this.emitLog('warning', `[Bridge RX] ${srcLabel} Unit ID mismatch (Req=${unitId}, Expected=${expectedUnit}) - processing anyway`);
+      }
+      const reqDesc = [
+          `TID=${transId}`,
+          `FC=${fc}`,
+          `Unit=${unitId}`,
+          `Addr=${addr}`,
+          len !== undefined ? `Len=${len}` : undefined,
+          val !== undefined ? `Val=${val}` : undefined
+      ].filter(Boolean).join(' ');
+      this.emitLog('packet', `[Bridge RX] ${srcLabel} -> ${reqDesc}`);
+      this.emitPacket('ModbusTCP', srcLabel, targetDeviceName, `RX FC${fc} Addr ${addr}${len !== undefined ? ` Len ${len}` : ''}`, {
+          transId,
+          unitId,
+          fc,
+          addr,
+          len,
+          val,
+          targetIp: normalizedTargetIp,
+          route: targetDeviceName
+      });
 
       let responseData: any = {};
       let exceptionCode = 0;
 
+      const coils = targetProfile?.coils ?? this.coils;
+      const discreteInputs = targetProfile?.discreteInputs ?? this.discreteInputs;
+      const holdingRegisters = targetProfile?.holdingRegisters ?? this.holdingRegisters;
+      const inputRegisters = targetProfile?.inputRegisters ?? this.inputRegisters;
+
       switch (fc) {
-          case 1: if (!this.checkAddressRange(this.coils, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(this.coils, addr, len || 1); break;
-          case 2: if (!this.checkAddressRange(this.discreteInputs, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(this.discreteInputs, addr, len || 1); break;
-          case 3: if (!this.checkAddressRange(this.holdingRegisters, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(this.holdingRegisters, addr, len || 1); break;
-          case 4: if (!this.checkAddressRange(this.inputRegisters, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(this.inputRegisters, addr, len || 1); break;
-          case 5: if (!this.coils.has(addr)) exceptionCode = 2; else { this.setCoil(addr, !!val, 'External Master'); responseData = { addr, val }; } break;
-          case 6: if (!this.holdingRegisters.has(addr)) exceptionCode = 2; else if (val < 0 || val > 65535) exceptionCode = 3; else { this.setRegister(addr, val, 'External Master'); responseData = { addr, val }; } break;
+          case 1: if (!this.checkAddressRange(coils, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(coils, addr, len || 1); break;
+          case 2: if (!this.checkAddressRange(discreteInputs, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(discreteInputs, addr, len || 1); break;
+          case 3: if (!this.checkAddressRange(holdingRegisters, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(holdingRegisters, addr, len || 1); break;
+          case 4: if (!this.checkAddressRange(inputRegisters, addr, len || 1)) exceptionCode = 2; else responseData.data = this.readRange(inputRegisters, addr, len || 1); break;
+          case 5:
+              if (!coils.has(addr)) exceptionCode = 2;
+              else {
+                  coils.set(addr, !!val);
+                  responseData = { addr, val: !!val ? 1 : 0 };
+              }
+              break;
+          case 6:
+              if (!holdingRegisters.has(addr)) exceptionCode = 2;
+              else if (val < 0 || val > 65535) exceptionCode = 3;
+              else {
+                  holdingRegisters.set(addr, Number(val));
+                  responseData = { addr, val: Number(val) };
+              }
+              break;
           default: exceptionCode = 1;
       }
+
+      if (exceptionCode === 0 && (fc === 1 || fc === 2 || fc === 3 || fc === 4)) {
+          const count = Array.isArray(responseData.data) ? responseData.data.length : 0;
+          this.emitPacket('ModbusTCP', srcLabel, 'Server', `Read FC${fc} Addr ${addr} Len ${count}`, { fc, addr, len: count });
+      }
+
+      const respDesc = exceptionCode > 0
+          ? `EX=${exceptionCode}`
+          : (responseData.data ? `Data=[${(responseData.data as any[]).join(',')}]` : `Addr=${responseData.addr ?? addr} Val=${responseData.val ?? val}`);
+      this.emitLog('packet', `[Bridge TX] Server -> ${srcLabel} TID=${transId} FC=${fc} ${respDesc}`);
+      this.emitPacket('ModbusTCP', targetDeviceName, srcLabel, `TX FC${fc} ${exceptionCode > 0 ? `EX ${exceptionCode}` : 'OK'}`, {
+          transId,
+          unitId,
+          fc,
+          exceptionCode,
+          ...responseData,
+          targetIp: normalizedTargetIp,
+          route: targetDeviceName
+      });
 
       this.sendBridgeMessage({ type: 'MODBUS_RESP', transId, unitId, fc, exceptionCode, ...responseData });
   }
@@ -263,18 +420,40 @@ export class SimulationEngine {
       this.emitDebugState(); // Initial state
   }
 
-  public getCoil(addr: number, source: string = 'System'): boolean { return this.coils.get(addr) || false; }
+  public getCoil(addr: number, source: string = 'System'): boolean {
+      const profile = this.getProfileBySource(source);
+      if (profile && profile.coils.has(addr)) return profile.coils.get(addr) || false;
+      return this.coils.get(addr) || false;
+  }
   public setCoil(addr: number, val: boolean, source: string = 'Logic') { 
       this.coils.set(addr, val);
-      if (source !== 'Logic' && this.modbusConfig.enabled) this.emitPacket('ModbusTCP', source, 'Server', `Write Coil ${addr}: ${val}`, { fc: 5, addr, val });
+      const profile = this.getProfileBySource(source);
+      if (profile) profile.coils.set(addr, val);
+      const isMasterWrite = source === 'Client Master' || source === 'External Master';
+      if (isMasterWrite && this.modbusConfig.enabled) this.emitPacket('ModbusTCP', source, 'Server', `Write Coil ${addr}: ${val}`, { fc: 5, addr, val });
   }
-  public getRegister(addr: number, source: string = 'System'): number { return this.holdingRegisters.get(addr) || 0; }
+  public getRegister(addr: number, source: string = 'System'): number {
+      const profile = this.getProfileBySource(source);
+      if (profile && profile.holdingRegisters.has(addr)) return profile.holdingRegisters.get(addr) || 0;
+      return this.holdingRegisters.get(addr) || 0;
+  }
   public setRegister(addr: number, val: number, source: string = 'Logic') { 
       this.holdingRegisters.set(addr, val);
-      if (source !== 'Logic' && this.modbusConfig.enabled) this.emitPacket('ModbusTCP', source, 'Server', `Write Register ${addr}: ${val}`, { fc: 6, addr, val });
+      const profile = this.getProfileBySource(source);
+      if (profile) profile.holdingRegisters.set(addr, val);
+      const isMasterWrite = source === 'Client Master' || source === 'External Master';
+      if (isMasterWrite && this.modbusConfig.enabled) this.emitPacket('ModbusTCP', source, 'Server', `Write Register ${addr}: ${val}`, { fc: 6, addr, val });
   }
-  public getInputRegister(addr: number, source: string = 'System'): number { return this.inputRegisters.get(addr) || 0; }
-  public getDiscreteInput(addr: number, source: string = 'System'): boolean { return this.discreteInputs.get(addr) || false; }
+  public getInputRegister(addr: number, source: string = 'System'): number {
+      const profile = this.getProfileBySource(source);
+      if (profile && profile.inputRegisters.has(addr)) return profile.inputRegisters.get(addr) || 0;
+      return this.inputRegisters.get(addr) || 0;
+  }
+  public getDiscreteInput(addr: number, source: string = 'System'): boolean {
+      const profile = this.getProfileBySource(source);
+      if (profile && profile.discreteInputs.has(addr)) return profile.discreteInputs.get(addr) || false;
+      return this.discreteInputs.get(addr) || false;
+  }
 
   public getModbusConfig() { return { ...this.modbusConfig }; }
   public setModbusConfig(config: { enabled: boolean; port: number; unitId: number }) { this.modbusConfig = config; }
@@ -611,6 +790,7 @@ export class SimulationEngine {
               code: '',
               tickRate: 100, // Default 100ms
               lastRun: 0,
+              enabled: true, // default enabled
               generator: null,
               iterator: null,
               breakpoints: new Set(),
@@ -637,6 +817,36 @@ export class SimulationEngine {
       const script = this.scripts.get(id);
       if (!script) return null;
       return { deviceId: script.id, code: script.code, tickRate: script.tickRate };
+  }
+
+  // NEW: start/stop a single device script without stopping the entire engine
+  public startScript(deviceId: string): boolean {
+      const script = this.scripts.get(deviceId);
+      if (!script) return false;
+      script.enabled = true;
+      // If engine is not running start the global loop so enabled scripts execute
+      if (!this.isRunning) this.start();
+      this.emitDebugState();
+      this.emitLog('info', `Script started for device: ${deviceId}`);
+      return true;
+  }
+
+  public stopScript(deviceId: string): boolean {
+      const script = this.scripts.get(deviceId);
+      if (!script) return false;
+      script.enabled = false;
+      // Reset execution state for that script only
+      script.iterator = null;
+      script.currentLine = 0;
+      this.emitDebugState();
+      this.emitLog('warning', `Script stopped for device: ${deviceId}`);
+      return true;
+  }
+
+  public isScriptEnabled(deviceId: string): boolean {
+      const script = this.scripts.get(deviceId);
+      if (!script) return false;
+      return !!script.enabled;
   }
 
   public updateScriptConfig(config: ScriptConfig) {
@@ -939,6 +1149,8 @@ export class SimulationEngine {
     const now = Date.now();
 
     for (const script of this.scripts.values()) {
+        // Skip scripts explicitly disabled (per-device stop)
+        if (!script.enabled) continue;
         if (!script.generator) continue;
 
         // Update stepTime (time in current state in milliseconds)

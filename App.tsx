@@ -224,6 +224,10 @@ const AppContent = () => {
   }, [selectedIED]);
 
     useEffect(() => {
+        engine.syncModbusDevices(iedList);
+    }, [iedList]);
+
+    useEffect(() => {
         try {
             localStorage.setItem('ui.logPanelCollapsed', isLogPanelCollapsed ? '1' : '0');
         } catch {

@@ -71,6 +71,7 @@ END_IF;
 const ACTION_QUALIFIERS = ['N', 'S', 'R', 'L', 'D', 'P', 'P1', 'P0', 'DS', 'SL'] as const;
 const TIME_QUALIFIERS = ['L', 'D', 'DS', 'SL'];
 const MAX_UNDO_HISTORY = 100;
+const SFC_ZOOM_PRESETS = [25, 50, 75, 100, 150, 200, 300, 400] as const;
 
 interface SFCTransition {
     target: string;
@@ -639,6 +640,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
       transitionIdx?: number;
       priority?: number;
       target?: string;
+      newTargetName?: string;
   }>({ isOpen: false, title: '', content: '', type: 'transition', nodeId: '' });
 
   // Creation Modal State
@@ -649,12 +651,14 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   }>({ isOpen: false, type: 'step' });
   const [newStepName, setNewStepName] = useState('');
   const [newTransTarget, setNewTransTarget] = useState('');
+    const [newTransTargetStepName, setNewTransTargetStepName] = useState('');
   const [newTransCond, setNewTransCond] = useState('TRUE');
     const [retargetModal, setRetargetModal] = useState<{
             isOpen: boolean;
             nodeId?: string;
             transitionIdx?: number;
             target: string;
+            newTargetName?: string;
     }>({ isOpen: false, nodeId: undefined, transitionIdx: undefined, target: '' });
       const [insertStepModal, setInsertStepModal] = useState<{
           isOpen: boolean;
@@ -671,6 +675,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
   const [editingPriority, setEditingPriority] = useState<{ nodeId?: string; idx?: number; value?: number }>({});
   // Normalization step size (configurable via SFC toolbar)
   const [normalizeStepSize, setNormalizeStepSize] = useState<number>(10);
+    const [newTransitionPriorityStep, setNewTransitionPriorityStep] = useState<number>(10);
 
   // Debug State
   const [debugState, setDebugState] = useState<DebugState>({
@@ -703,16 +708,56 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     const [draftMeta, setDraftMeta] = useState<{ hasDraft: boolean; restored: boolean; savedAt?: number }>({ hasDraft: false, restored: false, savedAt: undefined });
     const [selectedTransition, setSelectedTransition] = useState<{ nodeId?: string; idx?: number }>({});
     const [transitionContextMenu, setTransitionContextMenu] = useState<{ isOpen: boolean; x: number; y: number; nodeId?: string; idx?: number }>({ isOpen: false, x: 0, y: 0, nodeId: undefined, idx: undefined });
+    const [selectedSteps, setSelectedSteps] = useState<string[]>([]);
+    const [showSFCGrid, setShowSFCGrid] = useState(false);
+    const [snapToGrid, setSnapToGrid] = useState(true);
+    const [nodePositions, setNodePositions] = useState<Record<string, { x: number; y: number }>>({});
+    const [draggingNodeIds, setDraggingNodeIds] = useState<string[]>([]);
+    const [reconnectDrag, setReconnectDrag] = useState<{ active: boolean; nodeId?: string; idx?: number; startX: number; startY: number; cursorX: number; cursorY: number }>({ active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 });
+    const [reconnectNewStepModal, setReconnectNewStepModal] = useState<{ isOpen: boolean; nodeId?: string; idx?: number; stepName: string }>({ isOpen: false, nodeId: undefined, idx: undefined, stepName: '' });
+    const [stepContextMenu, setStepContextMenu] = useState<{ isOpen: boolean; x: number; y: number; nodeId?: string }>({ isOpen: false, x: 0, y: 0, nodeId: undefined });
+    const [canvasContextMenu, setCanvasContextMenu] = useState<{ isOpen: boolean; x: number; y: number }>({ isOpen: false, x: 0, y: 0 });
+    const [boxSelection, setBoxSelection] = useState<{ active: boolean; startX: number; startY: number; currentX: number; currentY: number }>({ active: false, startX: 0, startY: 0, currentX: 0, currentY: 0 });
   const lastStateRef = useRef<number | null>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const lineContainerRef = useRef<HTMLDivElement>(null);
   const sfcContainerRef = useRef<HTMLDivElement>(null);
   const sfcNodeRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+    const transitionHandleRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const undoHistoryRef = useRef<string[]>([DEFAULT_SCRIPT]);
   const undoIndexRef = useRef<number>(0);
   const skipHistoryCaptureRef = useRef<boolean>(false);
+    const isPanningRef = useRef(false);
+    const panStartRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
+    const stepDragRef = useRef<{ targets: string[]; startX: number; startY: number; base: Record<string, { x: number; y: number }> } | null>(null);
 
   const getDraftKey = (deviceId: string) => `substation-scout:draft:${deviceId}`;
+
+  const createUniqueStateId = (sourceCode: string, rawName: string): string | null => {
+      const clean = rawName.trim().toUpperCase().replace(/\s+/g, '_').replace(/[^A-Z0-9_]/g, '');
+      if (!clean) return null;
+      const base = clean.startsWith('STATE_') ? clean : `STATE_${clean}`;
+      let candidate = base;
+      let suffix = 1;
+      while (new RegExp(`\\b${candidate}\\b`).test(sourceCode)) {
+          suffix += 1;
+          candidate = `${base}_${suffix}`;
+      }
+      return candidate;
+  };
+
+  const insertStateConstant = (sourceCode: string, stateId: string): string => {
+      const lines = sourceCode.split('\n');
+      let maxId = 0;
+      const matches = sourceCode.matchAll(/STATE_\w+\s*:\s*INT\s*:=\s*(\d+)/g);
+      for (const m of matches) maxId = Math.max(maxId, parseInt(m[1], 10));
+      const newStateValue = maxId + 1;
+      const endVarIdx = lines.findIndex(l => /^\s*END_VAR;\s*$/i.test(l.trim()));
+      if (endVarIdx >= 0) {
+          lines.splice(endVarIdx, 0, `  ${stateId} : INT := ${newStateValue};`);
+      }
+      return lines.join('\n');
+  };
 
   const syncHistoryDepth = () => {
       const undo = undoIndexRef.current;
@@ -791,7 +836,178 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
       setTransitionContextMenu({ isOpen: false, x: 0, y: 0, nodeId: undefined, idx: undefined });
   };
 
-  const runTransitionAction = (action: 'edit' | 'retarget' | 'insert' | 'delete' | 'normalize') => {
+  const closeStepContextMenu = () => {
+      setStepContextMenu({ isOpen: false, x: 0, y: 0, nodeId: undefined });
+  };
+
+  const closeCanvasContextMenu = () => {
+      setCanvasContextMenu({ isOpen: false, x: 0, y: 0 });
+  };
+
+  const closeAllSFCMenus = () => {
+      closeTransitionContextMenu();
+      closeStepContextMenu();
+      closeCanvasContextMenu();
+  };
+
+  const clearSFCSelection = () => {
+      setSelectedTransition({});
+      setSelectedSteps([]);
+      closeAllSFCMenus();
+  };
+
+  const handleStepSelect = (nodeId: string, e?: React.MouseEvent) => {
+      if (e) {
+          e.stopPropagation();
+      }
+      setSelectedTransition({});
+      const additive = !!e && (e.ctrlKey || e.metaKey);
+      if (additive) {
+          setSelectedSteps(prev => prev.includes(nodeId) ? prev.filter(id => id !== nodeId) : [...prev, nodeId]);
+      } else {
+          setSelectedSteps([nodeId]);
+      }
+  };
+
+  const openStepContextMenu = (e: React.MouseEvent, nodeId: string) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setSelectedTransition({});
+      setSelectedSteps(prev => prev.includes(nodeId) ? prev : [nodeId]);
+      setStepContextMenu({ isOpen: true, x: e.clientX, y: e.clientY, nodeId });
+      closeTransitionContextMenu();
+      closeCanvasContextMenu();
+  };
+
+  const openCanvasContextMenu = (e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setCanvasContextMenu({ isOpen: true, x: e.clientX, y: e.clientY });
+      closeTransitionContextMenu();
+      closeStepContextMenu();
+  };
+
+  const setStepAsInitial = (nodeId: string) => {
+      const stateVar = detectedStateVar || 'state';
+      const initLineRe = new RegExp(`IF\\s+${stateVar}\\s*=\\s*undefined\\s+THEN\\s+${stateVar}\\s*:=\\s*STATE_\\w+\\s*;\\s*END_IF;`, 'i');
+      let nextCode = code;
+      if (initLineRe.test(nextCode)) {
+          nextCode = nextCode.replace(initLineRe, `IF ${stateVar} = undefined THEN ${stateVar} := ${nodeId}; END_IF;`);
+      } else {
+          const lines = nextCode.split('\n');
+          const endVarIdx = lines.findIndex(l => /^\s*END_VAR;\s*$/i.test(l.trim()));
+          if (endVarIdx >= 0) {
+              lines.splice(endVarIdx + 1, 0, '', `IF ${stateVar} = undefined THEN ${stateVar} := ${nodeId}; END_IF;`);
+              nextCode = lines.join('\n');
+          }
+      }
+      if (nextCode !== code) {
+          setCode(nextCode);
+          setIsDirty(true);
+          setConsoleOutput(prev => [...prev, `> Set initial step: ${nodeId.replace('STATE_', '')}`]);
+      }
+  };
+
+  const runStepAction = (action: 'edit-actions' | 'add-transition' | 'rename' | 'delete' | 'force' | 'set-initial') => {
+      const nodeId = stepContextMenu.nodeId || selectedSteps[0];
+      if (!nodeId) return;
+      const node = sfcNodes.find(n => n.id === nodeId);
+      if (!node) return;
+
+      if (action === 'edit-actions') handleEditAction(node);
+      if (action === 'add-transition') setAddModal({ isOpen: true, type: 'transition', sourceId: node.id });
+      if (action === 'rename') handleRenameStep(node);
+      if (action === 'delete') handleDeleteStep(node);
+      if (action === 'force') handleForceStep(node);
+      if (action === 'set-initial' && node.type !== 'init') setStepAsInitial(node.id);
+      closeStepContextMenu();
+  };
+
+  const retargetTransitionByRef = (sourceNodeId: string, transIdx: number, targetStateId: string, sourceCode?: string) => {
+      const workingCode = sourceCode ?? code;
+      const parsed = parseSFC(workingCode);
+      const node = parsed.find(n => n.id === sourceNodeId);
+      if (!node) return;
+      const trans = node.transitions[transIdx];
+      if (!trans) return;
+      if (trans.target === targetStateId) return;
+
+      const lines = workingCode.split('\n');
+      const blockStart = trans.lineIndex;
+      const blockEnd = trans.blockEndIndex;
+      const blockText = lines.slice(blockStart, blockEnd + 1).join('\n');
+
+      const stateVar = detectedStateVar || 'state';
+      const exactAssignRe = new RegExp(`\\b${stateVar}\\s*:=\\s*STATE_\\w+\\b`);
+      const genericAssignRe = /\b[A-Za-z_][A-Za-z0-9_]*\s*:=\s*STATE_\w+\b/;
+      const replacement = `${stateVar} := ${targetStateId}`;
+
+      let newBlockText = blockText;
+      if (exactAssignRe.test(newBlockText)) {
+          newBlockText = newBlockText.replace(exactAssignRe, replacement);
+      } else if (genericAssignRe.test(newBlockText)) {
+          newBlockText = newBlockText.replace(genericAssignRe, replacement);
+      } else {
+          return;
+      }
+
+      lines.splice(blockStart, blockEnd - blockStart + 1, ...newBlockText.split('\n'));
+      setCode(lines.join('\n'));
+      setIsDirty(true);
+      setConsoleOutput(prev => [...prev, `> Reconnected Transition: ${node.label} -> ${targetStateId.replace('STATE_', '')}`]);
+  };
+
+  const applyReconnectToNewStep = () => {
+      if (!reconnectNewStepModal.nodeId || reconnectNewStepModal.idx === undefined) return;
+      const createdId = createUniqueStateId(code, reconnectNewStepModal.stepName || '');
+      if (!createdId) return;
+      const withConst = insertStateConstant(code, createdId);
+      retargetTransitionByRef(reconnectNewStepModal.nodeId, reconnectNewStepModal.idx, createdId, withConst);
+      setReconnectNewStepModal({ isOpen: false, nodeId: undefined, idx: undefined, stepName: '' });
+  };
+
+  const startStepDrag = (nodeId: string, e: React.MouseEvent) => {
+      if (e.button !== 0 || e.shiftKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+
+      const targets = selectedSteps.includes(nodeId) && selectedSteps.length > 0 ? selectedSteps : [nodeId];
+      const base: Record<string, { x: number; y: number }> = {};
+      targets.forEach(id => {
+          base[id] = nodePositions[id] || { x: 0, y: 0 };
+      });
+
+      stepDragRef.current = {
+          targets,
+          startX: e.clientX,
+          startY: e.clientY,
+          base
+      };
+      setDraggingNodeIds(targets);
+  };
+
+  const startTransitionReconnect = (e: React.MouseEvent, nodeId: string, idx: number) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const key = `${nodeId}:${idx}`;
+      const handleEl = transitionHandleRefs.current.get(key);
+      const rect = handleEl?.getBoundingClientRect();
+      const startX = rect ? rect.left + rect.width / 2 : e.clientX;
+      const startY = rect ? rect.top + rect.height / 2 : e.clientY;
+      setReconnectDrag({
+          active: true,
+          nodeId,
+          idx,
+          startX,
+          startY,
+          cursorX: e.clientX,
+          cursorY: e.clientY
+      });
+      setSelectedTransition({ nodeId, idx });
+      closeAllSFCMenus();
+  };
+
+  const runTransitionAction = (action: 'edit' | 'retarget' | 'insert' | 'delete' | 'normalize' | 'set-priority') => {
       const nodeId = selectedTransition.nodeId;
       const idx = selectedTransition.idx;
       if (!nodeId || idx === undefined) return;
@@ -808,9 +1024,69 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
           deleteTransition(node, idx);
       } else if (action === 'normalize') {
           normalizePriorities(node.id, normalizeStepSize);
+      } else if (action === 'set-priority') {
+          startEditPriority(node.id, idx, node.transitions[idx]?.priority || 10);
       }
       closeTransitionContextMenu();
   };
+
+  useEffect(() => {
+      if (!reconnectDrag.active) return;
+
+      const onMouseMove = (e: MouseEvent) => {
+          setReconnectDrag(prev => prev.active ? { ...prev, cursorX: e.clientX, cursorY: e.clientY } : prev);
+      };
+
+      const onMouseUp = () => {
+          setReconnectDrag(prev => prev.active ? { active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 } : prev);
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+      return () => {
+          window.removeEventListener('mousemove', onMouseMove);
+          window.removeEventListener('mouseup', onMouseUp);
+      };
+  }, [reconnectDrag.active]);
+
+  useEffect(() => {
+      if (!draggingNodeIds.length) return;
+
+      const onMouseMove = (e: MouseEvent) => {
+          const drag = stepDragRef.current;
+          if (!drag) return;
+          const zoomFactor = Math.max(0.25, zoomLevel / 100);
+          const dx = (e.clientX - drag.startX) / zoomFactor;
+          const dy = (e.clientY - drag.startY) / zoomFactor;
+
+          setNodePositions(prev => {
+              const next = { ...prev };
+              drag.targets.forEach(id => {
+                  const basePos = drag.base[id] || { x: 0, y: 0 };
+                  let x = basePos.x + dx;
+                  let y = basePos.y + dy;
+                  if (snapToGrid) {
+                      x = Math.round(x / 10) * 10;
+                      y = Math.round(y / 10) * 10;
+                  }
+                  next[id] = { x, y };
+              });
+              return next;
+          });
+      };
+
+      const onMouseUp = () => {
+          stepDragRef.current = null;
+          setDraggingNodeIds([]);
+      };
+
+      window.addEventListener('mousemove', onMouseMove);
+      window.addEventListener('mouseup', onMouseUp);
+      return () => {
+          window.removeEventListener('mousemove', onMouseMove);
+          window.removeEventListener('mouseup', onMouseUp);
+      };
+  }, [draggingNodeIds, snapToGrid, zoomLevel]);
 
   // Console resize handlers
   const handleConsoleResizeStart = (e: React.MouseEvent) => {
@@ -1068,8 +1344,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
               if (inTextField) return;
 
               if (e.key === 'Escape') {
-                  closeTransitionContextMenu();
-                  setSelectedTransition({});
+                  clearSFCSelection();
+                  if (reconnectDrag.active) {
+                      setReconnectDrag({ active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 });
+                  }
                   return;
               }
 
@@ -1094,6 +1372,11 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
               if (key === 'n') {
                   e.preventDefault();
                   runTransitionAction('normalize');
+                  return;
+              }
+              if (key === 'p') {
+                  e.preventDefault();
+                  runTransitionAction('set-priority');
                   return;
               }
               if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -1139,14 +1422,14 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
       window.addEventListener('keydown', onKeyDown);
       return () => window.removeEventListener('keydown', onKeyDown);
-    }, [viewMode, debugState.isRunning, debugState.isPaused, debugState.currentLine, debugState.activeDeviceId, selectedDeviceId, code, selectedTransition, normalizeStepSize, sfcNodes]);
+    }, [viewMode, debugState.isRunning, debugState.isPaused, debugState.currentLine, debugState.activeDeviceId, selectedDeviceId, code, selectedTransition, normalizeStepSize, sfcNodes, selectedSteps, reconnectDrag.active]);
 
   useEffect(() => {
-      if (!transitionContextMenu.isOpen) return;
-      const close = () => closeTransitionContextMenu();
+      if (!transitionContextMenu.isOpen && !stepContextMenu.isOpen && !canvasContextMenu.isOpen) return;
+      const close = () => closeAllSFCMenus();
       window.addEventListener('click', close);
       return () => window.removeEventListener('click', close);
-  }, [transitionContextMenu.isOpen]);
+  }, [transitionContextMenu.isOpen, stepContextMenu.isOpen, canvasContextMenu.isOpen]);
 
   useEffect(() => {
       if (!selectedTransition.nodeId || selectedTransition.idx === undefined) return;
@@ -1156,6 +1439,15 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
           closeTransitionContextMenu();
       }
   }, [sfcNodes, selectedTransition]);
+
+  useEffect(() => {
+      if (selectedSteps.length === 0) return;
+      const valid = new Set(sfcNodes.map(n => n.id));
+      const next = selectedSteps.filter(id => valid.has(id));
+      if (next.length !== selectedSteps.length) {
+          setSelectedSteps(next);
+      }
+  }, [sfcNodes, selectedSteps]);
 
   // Detect state variable name used in the ST source (e.g. `state`, `CurrentState`)
   const detectedStateVar = useMemo(() => {
@@ -1258,6 +1550,126 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
       if (!draftMeta.savedAt) return null;
       return new Date(draftMeta.savedAt).toLocaleTimeString();
   }, [draftMeta.savedAt]);
+
+  const selectedTransitionHint = useMemo(() => {
+      if (!selectedTransition.nodeId || selectedTransition.idx === undefined) return null;
+      const node = sfcNodes.find(n => n.id === selectedTransition.nodeId);
+      if (!node) return null;
+      const trans = node.transitions[selectedTransition.idx];
+      if (!trans) return null;
+      return `${node.label} → ${trans.target.replace('STATE_', '')} • E Edit • T Retarget • I Insert • N Normalize • P Priority • Del Delete`;
+  }, [selectedTransition, sfcNodes]);
+
+  const setZoomFromPreset = (next: number) => {
+      const clamped = Math.max(SFC_ZOOM_PRESETS[0], Math.min(SFC_ZOOM_PRESETS[SFC_ZOOM_PRESETS.length - 1], next));
+      const nearest = SFC_ZOOM_PRESETS.reduce((prev, curr) => Math.abs(curr - clamped) < Math.abs(prev - clamped) ? curr : prev, 100);
+      setZoomLevel(nearest);
+  };
+
+  const handleSFCWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+      if (viewMode !== 'sfc') return;
+      e.preventDefault();
+      const currentIdx = SFC_ZOOM_PRESETS.indexOf(zoomLevel as any);
+      const idx = currentIdx >= 0 ? currentIdx : SFC_ZOOM_PRESETS.findIndex(v => v >= zoomLevel);
+      const base = idx >= 0 ? idx : 3;
+      const direction = e.deltaY > 0 ? -1 : 1;
+      const nextIdx = Math.max(0, Math.min(SFC_ZOOM_PRESETS.length - 1, base + direction));
+      setZoomLevel(SFC_ZOOM_PRESETS[nextIdx]);
+  };
+
+  const getCanvasRelativePoint = (e: React.MouseEvent<HTMLDivElement>) => {
+      const container = sfcContainerRef.current;
+      if (!container) return { x: 0, y: 0 };
+      const rect = container.getBoundingClientRect();
+      return {
+          x: e.clientX - rect.left + container.scrollLeft,
+          y: e.clientY - rect.top + container.scrollTop
+      };
+  };
+
+  const handleSFCMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!sfcContainerRef.current) return;
+
+      if (e.button === 1 || (e.button === 0 && e.shiftKey)) {
+          e.preventDefault();
+          const container = sfcContainerRef.current;
+          isPanningRef.current = true;
+          panStartRef.current = {
+              x: e.clientX,
+              y: e.clientY,
+              left: container.scrollLeft,
+              top: container.scrollTop
+          };
+          return;
+      }
+
+      if (e.button === 0 && e.target === e.currentTarget) {
+          const p = getCanvasRelativePoint(e);
+          setBoxSelection({ active: true, startX: p.x, startY: p.y, currentX: p.x, currentY: p.y });
+          setSelectedTransition({});
+          closeAllSFCMenus();
+      }
+  };
+
+  const handleSFCMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+      if (!sfcContainerRef.current) return;
+
+      if (isPanningRef.current && panStartRef.current) {
+          const container = sfcContainerRef.current;
+          const deltaX = e.clientX - panStartRef.current.x;
+          const deltaY = e.clientY - panStartRef.current.y;
+          container.scrollLeft = panStartRef.current.left - deltaX;
+          container.scrollTop = panStartRef.current.top - deltaY;
+          return;
+      }
+
+      if (boxSelection.active) {
+          const p = getCanvasRelativePoint(e);
+          setBoxSelection(prev => ({ ...prev, currentX: p.x, currentY: p.y }));
+      }
+  };
+
+  const handleSFCMouseUp = (e: React.MouseEvent<HTMLDivElement>) => {
+      isPanningRef.current = false;
+      panStartRef.current = null;
+
+      if (reconnectDrag.active) {
+          if (reconnectDrag.nodeId && reconnectDrag.idx !== undefined) {
+              setReconnectNewStepModal({
+                  isOpen: true,
+                  nodeId: reconnectDrag.nodeId,
+                  idx: reconnectDrag.idx,
+                  stepName: ''
+              });
+          }
+          setReconnectDrag({ active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 });
+          if (boxSelection.active) setBoxSelection(prev => ({ ...prev, active: false }));
+          return;
+      }
+
+      if (!boxSelection.active || !sfcContainerRef.current) return;
+      const container = sfcContainerRef.current;
+      const rect = container.getBoundingClientRect();
+      const x1 = Math.min(boxSelection.startX, boxSelection.currentX);
+      const y1 = Math.min(boxSelection.startY, boxSelection.currentY);
+      const x2 = Math.max(boxSelection.startX, boxSelection.currentX);
+      const y2 = Math.max(boxSelection.startY, boxSelection.currentY);
+
+      const picked: string[] = [];
+      sfcNodeRefs.current.forEach((el, nodeId) => {
+          const r = el.getBoundingClientRect();
+          const left = r.left - rect.left + container.scrollLeft;
+          const right = r.right - rect.left + container.scrollLeft;
+          const top = r.top - rect.top + container.scrollTop;
+          const bottom = r.bottom - rect.top + container.scrollTop;
+          const intersects = right >= x1 && left <= x2 && bottom >= y1 && top <= y2;
+          if (intersects) picked.push(nodeId);
+      });
+
+      const additive = e.ctrlKey || e.metaKey;
+      setSelectedSteps(prev => additive ? Array.from(new Set([...prev, ...picked])) : picked);
+      setBoxSelection(prev => ({ ...prev, active: false }));
+  };
 
   const handleCodeChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
       setCode(e.target.value);
@@ -1373,7 +1785,8 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
           nodeId: node.id,
           transitionIdx: transIdx,
           priority: trans.priority,
-          target: trans.target
+          target: trans.target,
+          newTargetName: ''
       });
   };
 
@@ -1570,7 +1983,14 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
           let updatedBlockText = blockText.replace(/IF\s+([\s\S]*?)\s+THEN/i, `IF ${newContent} THEN`);
 
-          const selectedTarget = editModal.target || trans.target;
+          let selectedTarget = editModal.target || trans.target;
+          let pendingStateInsert: string | null = null;
+          if (selectedTarget === '__NEW_STEP__') {
+              const createdId = createUniqueStateId(code, editModal.newTargetName || '');
+              if (!createdId) return;
+              selectedTarget = createdId;
+              pendingStateInsert = createdId;
+          }
           const stateVar = detectedStateVar || 'state';
           const exactAssignRe = new RegExp(`\\b${stateVar}\\s*:=\\s*STATE_\\w+\\b`);
           const genericAssignRe = /\b[A-Za-z_][A-Za-z0-9_]*\s*:=\s*STATE_\w+\b/;
@@ -1631,6 +2051,12 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
                   return;
               }
           }
+
+          if (pendingStateInsert) {
+              const withConst = insertStateConstant(lines.join('\n'), pendingStateInsert);
+              const finalLines = withConst.split('\n');
+              lines.splice(0, lines.length, ...finalLines);
+          }
       }
 
       setCode(lines.join('\n'));
@@ -1666,16 +2092,39 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
 
   const handleAddTransition = () => {
       if (!addModal.sourceId || !newTransTarget) return;
+
+      const pendingNewTarget = newTransTarget === '__NEW_STEP__';
+      if (pendingNewTarget && !newTransTargetStepName.trim()) return;
+
       const node = sfcNodes.find(n => n.id === addModal.sourceId);
       if (!node) return;
-      const lines = code.split('\n');
+
+      let workingCode = code;
+      let targetStateId = newTransTarget;
+      if (pendingNewTarget) {
+          const createdId = createUniqueStateId(workingCode, newTransTargetStepName);
+          if (!createdId) return;
+          targetStateId = createdId;
+      }
+
+      const lines = workingCode.split('\n');
       const insertIdx = node.stepEndLine + 1;
-      const transCode = `   IF ${newTransCond} THEN ${detectedStateVar} := ${newTransTarget}; END_IF;`;
+    const maxExistingPriority = node.transitions.length > 0 ? Math.max(...node.transitions.map(t => t.priority || 0)) : 0;
+    const assignedPriority = maxExistingPriority + Math.max(1, Math.floor(newTransitionPriorityStep || 10));
+    const transCode = `   (* PRI: ${assignedPriority} *) IF ${newTransCond} THEN ${detectedStateVar} := ${targetStateId}; END_IF;`;
       lines.splice(insertIdx, 0, transCode);
-      setCode(lines.join('\n'));
+
+      let nextCode = lines.join('\n');
+      if (pendingNewTarget) {
+          nextCode = insertStateConstant(nextCode, targetStateId);
+      }
+
+      setCode(nextCode);
       setIsDirty(true);
       setAddModal({ ...addModal, isOpen: false });
-      setConsoleOutput(prev => [...prev, `> Added Transition: ${node.label} -> ${newTransTarget.replace('STATE_', '')}`]);
+      setNewTransTarget('');
+      setNewTransTargetStepName('');
+      setConsoleOutput(prev => [...prev, `> Added Transition: ${node.label} -> ${targetStateId.replace('STATE_', '')} (PRI ${assignedPriority})`]);
   };
 
   const handleOpenRetargetTransition = (node: SFCNode, transIdx: number) => {
@@ -1685,7 +2134,8 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
           isOpen: true,
           nodeId: node.id,
           transitionIdx: transIdx,
-          target: trans.target
+          target: trans.target,
+          newTargetName: ''
       });
   };
 
@@ -1696,36 +2146,23 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
       const trans = node.transitions[retargetModal.transitionIdx];
       if (!trans) return;
 
-      if (trans.target === retargetModal.target) {
+      let targetStateId = retargetModal.target;
+      let nextCode = code;
+      if (targetStateId === '__NEW_STEP__') {
+          const createdId = createUniqueStateId(nextCode, retargetModal.newTargetName || '');
+          if (!createdId) return;
+          targetStateId = createdId;
+          nextCode = insertStateConstant(nextCode, targetStateId);
+          setCode(nextCode);
+      }
+
+      if (trans.target === targetStateId) {
           setRetargetModal({ isOpen: false, nodeId: undefined, transitionIdx: undefined, target: '' });
           return;
       }
 
-      const lines = code.split('\n');
-      const blockStart = trans.lineIndex;
-      const blockEnd = trans.blockEndIndex;
-      const blockText = lines.slice(blockStart, blockEnd + 1).join('\n');
-
-      const stateVar = detectedStateVar || 'state';
-      const exactAssignRe = new RegExp(`\\b${stateVar}\\s*:=\\s*STATE_\\w+\\b`);
-      const genericAssignRe = /\b[A-Za-z_][A-Za-z0-9_]*\s*:=\s*STATE_\w+\b/;
-      const replacement = `${stateVar} := ${retargetModal.target}`;
-
-      let newBlockText = blockText;
-      if (exactAssignRe.test(newBlockText)) {
-          newBlockText = newBlockText.replace(exactAssignRe, replacement);
-      } else if (genericAssignRe.test(newBlockText)) {
-          newBlockText = newBlockText.replace(genericAssignRe, replacement);
-      } else {
-          setConsoleOutput(prev => [...prev, `> Could not update transition target for ${node.label}. Assignment pattern not found.`]);
-          return;
-      }
-
-      lines.splice(blockStart, blockEnd - blockStart + 1, ...newBlockText.split('\n'));
-      setCode(lines.join('\n'));
-      setIsDirty(true);
-      setRetargetModal({ isOpen: false, nodeId: undefined, transitionIdx: undefined, target: '' });
-      setConsoleOutput(prev => [...prev, `> Updated Transition: ${node.label} -> ${retargetModal.target.replace('STATE_', '')}`]);
+      retargetTransitionByRef(retargetModal.nodeId, retargetModal.transitionIdx, targetStateId, nextCode);
+      setRetargetModal({ isOpen: false, nodeId: undefined, transitionIdx: undefined, target: '', newTargetName: '' });
   };
 
   const handleOpenInsertStepBetween = (node: SFCNode, transIdx: number) => {
@@ -2176,17 +2613,49 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                 <Icons.Code className="w-5 h-5" />
                 <span className="font-semibold text-gray-200 hidden md:inline">Logic Editor</span>
              </div>
-             <div className="relative group">
-                 <select 
-                    value={selectedDeviceId}
-                    onChange={handleDeviceSelect}
-                    className="bg-scada-bg border border-scada-border rounded pl-3 pr-8 py-1.5 text-sm text-white focus:border-scada-accent outline-none appearance-none min-w-[200px]"
-                 >
-                     {ieds.map(ied => (
-                         <option key={ied.id} value={ied.id}>{ied.name} ({ied.type})</option>
-                     ))}
-                 </select>
-                 <Icons.ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-scada-muted pointer-events-none" />
+             <div className="relative group flex items-center gap-2">
+                 <div className="relative">
+                   <select 
+                      value={selectedDeviceId}
+                      onChange={handleDeviceSelect}
+                      className="bg-scada-bg border border-scada-border rounded pl-3 pr-8 py-1.5 text-sm text-white focus:border-scada-accent outline-none appearance-none min-w-[200px]"
+                   >
+                       {ieds.map(ied => (
+                           <option key={ied.id} value={ied.id}>{ied.name} ({ied.type})</option>
+                       ))}
+                   </select>
+                   <Icons.ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-scada-muted pointer-events-none" />
+                 </div>
+
+                 {/* Per-device execution controls */}
+                 <div className="flex items-center gap-2">
+                   {/* Device status badge */}
+                   <div className={`px-2 py-0.5 rounded text-xs font-mono ${engine.isScriptEnabled(selectedDeviceId) && debugState.isRunning ? 'bg-scada-success/10 text-scada-success' : 'bg-scada-bg text-scada-muted border border-scada-border'}`}>
+                     {engine.isScriptEnabled(selectedDeviceId) && debugState.isRunning ? 'RUNNING' : (engine.isScriptEnabled(selectedDeviceId) ? 'ENABLED' : 'STOPPED')}
+                   </div>
+
+                   {/* Start / Stop selected device */}
+                   {engine.isScriptEnabled(selectedDeviceId) ? (
+                     <button onClick={() => { engine.stopScript(selectedDeviceId); setConsoleOutput(prev => [...prev, `> Stopped logic for ${selectedDeviceId}`]); }} title="Stop selected device" className="p-2 rounded bg-scada-danger/10 text-scada-danger hover:bg-scada-danger/20 border border-scada-danger/30">
+                       <Icons.Stop className="w-4 h-4" />
+                     </button>
+                   ) : (
+                     <button onClick={async () => {
+                         // Ensure current code is saved/compiled for this device then enable it
+                         handleSave();
+                         const res = engine.compile(selectedDeviceId, code);
+                         if (!res.success) {
+                             setConsoleOutput(prev => [...prev, `> Error compiling ${selectedDeviceId}: ${res.error}`]);
+                             return;
+                         }
+                         engine.updateScriptConfig({ deviceId: selectedDeviceId, code, tickRate });
+                         engine.startScript(selectedDeviceId);
+                         setConsoleOutput(prev => [...prev, `> Started logic for ${selectedDeviceId}`]);
+                     }} title="Start selected device" className="p-2 rounded bg-scada-success/10 text-scada-success hover:bg-scada-success/20 border border-scada-success/30">
+                       <Icons.Play className="w-4 h-4" />
+                     </button>
+                   )}
+                 </div>
              </div>
 
              <div className="flex bg-scada-bg rounded p-0.5 border border-scada-border">
@@ -2295,7 +2764,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                        <button onClick={() => engine.pause(selectedDeviceId)} className="flex items-center gap-2 px-3 py-1.5 bg-yellow-500/10 text-yellow-500 border border-yellow-500/50 rounded text-sm hover:bg-yellow-500/20"><Icons.Pause className="w-4 h-4" /></button>
                    )}
                    <div className="w-px h-6 bg-scada-border mx-1"></div>
-                   <button onClick={handleStop} className="flex items-center gap-2 px-4 py-1.5 bg-scada-danger/10 text-scada-danger hover:bg-scada-danger/20 border border-scada-danger/50 rounded text-sm transition-colors font-medium"><Icons.Stop className="w-4 h-4" /> Stop</button>
+                   <button onClick={handleStop} title="Stop all scripts" className="flex items-center gap-2 px-4 py-1.5 bg-scada-danger/10 text-scada-danger hover:bg-scada-danger/20 border border-scada-danger/50 rounded text-sm transition-colors font-medium"><Icons.Stop className="w-4 h-4" /> Stop</button>
                 </>
               )}
           </div>
@@ -2339,16 +2808,31 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                       {/* SFC Toolbar */}
                       <div className="h-10 bg-scada-panel border-b border-scada-border flex items-center px-4 gap-4 z-10 shadow-md">
                           <div className="flex items-center gap-2">
-                              <button onClick={() => setZoomLevel(z => Math.max(25, z - 25))} className="p-1 hover:bg-white/10 rounded text-scada-muted"><Icons.ChevronDown className="w-4 h-4" /></button>
-                              <select value={zoomLevel} onChange={(e) => setZoomLevel(parseInt(e.target.value || '100'))} className="bg-scada-bg border border-scada-border rounded p-1 text-xs font-mono w-20 text-center text-white">
-                                  <option value={25}>25%</option>
-                                  <option value={50}>50%</option>
-                                  <option value={75}>75%</option>
-                                  <option value={100}>100%</option>
-                                  <option value={150}>150%</option>
-                                  <option value={200}>200%</option>
+                              <button
+                                  onClick={() => {
+                                      const idx = SFC_ZOOM_PRESETS.indexOf(zoomLevel as any);
+                                      const base = idx >= 0 ? idx : SFC_ZOOM_PRESETS.findIndex(v => v >= zoomLevel);
+                                      setZoomLevel(SFC_ZOOM_PRESETS[Math.max(0, (base >= 0 ? base : 3) - 1)]);
+                                  }}
+                                  className="p-1 hover:bg-white/10 rounded text-scada-muted"
+                              ><Icons.ChevronDown className="w-4 h-4" /></button>
+                              <select
+                                  value={zoomLevel}
+                                  onChange={(e) => setZoomFromPreset(parseInt(e.target.value || '100', 10))}
+                                  onDoubleClick={() => setZoomLevel(100)}
+                                  title="Double-click to fit (100%)"
+                                  className="bg-scada-bg border border-scada-border rounded p-1 text-xs font-mono w-20 text-center text-white"
+                              >
+                                  {SFC_ZOOM_PRESETS.map(z => <option key={z} value={z}>{z}%</option>)}
                               </select>
-                              <button onClick={() => setZoomLevel(z => Math.min(200, z + 25))} className="p-1 hover:bg-white/10 rounded text-scada-muted"><Icons.ChevronRight className="w-4 h-4 -rotate-90" /></button>
+                              <button
+                                  onClick={() => {
+                                      const idx = SFC_ZOOM_PRESETS.indexOf(zoomLevel as any);
+                                      const base = idx >= 0 ? idx : SFC_ZOOM_PRESETS.findIndex(v => v >= zoomLevel);
+                                      setZoomLevel(SFC_ZOOM_PRESETS[Math.min(SFC_ZOOM_PRESETS.length - 1, (base >= 0 ? base : 3) + 1)]);
+                                  }}
+                                  className="p-1 hover:bg-white/10 rounded text-scada-muted"
+                              ><Icons.ChevronRight className="w-4 h-4 -rotate-90" /></button>
                               <label className="ml-3 text-xs text-scada-muted flex items-center gap-2">Normalize step
                                   <select aria-label="normalize-step-size" value={normalizeStepSize} onChange={e => setNormalizeStepSize(parseInt(e.target.value || '10', 10))} className="ml-2 bg-[#0d1117] border border-scada-border rounded p-1 text-xs">
                                       <option value={1}>1</option>
@@ -2358,18 +2842,45 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                       <option value={50}>50</option>
                                   </select>
                               </label>
+                              <label className="text-xs text-scada-muted flex items-center gap-2">New PRI step
+                                  <select aria-label="new-priority-step" value={newTransitionPriorityStep} onChange={e => setNewTransitionPriorityStep(parseInt(e.target.value || '10', 10))} className="ml-2 bg-[#0d1117] border border-scada-border rounded p-1 text-xs">
+                                      <option value={1}>1</option>
+                                      <option value={5}>5</option>
+                                      <option value={10}>10</option>
+                                      <option value={20}>20</option>
+                                      <option value={50}>50</option>
+                                  </select>
+                              </label>
                               <button onClick={() => exportPLCopenXML(sfcNodes)} title="Export PLCopen TC6 XML" className="ml-3 px-2 py-1 bg-scada-bg border border-scada-border rounded text-xs text-scada-muted hover:text-white">Export XML</button>
                               <button onClick={() => setFindReplaceOpen(true)} title="Find / Replace" className="px-2 py-1 bg-scada-bg border border-scada-border rounded text-xs text-scada-muted hover:text-white">Find/Replace</button>
+                              <button onClick={() => setShowSFCGrid(v => !v)} title="Toggle Grid" className={`px-2 py-1 border rounded text-xs ${showSFCGrid ? 'bg-scada-accent/20 border-scada-accent/50 text-scada-accent' : 'bg-scada-bg border-scada-border text-scada-muted hover:text-white'}`}>Grid</button>
+                              <button onClick={() => setSnapToGrid(v => !v)} title="Toggle Snap To Grid" className={`px-2 py-1 border rounded text-xs ${snapToGrid ? 'bg-scada-accent/20 border-scada-accent/50 text-scada-accent' : 'bg-scada-bg border-scada-border text-scada-muted hover:text-white'}`}>Snap</button>
                           </div>
                           <div className="h-4 w-px bg-scada-border" />
                           <div className="text-xs text-scada-muted flex items-center gap-2">
                               <span className="w-2 h-2 rounded-full bg-scada-success" /> Active
                               <span className="w-2 h-2 rounded-full bg-scada-panel border border-scada-border ml-2" /> Inactive
                           </div>
-                          <div className="ml-auto text-xs text-scada-muted italic">Click Action Block to Configure</div>
+                          <div className="ml-auto text-xs text-scada-muted italic truncate max-w-[45%]" title={selectedTransitionHint || `Selected steps: ${selectedSteps.length}. Drag step to move${snapToGrid ? ' (snap 10px)' : ''}. Shift+drag/Middle-drag pan.`}>
+                              {selectedTransitionHint || `Selected steps: ${selectedSteps.length}. Drag step to move${snapToGrid ? ' (snap 10px)' : ''}. Shift+drag/Middle-drag pan.`}
+                          </div>
                       </div>
 
-                      <div ref={sfcContainerRef} className="flex-1 overflow-auto p-8 relative flex flex-col items-center" onClick={() => { setSelectedTransition({}); closeTransitionContextMenu(); }}>
+                      <div
+                          ref={sfcContainerRef}
+                          className="flex-1 overflow-auto p-8 relative flex flex-col items-center"
+                          onContextMenu={openCanvasContextMenu}
+                          onMouseDown={handleSFCMouseDown}
+                          onMouseMove={handleSFCMouseMove}
+                          onMouseUp={handleSFCMouseUp}
+                          onDoubleClick={(e) => { if (e.target === e.currentTarget) setAddModal({ isOpen: true, type: 'step' }); }}
+                          onMouseLeave={() => { isPanningRef.current = false; panStartRef.current = null; if (boxSelection.active) setBoxSelection(prev => ({ ...prev, active: false })); }}
+                          onWheel={handleSFCWheel}
+                          style={showSFCGrid ? {
+                              backgroundImage: 'linear-gradient(to right, rgba(148,163,184,0.12) 1px, transparent 1px), linear-gradient(to bottom, rgba(148,163,184,0.12) 1px, transparent 1px)',
+                              backgroundSize: '10px 10px'
+                          } : undefined}
+                      >
                           {sfcNodes.length === 0 ? (
                               <div className="text-scada-muted flex flex-col items-center mt-20 opacity-50">
                                   <Icons.SFC className="w-16 h-16 mb-4" />
@@ -2380,6 +2891,9 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                               <div className="space-y-8 origin-top transition-transform duration-200" style={{ transform: `scale(${zoomLevel / 100})` }}>
                                   {sfcNodes.map((node, index) => {
                                       const isActive = activeSFCStepId === node.id;
+                                      const isStepSelected = selectedSteps.includes(node.id);
+                                      const isDraggingNode = draggingNodeIds.includes(node.id);
+                                      const nodeOffset = nodePositions[node.id] || { x: 0, y: 0 };
                                       const nodeHasError = diagnostics.some(d => d.nodes?.includes(node.id) && d.severity === 'error');
                                       const nodeHasWarning = diagnostics.some(d => d.nodes?.includes(node.id) && d.severity === 'warning');
                                       const isForced = !!forcedSteps[node.id];
@@ -2396,6 +2910,8 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                   }
                                               }}
                                               className="relative flex flex-col items-center group"
+                                              onContextMenu={(e) => openStepContextMenu(e, node.id)}
+                                              style={{ transform: `translate(${nodeOffset.x}px, ${nodeOffset.y}px)`, zIndex: isDraggingNode ? 40 : undefined }}
                                           >
                                               
                                               <div className="flex items-center gap-4">
@@ -2403,7 +2919,19 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                   <div className={`w-40 h-20 flex flex-col items-center justify-center font-bold text-sm shadow-xl transition-all duration-300 relative z-10
                                                       ${isActive ? 'bg-scada-success/20 border-scada-success text-white shadow-[0_0_20px_rgba(16,185,129,0.18)]' : 'bg-scada-panel text-gray-300'}
                                                       ${nodeHasError ? 'border-scada-danger' : nodeHasWarning ? 'border-scada-warning' : 'border-scada-border'}
-                                                      ${node.type === 'init' ? 'border-4 border-double border-scada-accent' : 'border-2 border-scada-border'}`}>
+                                                      ${node.type === 'init' ? 'border-4 border-double border-scada-accent' : 'border-2 border-scada-border'}
+                                                      ${isStepSelected ? 'ring-2 ring-scada-accent ring-offset-1 ring-offset-[#1e1e1e]' : ''}
+                                                      ${isDraggingNode ? 'opacity-80 shadow-[0_0_0_2px_rgba(34,211,238,0.35)]' : ''}`}
+                                                      onClick={(e) => handleStepSelect(node.id, e)}
+                                                      onMouseUp={(e) => {
+                                                          if (reconnectDrag.active && reconnectDrag.nodeId && reconnectDrag.idx !== undefined) {
+                                                              e.stopPropagation();
+                                                              retargetTransitionByRef(reconnectDrag.nodeId, reconnectDrag.idx, node.id);
+                                                              setReconnectDrag({ active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 });
+                                                          }
+                                                      }}
+                                                      onMouseDown={(e) => startStepDrag(node.id, e)}
+                                                  >
                                                       <div className="text-center">
                                                           <div className="text-[9px] uppercase text-scada-muted mb-1 flex items-center gap-2 justify-center">
                                                               {node.type === 'init' ? <span className="px-2 py-0.5 rounded bg-black/20 border border-scada-accent text-scada-accent">INITIAL</span> : <span className="text-scada-muted">STEP {index}</span>}
@@ -2559,6 +3087,18 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                                               >
                                                                   <Icons.ArrowDownLeft className="w-3 h-3 text-scada-muted" />
                                                                   <span>{trans.target.replace('STATE_', '')}</span>
+                                                                  <div
+                                                                      ref={(el) => {
+                                                                          const key = `${node.id}:${idx}`;
+                                                                          if (el) transitionHandleRefs.current.set(key, el);
+                                                                          else transitionHandleRefs.current.delete(key);
+                                                                      }}
+                                                                      onMouseDown={(e) => startTransitionReconnect(e, node.id, idx)}
+                                                                      className="ml-1 px-1 rounded bg-scada-bg border border-scada-border text-[9px] text-scada-muted hover:text-white hover:border-scada-accent cursor-grab"
+                                                                      title="Drag to reconnect this transition"
+                                                                  >
+                                                                      ⤢
+                                                                  </div>
                                                               </div>
                                                           </div>
                                                       )})}
@@ -2595,6 +3135,18 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                               </div>
                           )}
 
+                          {boxSelection.active && (
+                              <div
+                                  className="absolute border border-scada-accent bg-scada-accent/10 pointer-events-none z-30"
+                                  style={{
+                                      left: Math.min(boxSelection.startX, boxSelection.currentX),
+                                      top: Math.min(boxSelection.startY, boxSelection.currentY),
+                                      width: Math.abs(boxSelection.currentX - boxSelection.startX),
+                                      height: Math.abs(boxSelection.currentY - boxSelection.startY)
+                                  }}
+                              />
+                          )}
+
                           {transitionContextMenu.isOpen && (
                               <div
                                   className="fixed z-[70] min-w-[220px] bg-scada-panel border border-scada-border rounded shadow-2xl p-1"
@@ -2605,9 +3157,57 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                   <button onClick={() => runTransitionAction('retarget')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Retarget Step <span className="text-scada-muted float-right">T</span></button>
                                   <button onClick={() => runTransitionAction('insert')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Insert Step Between <span className="text-scada-muted float-right">I</span></button>
                                   <button onClick={() => runTransitionAction('normalize')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Normalize Priorities <span className="text-scada-muted float-right">N</span></button>
+                                  <button onClick={() => runTransitionAction('set-priority')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Set Priority <span className="text-scada-muted float-right">P</span></button>
                                   <div className="h-px my-1 bg-scada-border" />
                                   <button onClick={() => runTransitionAction('delete')} className="w-full text-left px-3 py-1.5 text-xs text-scada-danger hover:bg-red-500/10 rounded">Delete Transition <span className="text-scada-muted float-right">Del</span></button>
                               </div>
+                          )}
+
+                          {stepContextMenu.isOpen && (() => {
+                              const node = sfcNodes.find(n => n.id === stepContextMenu.nodeId);
+                              return (
+                                  <div
+                                      className="fixed z-[70] min-w-[220px] bg-scada-panel border border-scada-border rounded shadow-2xl p-1"
+                                      style={{ left: stepContextMenu.x, top: stepContextMenu.y }}
+                                      onClick={(e) => e.stopPropagation()}
+                                  >
+                                      <button onClick={() => runStepAction('edit-actions')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Edit Actions</button>
+                                      <button onClick={() => runStepAction('add-transition')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Add Transition</button>
+                                      <button onClick={() => runStepAction('rename')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Rename Step</button>
+                                      <button onClick={() => runStepAction('force')} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Force Step</button>
+                                      {node && node.type !== 'init' && (
+                                          <button onClick={() => runStepAction('set-initial')} className="w-full text-left px-3 py-1.5 text-xs text-scada-accent hover:bg-white/10 rounded">Set as Initial</button>
+                                      )}
+                                      <div className="h-px my-1 bg-scada-border" />
+                                      <button onClick={() => runStepAction('delete')} className="w-full text-left px-3 py-1.5 text-xs text-scada-danger hover:bg-red-500/10 rounded">Delete Step</button>
+                                  </div>
+                              );
+                          })()}
+
+                          {canvasContextMenu.isOpen && (
+                              <div
+                                  className="fixed z-[70] min-w-[220px] bg-scada-panel border border-scada-border rounded shadow-2xl p-1"
+                                  style={{ left: canvasContextMenu.x, top: canvasContextMenu.y }}
+                                  onClick={(e) => e.stopPropagation()}
+                              >
+                                  <button onClick={() => { setAddModal({ isOpen: true, type: 'step' }); closeCanvasContextMenu(); }} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Add Step</button>
+                                  <button onClick={() => { setConsoleOutput(prev => [...prev, '> Paste action is not available yet in SFC canvas.']); closeCanvasContextMenu(); }} className="w-full text-left px-3 py-1.5 text-xs text-scada-muted hover:bg-white/10 rounded">Paste</button>
+                                  <button onClick={() => { setZoomLevel(100); setNodePositions({}); if (sfcContainerRef.current) { sfcContainerRef.current.scrollTo({ top: 0, left: 0, behavior: 'smooth' }); } closeCanvasContextMenu(); }} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">Auto-layout (Reset View)</button>
+                                  <button onClick={() => { setShowSFCGrid(v => !v); closeCanvasContextMenu(); }} className="w-full text-left px-3 py-1.5 text-xs text-white hover:bg-white/10 rounded">{showSFCGrid ? 'Hide Grid' : 'Show Grid'}</button>
+                              </div>
+                          )}
+
+                          {reconnectDrag.active && (
+                              <svg className="fixed inset-0 pointer-events-none z-[65]">
+                                  <path
+                                      d={`M ${reconnectDrag.startX} ${reconnectDrag.startY} L ${reconnectDrag.startX} ${(reconnectDrag.startY + reconnectDrag.cursorY) / 2} L ${reconnectDrag.cursorX} ${(reconnectDrag.startY + reconnectDrag.cursorY) / 2} L ${reconnectDrag.cursorX} ${reconnectDrag.cursorY}`}
+                                      fill="none"
+                                      stroke="rgb(34 211 238)"
+                                      strokeWidth="2"
+                                      strokeDasharray="6 4"
+                                  />
+                                  <circle cx={reconnectDrag.cursorX} cy={reconnectDrag.cursorY} r="4" fill="rgb(34 211 238)" />
+                              </svg>
                           )}
                       </div>
                   </div>
@@ -2973,7 +3573,17 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                               >
                                   <option value="">-- Select Target --</option>
                                   {sfcNodes.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
+                                  <option value="__NEW_STEP__">+ Create New Step...</option>
                               </select>
+
+                              {editModal.target === '__NEW_STEP__' && (
+                                  <input
+                                      className="mt-2 w-full bg-[#0d1117] border border-scada-border rounded p-2 text-white font-mono focus:border-scada-accent outline-none"
+                                      value={editModal.newTargetName || ''}
+                                      onChange={(e) => setEditModal(m => ({ ...m, newTargetName: e.target.value }))}
+                                      placeholder="New step name (e.g. CHECK_READY)"
+                                  />
+                              )}
                           </div>
                       )}
 
@@ -3027,8 +3637,18 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                       <button onClick={() => setEditModal({ ...editModal, isOpen: false })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
                       <button
                           onClick={() => saveEdit(editModal.content)}
-                          disabled={editModal.type === 'transition' && (() => { const node = sfcNodes.find(n => n.id === editModal.nodeId); return !!(node && typeof editModal.priority === 'number' && node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === editModal.priority)); })()}
-                          className={`px-4 py-2 rounded text-sm font-bold transition-colors shadow-lg shadow-cyan-900/20 ${editModal.type === 'transition' && (() => { const node = sfcNodes.find(n => n.id === editModal.nodeId); return !!(node && typeof editModal.priority === 'number' && node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === editModal.priority)); })() ? 'bg-scada-bg text-scada-muted opacity-60 cursor-default' : 'bg-scada-accent text-white hover:bg-cyan-600'}`}>
+                          disabled={editModal.type === 'transition' && (() => {
+                              const node = sfcNodes.find(n => n.id === editModal.nodeId);
+                              const duplicatePriority = !!(node && typeof editModal.priority === 'number' && node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === editModal.priority));
+                              const missingNewTargetName = editModal.target === '__NEW_STEP__' && !(editModal.newTargetName || '').trim();
+                              return duplicatePriority || missingNewTargetName;
+                          })()}
+                          className={`px-4 py-2 rounded text-sm font-bold transition-colors shadow-lg shadow-cyan-900/20 ${editModal.type === 'transition' && (() => {
+                              const node = sfcNodes.find(n => n.id === editModal.nodeId);
+                              const duplicatePriority = !!(node && typeof editModal.priority === 'number' && node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === editModal.priority));
+                              const missingNewTargetName = editModal.target === '__NEW_STEP__' && !(editModal.newTargetName || '').trim();
+                              return duplicatePriority || missingNewTargetName;
+                          })() ? 'bg-scada-bg text-scada-muted opacity-60 cursor-default' : 'bg-scada-accent text-white hover:bg-cyan-600'}`}>
                           Apply Changes
                       </button>
                   </div>
@@ -3069,7 +3689,17 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                   >
                                       <option value="">-- Select Target --</option>
                                       {sfcNodes.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
+                                      <option value="__NEW_STEP__">+ Create New Step...</option>
                                   </select>
+
+                                  {newTransTarget === '__NEW_STEP__' && (
+                                      <input
+                                          className="mt-2 w-full bg-[#0d1117] border border-scada-border rounded p-2 text-white font-mono focus:border-scada-accent outline-none"
+                                          value={newTransTargetStepName}
+                                          onChange={e => setNewTransTargetStepName(e.target.value)}
+                                          placeholder="New step name (e.g. CHECK_READY)"
+                                      />
+                                  )}
                               </div>
                               <div>
                                   <label className="text-xs font-bold text-scada-muted uppercase block mb-1">Condition (ST Boolean)</label>
@@ -3087,7 +3717,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                       <button onClick={() => setAddModal({ ...addModal, isOpen: false })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
                       <button 
                           onClick={addModal.type === 'step' ? handleAddStep : handleAddTransition} 
-                          disabled={addModal.type === 'step' ? !newStepName : !newTransTarget}
+                          disabled={addModal.type === 'step' ? !newStepName : (!newTransTarget || (newTransTarget === '__NEW_STEP__' && !newTransTargetStepName.trim()))}
                           className="px-4 py-2 bg-scada-accent text-white rounded text-sm font-bold hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-900/20 disabled:opacity-50"
                       >
                           {addModal.type === 'step' ? 'Create Step' : 'Add Link'}
@@ -3119,7 +3749,17 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                           >
                               <option value="">-- Select Target --</option>
                               {sfcNodes.map(n => <option key={n.id} value={n.id}>{n.label}</option>)}
+                              <option value="__NEW_STEP__">+ Create New Step...</option>
                           </select>
+
+                          {retargetModal.target === '__NEW_STEP__' && (
+                              <input
+                                  className="mt-2 w-full bg-[#0d1117] border border-scada-border rounded p-2 text-white font-mono focus:border-scada-accent outline-none"
+                                  value={retargetModal.newTargetName || ''}
+                                  onChange={(e) => setRetargetModal(m => ({ ...m, newTargetName: e.target.value }))}
+                                  placeholder="New step name (e.g. CHECK_READY)"
+                              />
+                          )}
                       </div>
                   </div>
 
@@ -3127,7 +3767,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                       <button onClick={() => setRetargetModal({ isOpen: false, nodeId: undefined, transitionIdx: undefined, target: '' })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
                       <button
                           onClick={applyRetargetTransition}
-                          disabled={!retargetModal.target}
+                          disabled={!retargetModal.target || (retargetModal.target === '__NEW_STEP__' && !(retargetModal.newTargetName || '').trim())}
                           className="px-4 py-2 bg-scada-accent text-white rounded text-sm font-bold hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-900/20 disabled:opacity-50"
                       >
                           Apply Target
@@ -3170,6 +3810,45 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                           className="px-4 py-2 bg-scada-accent text-white rounded text-sm font-bold hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-900/20 disabled:opacity-50"
                       >
                           Insert Step
+                      </button>
+                  </div>
+              </div>
+          </div>
+      )}
+
+      {/* Reconnect → Create New Step Modal */}
+      {reconnectNewStepModal.isOpen && (
+          <div className="absolute inset-0 z-50 bg-black/80 flex items-center justify-center p-8 backdrop-blur-sm animate-in fade-in">
+              <div className="bg-scada-panel border border-scada-border rounded-lg shadow-2xl w-full max-w-md flex flex-col overflow-hidden animate-in zoom-in-95">
+                  <div className="p-4 border-b border-scada-border bg-scada-bg/50 flex justify-between items-center">
+                      <h3 className="font-bold text-white flex items-center gap-2">
+                          <Icons.GitBranch className="w-4 h-4 text-scada-accent" /> Reconnect to New Step
+                      </h3>
+                      <button onClick={() => setReconnectNewStepModal({ isOpen: false, nodeId: undefined, idx: undefined, stepName: '' })} className="text-scada-muted hover:text-white"><Icons.Close className="w-5 h-5" /></button>
+                  </div>
+
+                  <div className="p-6 space-y-4">
+                      <div>
+                          <label className="text-xs font-bold text-scada-muted uppercase block mb-1">New Step Name</label>
+                          <input
+                              className="w-full bg-[#0d1117] border border-scada-border rounded p-2 text-white font-mono focus:border-scada-accent outline-none"
+                              value={reconnectNewStepModal.stepName}
+                              onChange={(e) => setReconnectNewStepModal(m => ({ ...m, stepName: e.target.value }))}
+                              placeholder="e.g. RECOVER"
+                              autoFocus
+                          />
+                          <p className="text-xs text-scada-muted mt-2">Creates a new state constant and reconnects the dragged transition to it.</p>
+                      </div>
+                  </div>
+
+                  <div className="p-4 border-t border-scada-border bg-scada-bg/30 flex justify-end gap-3">
+                      <button onClick={() => setReconnectNewStepModal({ isOpen: false, nodeId: undefined, idx: undefined, stepName: '' })} className="px-4 py-2 rounded text-sm hover:bg-white/5 text-scada-muted transition-colors">Cancel</button>
+                      <button
+                          onClick={applyReconnectToNewStep}
+                          disabled={!reconnectNewStepModal.stepName.trim()}
+                          className="px-4 py-2 bg-scada-accent text-white rounded text-sm font-bold hover:bg-cyan-600 transition-colors shadow-lg shadow-cyan-900/20 disabled:opacity-50"
+                      >
+                          Create & Reconnect
                       </button>
                   </div>
               </div>

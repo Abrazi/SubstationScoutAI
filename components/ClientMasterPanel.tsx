@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Icons } from './Icons';
-import { IEDNode, ClientTransaction, ModbusRegisterType } from '../types';
+import { IEDNode, ClientTransaction } from '../types';
 import { engine } from '../services/SimulationEngine';
 
 interface ClientMasterPanelProps {
@@ -11,6 +11,7 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
   const [activeTab, setActiveTab] = useState<'iec61850' | 'modbus'>('iec61850');
   const [transactions, setTransactions] = useState<ClientTransaction[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
+    const [connectedTargetId, setConnectedTargetId] = useState<string | null>(null);
 
   // Common Connection State
   const [targetIP, setTargetIP] = useState('192.168.1.100');
@@ -27,6 +28,29 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
   // MMS State
   const [mmsPath, setMmsPath] = useState('IED_Bay_01_Main/LD0/MMXU1.PhV.phsA.mag');
   const [mmsWriteValue, setMmsWriteValue] = useState('');
+
+    const modbusEndpoints = ieds
+        .filter(ied => !!ied.config?.modbusMap)
+        .map(ied => ({
+            id: ied.id,
+            name: ied.name,
+            ip: ied.config?.ip || '0.0.0.0',
+            port: ied.config?.modbusPort ?? 502,
+            unitId: ied.config?.modbusUnitId ?? 1
+        }));
+
+    const iecEndpoints = ieds
+        .filter(ied => {
+            const hasIecModel = Array.isArray(ied.children) && ied.children.length > 0;
+            const isIecServer = (ied.config?.role ?? 'server') === 'server';
+            return hasIecModel && isIecServer;
+        })
+        .map(ied => ({
+            id: ied.id,
+            name: ied.name,
+            ip: ied.config?.ip || '0.0.0.0',
+            port: ied.config?.iecMmsPort ?? 102
+        }));
 
   // Auto-scroll log
   useEffect(() => {
@@ -51,24 +75,36 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
       setConnectionStatus('connecting');
       // Simulate network handshake
       setTimeout(() => {
-          // Check if IP matches a simulated IED
-          const target = ieds.find(ied => ied.config?.ip === targetIP);
+          const target = activeTab === 'modbus'
+              ? modbusEndpoints.find(ep =>
+                    ep.ip === targetIP && ep.port === mbPort
+                )
+              : iecEndpoints.find(ep =>
+                    ep.ip === targetIP
+                );
           
           if (target) {
               setConnectionStatus('connected');
               setIsConnected(true);
-              addLog('response', activeTab === 'modbus' ? 'Modbus' : 'MMS', `Connected to ${target.name} (${targetIP})`, undefined, 'success');
+              setConnectedTargetId(target.id);
+              const endpointInfo = activeTab === 'modbus' ? `:${mbPort}` : `:${target.port}`;
+              addLog('response', activeTab === 'modbus' ? 'Modbus' : 'MMS', `Connected to ${target.name} (${targetIP}${endpointInfo})`, undefined, 'success');
           } else {
               // If bridge is active, we might connect externally, but for now assuming simulation only or failure
               setConnectionStatus('failed');
               setIsConnected(false);
-              addLog('error', activeTab === 'modbus' ? 'Modbus' : 'MMS', `Connection Timeout: ${targetIP} unreachable`, undefined, 'timeout');
+              setConnectedTargetId(null);
+              const reason = activeTab === 'modbus'
+                ? `No Modbus slave listening at ${targetIP}:${mbPort}`
+                : `No IEC 61850 server found at ${targetIP}`;
+              addLog('error', activeTab === 'modbus' ? 'Modbus' : 'MMS', `Connection Timeout: ${reason}`, undefined, 'timeout');
           }
       }, 800);
   };
 
   const handleDisconnect = () => {
       setIsConnected(false);
+      setConnectedTargetId(null);
       setConnectionStatus('idle');
       addLog('response', activeTab === 'modbus' ? 'Modbus' : 'MMS', 'Connection Closed');
   };
@@ -84,9 +120,11 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
 
       // Logic Execution
       setTimeout(() => {
-           // Resolve Target
-           const target = ieds.find(ied => ied.config?.ip === targetIP);
-           if (!target) return; // Should allow external via engine later
+           const target = ieds.find(ied => ied.id === connectedTargetId);
+           if (!target || !target.config?.modbusMap) {
+               addLog('error', 'Modbus', 'Target is not an active Modbus slave endpoint', undefined, 'error');
+               return;
+           }
 
            let resultValue: any;
            let error = false;
@@ -233,6 +271,30 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                             className="w-full bg-scada-panel border border-scada-border rounded px-3 py-2 text-white font-mono focus:border-scada-accent outline-none disabled:opacity-50"
                         />
                     </div>
+
+                    {!isConnected && activeTab === 'iec61850' && iecEndpoints.length > 0 && (
+                        <div className="space-y-1">
+                            <label className="text-xs font-bold text-gray-400">Quick Select IEC Server</label>
+                            <div className="relative">
+                                <select
+                                    value=""
+                                    onChange={(e) => {
+                                        const endpoint = iecEndpoints.find(ep => ep.id === e.target.value);
+                                        if (endpoint) {
+                                            setTargetIP(endpoint.ip);
+                                        }
+                                    }}
+                                    className="w-full bg-scada-panel border border-scada-border rounded px-3 py-2 text-white text-xs font-mono focus:border-scada-accent outline-none appearance-none"
+                                >
+                                    <option value="">-- Select IEC Server --</option>
+                                    {iecEndpoints.map(ep => (
+                                        <option key={ep.id} value={ep.id}>{ep.name} ({ep.ip}:{ep.port})</option>
+                                    ))}
+                                </select>
+                                <Icons.ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-scada-muted pointer-events-none" />
+                            </div>
+                        </div>
+                    )}
                     
                     {activeTab === 'modbus' && (
                         <div className="grid grid-cols-2 gap-4">
@@ -329,6 +391,33 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                         >
                             Send Request
                         </button>
+
+                        <div className="mt-5 border-t border-scada-border/50 pt-4">
+                            <div className="text-[11px] font-bold uppercase text-scada-muted mb-2">Available Modbus Slaves</div>
+                            <div className="max-h-28 overflow-auto space-y-1.5">
+                                {modbusEndpoints.length === 0 && (
+                                    <div className="text-xs text-scada-muted">No Modbus slave devices configured.</div>
+                                )}
+                                {modbusEndpoints.map(ep => (
+                                    <button
+                                        key={ep.id}
+                                        type="button"
+                                        onClick={() => {
+                                            if (!isConnected) {
+                                                setTargetIP(ep.ip);
+                                                setMbPort(ep.port);
+                                                setMbUnitId(ep.unitId);
+                                            }
+                                        }}
+                                        disabled={isConnected}
+                                        className="w-full text-left px-2 py-1.5 rounded bg-scada-bg border border-scada-border hover:border-scada-accent disabled:opacity-60"
+                                    >
+                                        <div className="text-xs text-gray-200 font-medium truncate">{ep.name}</div>
+                                        <div className="text-[10px] font-mono text-scada-muted">{ep.ip}:{ep.port} · Unit {ep.unitId}</div>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
                     </div>
                 ) : (
                     <div className="space-y-4">

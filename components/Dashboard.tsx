@@ -81,7 +81,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
     const getRegisterByName = (root: IEDNode | null, name: string): number | undefined => {
         const reg = root?.config?.modbusMap?.find(r => r.name.toLowerCase() === name.toLowerCase());
         if (!reg) return undefined;
-        return engine.getRegister(reg.address);
+        return engine.getRegister(reg.address, root?.name || 'System');
     };
 
     const getNumericDa = (path?: string): number | undefined => {
@@ -115,13 +115,13 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
             if (!Number.isFinite(address)) return undefined;
             switch (type as ModbusRegisterType) {
                 case 'Coil':
-                    return engine.getCoil(address);
+                    return engine.getCoil(address, selectedNode?.name || 'System');
                 case 'DiscreteInput':
-                    return engine.getDiscreteInput(address);
+                    return engine.getDiscreteInput(address, selectedNode?.name || 'System');
                 case 'HoldingRegister':
-                    return engine.getRegister(address);
+                    return engine.getRegister(address, selectedNode?.name || 'System');
                 case 'InputRegister':
-                    return engine.getInputRegister(address);
+                    return engine.getInputRegister(address, selectedNode?.name || 'System');
                 default:
                     return undefined;
             }
@@ -160,7 +160,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
             return (statusWord & (1 << 4)) !== 0;
         }
 
-        return engine.getCoil(2);
+        return engine.getCoil(2, root?.name || 'System');
     };
 
   // Initialize Layout on Node Change
@@ -233,7 +233,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ selectedNode, ieds, onSele
   const toggleBreaker = () => {
     const newState = !breakerState;
         setBreakerState(newState);
-        engine.setCoil(2, newState, 'Dashboard User');
+        engine.setCoil(2, newState, selectedNode?.name || 'Dashboard User');
 
         const posPath = findDaPath(selectedNode, '.XCBR1.Pos.stVal');
         if (posPath) {

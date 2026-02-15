@@ -130,36 +130,23 @@ export const generateFleet = (): IEDNode[] => {
 
     // 1. Create Generators
     Object.entries(GEN_IP_MAP).forEach(([name, ip]) => {
-        const iedPath = name;
-        const ldPath = `${name}LD0`;
-        
         fleet.push({
             id: name, // Use Name as ID for easier script mapping
             name: name,
             type: NodeType.IED,
-            path: iedPath,
+            path: name,
             description: `Diesel Generator Controller (${ip})`,
             config: {
                 ip: ip,
                 subnet: '255.255.0.0',
                 gateway: '172.16.0.1',
                 vlan: 30,
+                role: 'server',
+                modbusPort: 502,
+                modbusUnitId: 1,
                 modbusMap: createGeneratorModbusMap()
             },
-            children: [
-                {
-                    id: `${name}-ld0`,
-                    name: 'LD0',
-                    type: NodeType.LDevice,
-                    path: ldPath,
-                    description: "Controller Logical Device",
-                    children: [
-                        createLN('', 'LLN0', '', ldPath),
-                        createLN('Meas', 'MMXU', '1', ldPath),
-                        createLN('Ctrl', 'XCBR', '1', ldPath),
-                    ]
-                }
-            ]
+            children: []
         });
     });
 
@@ -183,6 +170,9 @@ export const generateFleet = (): IEDNode[] => {
                 subnet: '255.255.0.0',
                 gateway: '172.16.0.1',
                 vlan: 30,
+                role: 'server',
+                modbusPort: 502,
+                modbusUnitId: 1,
                 modbusMap: [
                     { address: 74, type: 'HoldingRegister', value: 0, name: 'Total Demand', description: 'kW' },
                     { address: 901, type: 'HoldingRegister', value: 0, name: 'Online Gens', description: 'Count' }

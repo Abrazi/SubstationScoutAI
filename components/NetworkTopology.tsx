@@ -26,6 +26,8 @@ const VLAN_CONFIG = {
   1:  { name: 'Management', color: '#64748b', subnet: '192.168.1' } // Slate
 };
 
+const MAX_ACTIVE_PACKETS = 120;
+
 export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelectIED, onDeleteIED, simulationTime }) => {
   // Configurable Core Switch State
   const [switchConfig, setSwitchConfig] = useState({
@@ -90,6 +92,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
         y: 350 + radius * Math.sin(angle),
         status: 'online',
         ip: ip,
+                modbusPort: ied.config?.modbusMap ? (ied.config.modbusPort ?? 502) : undefined,
         vlan: vlanId
       };
     });
@@ -169,7 +172,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
       // 1. Move packets
       setPackets(prev => {
         if (prev.length === 0) return prev;
-        return prev.map(p => ({ ...p, progress: p.progress + 1.5 })).filter(p => p.progress < 100);
+                return prev.map(p => ({ ...p, progress: p.progress + 2.4 })).filter(p => p.progress < 100);
       });
 
       // 2. Decay link activity
@@ -221,7 +224,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                           path: `M ${start.x} ${start.y} L ${end.x} ${end.y}`,
                           color: color,
                           progress: 0
-                      }]);
+                      }].slice(-MAX_ACTIVE_PACKETS));
                       
                       // Flash link
                       setLinkActivity(prev => ({ ...prev, [linkToSwitch.id]: 1.0 }));
@@ -234,30 +237,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
       return () => unsubscribe();
     }, [positionedNodes, links]);
 
-  // Background Noise Traffic (Optional, for liveliness)
-  useEffect(() => {
-    if (links.length === 0) return;
-    if (Math.random() > 0.3) return; // Reduce noise
-
-    const link = links[Math.floor(Math.random() * links.length)];
-    // Filter noise based on VLAN visibility
-    if (activeVlanFilter !== 'all' && link.vlan !== activeVlanFilter) return;
-
-    const color = '#64748b'; // Grey for noise
-
-    const sourceNode = positionedNodes.find(n => n.id === link.sourceId);
-    const targetNode = positionedNodes.find(n => n.id === link.targetId);
-    
-    if (sourceNode && targetNode) {
-        setPackets(prev => [...prev, {
-            id: Date.now() + Math.random(),
-            linkId: link.id,
-            path: `M ${sourceNode.x} ${sourceNode.y} L ${targetNode.x} ${targetNode.y}`,
-            color: color, 
-            progress: 0
-        }]);
-    }
-    }, [simulationTime, links, positionedNodes, activeVlanFilter]);
+    // Background noise disabled to reduce visual clutter and render load.
 
   return (
     <div className="w-full h-full bg-scada-bg relative overflow-hidden">
@@ -419,7 +399,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
              return (
                  <circle 
                     key={p.id}
-                    cx={cx} cy={cy} r={4}
+                    cx={cx} cy={cy} r={3}
                     fill={p.color}
                     filter="url(#glow)"
                  />
@@ -524,6 +504,12 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                             <div className="flex items-center justify-between gap-4 text-[10px] font-mono text-scada-muted">
                                 <span>VLAN:</span>
                                 <span style={{ color: vlanConfig?.color }}>{node.vlan}</span>
+                            </div>
+                        )}
+                        {node.modbusPort && (
+                            <div className="flex items-center justify-between gap-4 text-[10px] font-mono text-scada-muted">
+                                <span>MB Port:</span>
+                                <span className="text-yellow-400">{node.modbusPort}</span>
                             </div>
                         )}
                         <div className="flex items-center justify-between gap-4 text-[10px] font-mono text-scada-muted border-t border-scada-border/50 pt-1 mt-1">

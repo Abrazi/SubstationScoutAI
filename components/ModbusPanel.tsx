@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { ModbusRegister, ModbusRegisterType, IEDNode, WatchItem, BridgeStatus, IEDConfig } from '../types';
+import { ModbusRegister, ModbusRegisterType, IEDNode, WatchItem, IEDConfig } from '../types';
 import { Icons } from './Icons';
 import { engine } from '../services/SimulationEngine';
 
@@ -28,9 +28,12 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
   const [view, setView] = useState<'map' | 'config'>('map');
   const [activeTab, setActiveTab] = useState<ModbusRegisterType>('Coil');
   const [searchTerm, setSearchTerm] = useState('');
+    const modbusDevices = iedList.filter(ied => !!ied.config?.modbusMap);
+    const isModbusDeviceSelected = !!selectedNode.config?.modbusMap;
+    const activeNode = isModbusDeviceSelected ? selectedNode : (modbusDevices[0] || selectedNode);
   
   // Resolve registers from node config or fallback
-  const registers = selectedNode.config?.modbusMap || DEFAULT_REGISTERS;
+    const registers = activeNode.config?.modbusMap || [];
 
   // Local state for polling the engine
   const [values, setValues] = useState<Record<string, any>>({});
@@ -46,17 +49,6 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
       isDHCP: false
   });
 
-  // Bridge State
-  const [bridgeStatus, setBridgeStatus] = useState<BridgeStatus>({
-    connected: false,
-    url: 'ws://localhost:3001',
-    adapters: [],
-    selectedAdapter: null,
-    rxCount: 0,
-    txCount: 0
-  });
-  const [bridgeUrlInput, setBridgeUrlInput] = useState('ws://localhost:3001');
-
   // New Register State for Config Form
   // Using any to allow string values during input before parsing
   const [newReg, setNewReg] = useState<any>({
@@ -65,20 +57,19 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
 
   // Load profile into engine when node changes
   useEffect(() => {
-      engine.loadProfile(registers);
+      if (!isModbusDeviceSelected && modbusDevices.length > 0) {
+          onSelectNode(modbusDevices[0]);
+          return;
+      }
+
       setMbConfig(engine.getModbusConfig());
 
       // Sync local network config state with selected node
-      if (selectedNode.config) {
-          setNetConfig(selectedNode.config);
+      if (activeNode.config) {
+          setNetConfig(activeNode.config);
       }
       
-      // Subscribe to bridge updates
-      engine.subscribeToBridge((status) => {
-          setBridgeStatus(status);
-          if (status.url) setBridgeUrlInput(status.url);
-      });
-  }, [selectedNode.id]); // Reload when ID changes
+  }, [selectedNode.id, isModbusDeviceSelected, modbusDevices.length]); // Reload when ID changes
 
   // Poll the Engine for real-time updates
   useEffect(() => {
@@ -87,10 +78,10 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
         registers.forEach(reg => {
             let val;
             switch(reg.type) {
-                case 'Coil': val = engine.getCoil(reg.address); break;
-                case 'DiscreteInput': val = engine.getDiscreteInput(reg.address); break;
-                case 'InputRegister': val = engine.getInputRegister(reg.address); break;
-                case 'HoldingRegister': val = engine.getRegister(reg.address); break;
+                case 'Coil': val = engine.getCoil(reg.address, activeNode.name); break;
+                case 'DiscreteInput': val = engine.getDiscreteInput(reg.address, activeNode.name); break;
+                case 'InputRegister': val = engine.getInputRegister(reg.address, activeNode.name); break;
+                case 'HoldingRegister': val = engine.getRegister(reg.address, activeNode.name); break;
             }
             newValues[`${reg.type}-${reg.address}`] = val;
         });
@@ -98,17 +89,32 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
     }, 200); // 5Hz UI Refresh
 
     return () => clearInterval(interval);
-  }, [registers]);
+    }, [registers, activeNode.name]);
 
   const handleValueChange = (reg: ModbusRegister, newValue: string) => {
+    const parsedNumber = parseInt(newValue) || 0;
+    const parsedBool = newValue === 'true';
+
     // Write back to Engine with source 'User' to trigger a network packet
     if (reg.type === 'Coil') {
-        engine.setCoil(reg.address, newValue === 'true', 'User');
+        engine.setCoil(reg.address, parsedBool, activeNode.name);
     } else if (reg.type === 'HoldingRegister') {
-        engine.setRegister(reg.address, parseInt(newValue) || 0, 'User');
+        engine.setRegister(reg.address, parsedNumber, activeNode.name);
     }
+
+    const updatedRegisters = registers.map(r => {
+        if (r.type === reg.type && r.address === reg.address) {
+            return {
+                ...r,
+                value: reg.type === 'Coil' ? parsedBool : parsedNumber
+            };
+        }
+        return r;
+    });
+    updateNodeRegisters(updatedRegisters);
+
     // Force immediate update for UI responsiveness
-    setValues(prev => ({ ...prev, [`${reg.type}-${reg.address}`]: newValue === 'true' ? true : parseInt(newValue) }));
+    setValues(prev => ({ ...prev, [`${reg.type}-${reg.address}`]: reg.type === 'Coil' ? parsedBool : parsedNumber }));
   };
 
   const handleSaveConfig = () => {
@@ -117,26 +123,14 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
 
     // 2. Update Node Configuration (Persist to App State)
     const updatedNode: IEDNode = {
-        ...selectedNode,
+        ...activeNode,
         config: {
-            ...selectedNode.config,
+            ...activeNode.config,
             ...netConfig,
             modbusMap: registers // Ensure map is preserved
         }
     };
     onUpdateNode(updatedNode);
-  };
-
-  const handleConnectBridge = () => {
-      if (bridgeStatus.connected) {
-          engine.disconnectBridge();
-      } else {
-          engine.connectBridge(bridgeUrlInput);
-      }
-  };
-
-  const handleSelectAdapter = (ip: string) => {
-      engine.selectAdapter(ip);
   };
 
   const handleAddRegister = () => {
@@ -160,22 +154,31 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
 
   const updateNodeRegisters = (updatedRegisters: ModbusRegister[]) => {
       // Create deep copy of node
-      const newNode: IEDNode = JSON.parse(JSON.stringify(selectedNode));
+    const newNode: IEDNode = JSON.parse(JSON.stringify(activeNode));
       if (!newNode.config) newNode.config = { ip: '0.0.0.0', subnet: '0.0.0.0', gateway: '0.0.0.0', vlan: 1 };
       
       newNode.config.modbusMap = updatedRegisters;
       
       // Update Parent State
       onUpdateNode(newNode);
-      
-      // Update Engine immediately
-      engine.loadProfile(updatedRegisters);
   };
 
   const filteredRegisters = registers.filter(r => 
     r.type === activeTab && 
     (r.name.toLowerCase().includes(searchTerm.toLowerCase()) || r.address.toString().includes(searchTerm))
   );
+
+  if (modbusDevices.length === 0) {
+      return (
+          <div className="h-full flex items-center justify-center bg-scada-bg text-scada-muted">
+              <div className="text-center border border-scada-border rounded-lg p-6 bg-scada-panel/40 max-w-md">
+                  <Icons.Database className="w-10 h-10 mx-auto mb-3 text-yellow-500" />
+                  <div className="text-white font-semibold mb-1">No Modbus devices available</div>
+                  <div className="text-sm">SCD-imported IEC 61850 devices are intentionally excluded from Modbus lists.</div>
+              </div>
+          </div>
+      );
+  }
 
   return (
     <div className="h-full flex flex-col bg-scada-bg animate-in fade-in duration-300">
@@ -196,24 +199,19 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
                      Offline
                  </span>
              )}
-             {bridgeStatus.connected && (
-                 <span className="text-xs font-mono uppercase bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded border border-purple-500/20 flex items-center gap-1">
-                     <Icons.Wifi className="w-3 h-3" /> Bridged
-                 </span>
-             )}
            </div>
            
            {/* Device Dropdown Selector */}
            <div className="relative group inline-block my-1">
                <select 
-                  value={selectedNode.id}
+                  value={activeNode.id}
                   onChange={(e) => {
-                      const node = iedList.find(n => n.id === e.target.value);
+                      const node = modbusDevices.find(n => n.id === e.target.value);
                       if (node) onSelectNode(node);
                   }}
                   className="appearance-none bg-transparent text-2xl font-bold text-white pr-8 focus:outline-none cursor-pointer border-b border-dashed border-scada-muted/30 hover:border-scada-accent transition-colors w-auto max-w-md truncate py-1"
                >
-                   {iedList.map(ied => (
+                   {modbusDevices.map(ied => (
                        <option key={ied.id} value={ied.id} className="bg-scada-panel text-sm text-white">{ied.name}</option>
                    ))}
                </select>
@@ -229,9 +227,9 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
         <div className="flex items-center gap-3">
             {onDeleteNode && (
                 <button 
-                    onClick={() => onDeleteNode(selectedNode.id)}
+                    onClick={() => onDeleteNode(activeNode.id)}
                     className="flex items-center gap-2 px-3 py-1.5 bg-scada-danger/10 hover:bg-scada-danger/20 border border-scada-danger/30 text-scada-danger rounded text-sm transition-colors"
-                    title={`Delete ${selectedNode.name}`}
+                    title={`Delete ${activeNode.name}`}
                 >
                     <Icons.Trash className="w-4 h-4" />
                 </button>
@@ -384,70 +382,6 @@ export const ModbusPanel: React.FC<ModbusPanelProps> = ({ selectedNode, iedList,
                                 </button>
                             </div>
                         </div>
-                    </div>
-
-                    {/* Physical Network Bridge Card (New) */}
-                    <div className="bg-scada-panel border border-scada-border rounded-lg p-6">
-                        <div className="flex items-center justify-between mb-4">
-                            <div>
-                                <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                                    <Icons.Zap className="w-5 h-5 text-yellow-400" /> Physical Network Bridge
-                                </h3>
-                                <p className="text-sm text-scada-muted">Connect to a local Relay Agent to expose this simulated device on your real network adapter.</p>
-                            </div>
-                            <div className={`px-2 py-1 rounded text-xs font-bold uppercase border ${bridgeStatus.connected ? 'bg-scada-success/10 text-scada-success border-scada-success/30' : 'bg-scada-bg text-scada-muted border-scada-border'}`}>
-                                {bridgeStatus.connected ? 'Connected' : 'Disconnected'}
-                            </div>
-                        </div>
-
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-end">
-                            <div className="space-y-2">
-                                <label className="text-sm font-bold text-scada-muted uppercase">Bridge URL</label>
-                                <div className="flex gap-2">
-                                    <input 
-                                        type="text" 
-                                        value={bridgeUrlInput}
-                                        onChange={(e) => setBridgeUrlInput(e.target.value)}
-                                        placeholder="ws://localhost:3001"
-                                        disabled={bridgeStatus.connected}
-                                        className="flex-1 bg-scada-bg border border-scada-border rounded px-3 py-2 text-white text-sm font-mono focus:border-scada-accent outline-none disabled:opacity-50"
-                                    />
-                                    <button 
-                                        onClick={handleConnectBridge}
-                                        className={`px-4 py-2 rounded font-bold text-sm transition-colors ${bridgeStatus.connected ? 'bg-scada-danger text-white hover:bg-red-600' : 'bg-scada-accent text-white hover:bg-cyan-600'}`}
-                                    >
-                                        {bridgeStatus.connected ? 'Disconnect' : 'Connect'}
-                                    </button>
-                                </div>
-                            </div>
-                            
-                            <div className="space-y-2">
-                                <label className="text-sm font-bold text-scada-muted uppercase">Bind to Network Adapter</label>
-                                <div className="relative">
-                                    <select 
-                                        value={bridgeStatus.selectedAdapter || ''}
-                                        onChange={(e) => handleSelectAdapter(e.target.value)}
-                                        disabled={!bridgeStatus.connected || bridgeStatus.adapters.length === 0}
-                                        className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-white text-sm font-mono focus:border-scada-accent outline-none appearance-none disabled:opacity-50"
-                                    >
-                                        <option value="">-- Select Adapter --</option>
-                                        {bridgeStatus.adapters.map(adapter => (
-                                            <option key={adapter.ip} value={adapter.ip}>
-                                                {adapter.name} ({adapter.ip})
-                                            </option>
-                                        ))}
-                                    </select>
-                                    <Icons.ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-scada-muted pointer-events-none" />
-                                </div>
-                            </div>
-                        </div>
-
-                        {bridgeStatus.connected && (
-                            <div className="mt-4 flex gap-4 text-xs font-mono text-scada-muted bg-black/20 p-2 rounded">
-                                <span>TX: <span className="text-scada-accent">{bridgeStatus.txCount}</span></span>
-                                <span>RX: <span className="text-scada-success">{bridgeStatus.rxCount}</span></span>
-                            </div>
-                        )}
                     </div>
 
                     {/* Network Settings Card */}

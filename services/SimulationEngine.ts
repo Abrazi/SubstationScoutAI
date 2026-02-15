@@ -13,6 +13,16 @@ interface DeviceModbusProfile {
     inputRegisters: Map<number, number>;
 }
 
+interface DeviceIecEndpoint {
+    id: string;
+    name: string;
+    ip: string;
+    port: number;
+    backendHost: string;
+    backendPort: number;
+    scdFile?: string;
+}
+
 interface BreakpointMeta {
     enabled: boolean;
     condition?: string;
@@ -55,6 +65,9 @@ export class SimulationEngine {
 
   // IEC 61850 Data Model State (Path -> Value)
   private iedValues: Map<string, any> = new Map();
+  
+  // IED Model Registry (IED Name -> IEDNode tree)
+  private iedModels: Map<string, IEDNode> = new Map();
 
   // IEC 61850 Control Sessions (SBO)
   private activeControls: Map<string, ControlSession> = new Map();
@@ -85,6 +98,8 @@ export class SimulationEngine {
         boundEndpoints: []
   };
   private bridgeCallback: ((status: BridgeStatus) => void) | null = null;
+    private pendingBridgeModbusEndpoints: Array<{ ip: string; port: number; name: string; unitId: number }> = [];
+    private pendingBridgeIecEndpoints: DeviceIecEndpoint[] = [];
 
   // Runtime State
   private isRunning: boolean = false;
@@ -189,7 +204,43 @@ export class SimulationEngine {
           name: profile.name,
           unitId: profile.unitId
       }));
-      this.sendBridgeMessage({ type: 'SET_DEVICE_ENDPOINTS', endpoints });
+      this.pendingBridgeModbusEndpoints = endpoints;
+      this.sendBridgeMessage({ type: 'SET_PROTOCOL_ENDPOINTS', protocol: 'modbus', endpoints });
+  }
+
+  public syncIecServers(devices: IEDNode[]) {
+      const endpoints: DeviceIecEndpoint[] = [];
+
+      devices.forEach(device => {
+          const ip = this.normalizeIp(device.config?.mmsIp || device.config?.ip);
+          const isServer = (device.config?.role ?? 'server') === 'server';
+          const hasIecModel = Array.isArray(device.children) && device.children.length > 0;
+          if (!ip || !isServer || !hasIecModel) return;
+
+          endpoints.push({
+              id: device.id,
+              name: device.name,
+              ip,
+              port: device.config?.iecMmsPort ?? 102,
+              backendHost: device.config?.iecBackendHost || '127.0.0.1',
+              backendPort: device.config?.iecBackendPort ?? 8102,
+              scdFile: device.config?.iecSclFile
+          });
+      });
+
+      this.pendingBridgeIecEndpoints = endpoints;
+      this.emitLog('info', `Synced ${endpoints.length} IEC 61850 server endpoints.`);
+      this.sendBridgeMessage({ type: 'SET_PROTOCOL_ENDPOINTS', protocol: 'iec61850', endpoints });
+      
+      // Register IED models for relay simulation mode
+      devices.forEach(device => {
+          const isServer = (device.config?.role ?? 'server') === 'server';
+          const hasIecModel = Array.isArray(device.children) && device.children.length > 0;
+          const isSimulation = device.config?.iecBackendHost === 'simulation';
+          if (isServer && hasIecModel && isSimulation) {
+              this.iedModels.set(device.name, device);
+          }
+      });
   }
 
   private getProfileBySource(source: string): DeviceModbusProfile | undefined {
@@ -201,6 +252,10 @@ export class SimulationEngine {
   public subscribeToBridge(callback: (status: BridgeStatus) => void) {
     this.bridgeCallback = callback;
     callback(this.bridgeStatus);
+  }
+
+  public getBridgeStatus(): BridgeStatus {
+    return this.bridgeStatus;
   }
 
   public connectBridge(url: string) {
@@ -218,6 +273,9 @@ export class SimulationEngine {
         this.emitLog('info', `Bridge connected to ${url}`);
         this.updateBridgeStatus();
         this.sendBridgeMessage({ type: 'GET_ADAPTERS' });
+        this.sendBridgeMessage({ type: 'SET_PROTOCOL_ENDPOINTS', protocol: 'modbus', endpoints: this.pendingBridgeModbusEndpoints });
+        this.sendBridgeMessage({ type: 'SET_PROTOCOL_ENDPOINTS', protocol: 'iec61850', endpoints: this.pendingBridgeIecEndpoints });
+        this.sendBridgeMessage({ type: 'GET_ENDPOINT_STATUS' });
       };
             this.bridgeWs.onclose = (event) => {
         this.bridgeStatus.connected = false;
@@ -285,11 +343,37 @@ export class SimulationEngine {
               this.bridgeStatus.adapters = msg.adapters || [];
               this.updateBridgeStatus();
               break;
+          case 'GET_IED_MODEL':
+              // Relay is requesting IED model for simulation mode
+              if (msg.iedName) {
+                  const iedModel = this.iedModels.get(msg.iedName);
+                  if (iedModel) {
+                      this.sendBridgeMessage({
+                          type: 'IED_MODEL',
+                          protocol: msg.protocol || 'iec61850',
+                          ip: msg.ip,
+                          port: msg.port,
+                          model: iedModel
+                      });
+                      this.emitLog('info', `Sent IED model for ${msg.iedName} to relay`);
+                  } else {
+                      this.emitLog('warning', `Relay requested IED model for ${msg.iedName}, but not found`);
+                  }
+              }
+              break;
           case 'MODBUS_CMD':
               this.processExternalModbusCommand(msg);
               break;
           case 'MODBUS_TRACE':
               this.emitLog('packet', `[Relay ${msg.direction || 'trace'}] ${msg.source || 'peer'} TID=${msg.transId} FC=${msg.fc} Unit=${msg.unitId}${msg.exceptionCode ? ` EX=${msg.exceptionCode}` : ''}`);
+              break;
+          case 'IEC_TRACE':
+              this.emitLog('mms', `[Relay ${msg.direction || 'trace'}] ${msg.source || 'peer'} -> ${msg.targetIp || 'unknown'}:${msg.targetPort || 102} (${msg.bytes || 0} bytes)`);
+              this.emitPacket('MMS', msg.source || 'External IEC Client', msg.targetIp || 'IEC Server', msg.info || 'IEC 61850 TCP payload', {
+                  bytes: msg.bytes,
+                  targetIp: msg.targetIp,
+                  targetPort: msg.targetPort
+              });
               break;
           case 'ENDPOINT_STATUS_LIST':
               this.bridgeStatus.boundEndpoints = Array.isArray(msg.endpoints) ? msg.endpoints : [];
@@ -1052,7 +1136,7 @@ export class SimulationEngine {
 
     this.intervalId = setInterval(() => {
       this.runCycle();
-    }, 50); // High freq polling to handle multiple ticks
+        }, 100); // Match common script tick rates and reduce sustained CPU load
   }
 
   public stop() {

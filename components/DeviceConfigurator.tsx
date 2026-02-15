@@ -99,6 +99,9 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
     subnet: '255.255.255.0',
     gateway: '10.0.10.1',
     vlan: 10,
+        iecMmsPort: 102,
+                iecBackendHost: '10.0.10.100',
+        iecBackendPort: 8102,
     isDHCP: false,
     role: 'server'
   });
@@ -165,10 +168,11 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                     ip: extractedConfig.ip || prev.ip,
                     subnet: extractedConfig.subnet || prev.subnet,
                     gateway: extractedConfig.gateway || prev.gateway,
+                    iecBackendHost: extractedConfig.ip || prev.iecBackendHost || prev.ip,
                     role: sclRole // Apply selected role
                 }));
             } else {
-                setNetConfig(prev => ({ ...prev, role: sclRole }));
+                setNetConfig(prev => ({ ...prev, iecBackendHost: prev.iecBackendHost || prev.ip, role: sclRole }));
             }
 
             setStep('configure');
@@ -275,6 +279,8 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
       const finalConfig: IEDConfig = {
           ...netConfig,
           ip: instanceIp,
+          modbusPort: modbusSettings.port,
+          modbusUnitId: modbusSettings.unitId,
           modbusMap: isMaster ? undefined : registers,
           pollingList: isMaster ? pollingTasks : undefined
       };
@@ -341,7 +347,14 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
             clonedIED.id = `imported-${Date.now()}-${i}`;
             clonedIED.name = instanceName;
             clonedIED.path = instanceName;
-            clonedIED.config = { ...netConfig, ip: instanceIp };
+            clonedIED.config = {
+                ...netConfig,
+                ip: instanceIp,
+                iecBackendHost: netConfig.role === 'server'
+                    ? (netConfig.iecBackendHost && netConfig.iecBackendHost !== '127.0.0.1' ? netConfig.iecBackendHost : instanceIp)
+                    : netConfig.iecBackendHost,
+                iecBackendPort: netConfig.role === 'server' ? (netConfig.iecBackendPort ?? 8102) + i : netConfig.iecBackendPort
+            };
             clonedIED.description = draftIED.description + (netConfig.role === 'client' ? ' [Client/Remote]' : ' [Server/Simulated]');
             clonedIED.children = filteredChildren;
 
@@ -844,6 +857,37 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                 <option value="20">VLAN 20 (Process Bus)</option>
                             </select>
                          </div>
+                         {(importMode === 'scl' || importMode === 'demo') && netConfig.role === 'server' && (
+                            <>
+                                <div className="space-y-2 col-span-2 md:col-span-1">
+                                    <label className="text-sm font-bold text-scada-muted">IEC 61850 MMS Port</label>
+                                    <input
+                                        type="number"
+                                        value={netConfig.iecMmsPort ?? 102}
+                                        onChange={e => setNetConfig({ ...netConfig, iecMmsPort: parseInt(e.target.value) || 102 })}
+                                        className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
+                                    />
+                                </div>
+                                <div className="space-y-2 col-span-2 md:col-span-1">
+                                    <label className="text-sm font-bold text-scada-muted">IEC Backend Host</label>
+                                    <input
+                                        type="text"
+                                        value={netConfig.iecBackendHost ?? netConfig.ip}
+                                        onChange={e => setNetConfig({ ...netConfig, iecBackendHost: e.target.value || netConfig.ip })}
+                                        className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
+                                    />
+                                </div>
+                                <div className="space-y-2 col-span-2 md:col-span-1">
+                                    <label className="text-sm font-bold text-scada-muted">IEC Backend Port</label>
+                                    <input
+                                        type="number"
+                                        value={netConfig.iecBackendPort ?? 8102}
+                                        onChange={e => setNetConfig({ ...netConfig, iecBackendPort: parseInt(e.target.value) || 8102 })}
+                                        className="w-full bg-scada-panel border border-scada-border rounded p-2 text-white focus:border-scada-accent outline-none font-mono"
+                                    />
+                                </div>
+                            </>
+                         )}
                     </div>
                     
                     <div className="flex items-center gap-2 mt-4">
@@ -928,6 +972,8 @@ export const DeviceConfigurator: React.FC<DeviceConfiguratorProps> = ({ onSave, 
                                         <>
                                             {selectedLDs.length} Logical Devices<br/>
                                             {draftIED?.children?.filter(c => selectedLDs.includes(c.id)).reduce((acc, curr) => acc + (curr.children?.length || 0), 0)} Logical Nodes<br/>
+                                            {netConfig.role === 'server' && <>MMS Port: {netConfig.iecMmsPort ?? 102}<br/></>}
+                                            {netConfig.role === 'server' && <>Backend: {netConfig.iecBackendHost || netConfig.ip}:{netConfig.iecBackendPort ?? 8102}<br/></>}
                                             Role: <span className={netConfig.role === 'client' ? 'text-blue-400 font-bold' : 'text-scada-success font-bold'}>
                                                 {netConfig.role === 'client' ? 'CLIENT (Remote)' : 'SERVER (Simulated)'}
                                             </span>

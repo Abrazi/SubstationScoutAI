@@ -32,9 +32,24 @@ export interface PollingTask {
 
 export interface IEDConfig {
   ip: string;
+  mmsIp?: string;
+  gooseIp?: string;
+  iecSclFile?: string;
+  communicationIps?: Array<{
+    ip: string;
+    subnet?: string;
+    gateway?: string;
+    subNetwork?: string;
+    protocolHints?: Array<'mms' | 'goose' | 'sv'>;
+  }>;
   subnet: string;
   gateway: string;
   vlan: number;
+  modbusPort?: number;
+  modbusUnitId?: number;
+  iecMmsPort?: number;
+  iecBackendHost?: string;
+  iecBackendPort?: number;
   mac?: string;
   isDHCP?: boolean;
   role?: 'server' | 'client'; // New: Distinguish simulation vs connection
@@ -111,7 +126,7 @@ export interface SimulationData {
   breakerStatus: boolean; // true = closed, false = open
 }
 
-export type ViewMode = 'explorer' | 'dashboard' | 'ai-analysis' | 'network' | 'modbus' | 'logic' | 'config' | 'tap' | 'client' | 'devices';
+export type ViewMode = 'explorer' | 'dashboard' | 'ai-analysis' | 'network' | 'modbus' | 'logic' | 'config' | 'tap' | 'client' | 'devices' | 'binding';
 
 export interface ChatMessage {
   id: string;
@@ -126,6 +141,7 @@ export interface NetworkNode {
   name: string;
   type: 'ied' | 'switch' | 'hmi';
   ip?: string;
+  modbusPort?: number;
   x: number;
   y: number;
   status: 'online' | 'offline' | 'error';
@@ -194,6 +210,19 @@ export interface BridgeStatus {
   selectedAdapter: string | null;
   rxCount: number;
   txCount: number;
+  lastError?: string;
+  lastRoute?: string;
+  boundEndpoints?: Array<{
+    ip: string;
+    port: number;
+    protocol?: 'modbus' | 'iec61850';
+    name?: string;
+    clients?: number;
+    backendHost?: string;
+    backendPort?: number;
+    status: 'active' | 'failed';
+    error?: string;
+  }>;
 }
 
 // IEC 61850 Control Types

@@ -2764,7 +2764,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                        <button onClick={() => engine.pause(selectedDeviceId)} className="flex items-center gap-2 px-3 py-1.5 bg-yellow-500/10 text-yellow-500 border border-yellow-500/50 rounded text-sm hover:bg-yellow-500/20"><Icons.Pause className="w-4 h-4" /></button>
                    )}
                    <div className="w-px h-6 bg-scada-border mx-1"></div>
-                   <button onClick={handleStop} title="Stop all scripts" className="flex items-center gap-2 px-4 py-1.5 bg-scada-danger/10 text-scada-danger hover:bg-scada-danger/20 border border-scada-danger/50 rounded text-sm transition-colors font-medium"><Icons.Stop className="w-4 h-4" /> Stop</button>
+                   <button onClick={handleStop} className="flex items-center gap-2 px-4 py-1.5 bg-scada-danger/10 text-scada-danger hover:bg-scada-danger/20 border border-scada-danger/50 rounded text-sm transition-colors font-medium"><Icons.Stop className="w-4 h-4" /> Stop</button>
                 </>
               )}
           </div>

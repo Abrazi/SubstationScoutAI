@@ -5,11 +5,16 @@ import { Icons } from './Icons';
 interface LogPanelProps {
   logs: LogEntry[];
   onClear: () => void;
+  onExport: () => void;
+  onStart: () => void;
+  onStop: () => void;
+  onTogglePause: () => void;
+  isPaused: boolean;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
 }
 
-export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClear, isCollapsed, onToggleCollapse }) => {
+export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClear, onExport, onStart, onStop, onTogglePause, isPaused, isCollapsed, onToggleCollapse }) => {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to bottom
@@ -51,15 +56,57 @@ export const LogPanel: React.FC<LogPanelProps> = ({ logs, onClear, isCollapsed, 
             <span className="text-xs bg-scada-border px-2 rounded-full text-scada-text">{logs.length} Events</span>
             <Icons.ChevronDown className={`w-4 h-4 text-scada-muted transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
         </div>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onClear();
-          }}
-          className="text-xs hover:text-white text-scada-muted flex items-center gap-1"
-        >
-            <Icons.Stop className="w-3 h-3" /> Clear
-        </button>
+        <div className="flex items-center gap-2">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onTogglePause();
+              }}
+              className="text-xs hover:text-white text-scada-muted flex items-center gap-1"
+              title={isPaused ? 'Resume log capture' : 'Pause log capture'}
+            >
+                {isPaused ? <Icons.Play className="w-3 h-3" /> : <Icons.Pause className="w-3 h-3" />} {isPaused ? 'Resume' : 'Pause'}
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onStart();
+              }}
+              className="text-xs hover:text-white text-scada-muted flex items-center gap-1"
+              title="Start simulation"
+            >
+                <Icons.Play className="w-3 h-3" /> Start
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onStop();
+              }}
+              className="text-xs hover:text-white text-scada-muted flex items-center gap-1"
+              title="Stop simulation"
+            >
+                <Icons.Stop className="w-3 h-3" /> Stop
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onExport();
+              }}
+              className="text-xs hover:text-white text-scada-muted flex items-center gap-1"
+              title="Export logs"
+            >
+                <Icons.Save className="w-3 h-3" /> Export
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onClear();
+              }}
+              className="text-xs hover:text-white text-scada-muted flex items-center gap-1"
+            >
+                <Icons.Stop className="w-3 h-3" /> Clear
+            </button>
+        </div>
       </div>
       {!isCollapsed && (
       <div className="flex-1 overflow-y-auto p-2 space-y-1" ref={scrollRef}>

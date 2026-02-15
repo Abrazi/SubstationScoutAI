@@ -21,6 +21,16 @@ interface TemplateStore {
   enumTypes: Map<string, string[]>;
 }
 
+type ProtocolHint = 'mms' | 'goose' | 'sv';
+
+export interface SclCommunicationAddress {
+    ip: string;
+    subnet?: string;
+    gateway?: string;
+    subNetwork?: string;
+    protocolHints?: ProtocolHint[];
+}
+
 const parseTemplates = (doc: Document): TemplateStore => {
   const store: TemplateStore = {
     lNodeTypes: new Map(),
@@ -233,52 +243,189 @@ export const extractIEDs = (xmlText: string): {
 // Helper to extract Communication IP parameters
 export const extractCommunication = (xmlText: string, iedName: string): Partial<IEDConfig> | null => {
     try {
-        const parser = new DOMParser();
-        const xmlDoc = parser.parseFromString(xmlText, "text/xml");
-        const communication = xmlDoc.querySelector('Communication');
-        
-        if (!communication) return null;
-
-        // Find ConnectedAP for this IED
-        // Structure: Communication -> SubNetwork -> ConnectedAP
-        let targetAp: Element | null = null;
-        const subNetworks = communication.querySelectorAll('SubNetwork');
-        
-        for (let i = 0; i < subNetworks.length; i++) {
-            const sn = subNetworks[i];
-            const aps = sn.querySelectorAll('ConnectedAP');
-            for (let j = 0; j < aps.length; j++) {
-                if (aps[j].getAttribute('iedName') === iedName) {
-                    targetAp = aps[j];
-                    break;
-                }
-            }
-            if (targetAp) break;
-        }
-
-        if (!targetAp) return null;
-
-        const address = targetAp.querySelector('Address');
-        if (!address) return null;
-
-        const config: Partial<IEDConfig> = {};
-        
-        address.querySelectorAll('P').forEach(p => {
-            const type = p.getAttribute('type');
-            const val = p.textContent?.trim();
-            if (val) {
-                if (type === 'IP') config.ip = val;
-                if (type === 'IP-SUBNET') config.subnet = val;
-                if (type === 'Gateway') config.gateway = val;
-            }
-        });
-
-        return config;
+        const map = extractCommunicationMap(xmlText);
+        return map[iedName] || null;
 
     } catch (e) {
         console.error("Failed to extract communication parameters", e);
         return null;
     }
+};
+
+export const extractCommunicationProfiles = (xmlText: string): Record<string, SclCommunicationAddress[]> => {
+    const result: Record<string, SclCommunicationAddress[]> = {};
+
+    try {
+        const parser = new DOMParser();
+        const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+        if (xmlDoc.getElementsByTagName('parsererror').length > 0) return result;
+
+        const communication = xmlDoc.querySelector('Communication');
+        if (!communication) return result;
+
+        const connectedAps = communication.querySelectorAll('SubNetwork ConnectedAP');
+        connectedAps.forEach((ap) => {
+            const iedName = ap.getAttribute('iedName') || '';
+            if (!iedName) return;
+
+            const subNetworkEl = ap.closest('SubNetwork');
+            const subNetworkName = subNetworkEl?.getAttribute('name') || undefined;
+            const subNetworkType = subNetworkEl?.getAttribute('type') || '';
+            const address = ap.querySelector('Address');
+            if (!address) return;
+
+            const profile: SclCommunicationAddress = {
+                ip: '',
+                subnet: undefined,
+                gateway: undefined,
+                subNetwork: subNetworkName,
+                protocolHints: []
+            };
+
+            address.querySelectorAll('P').forEach(p => {
+                const type = p.getAttribute('type');
+                const val = p.textContent?.trim();
+                if (!val) return;
+                if (type === 'IP') profile.ip = val;
+                if (type === 'IP-SUBNET') profile.subnet = val;
+                if (type === 'Gateway') profile.gateway = val;
+            });
+
+            if (!profile.ip) return;
+
+            const hints = new Set<ProtocolHint>();
+            const normalizedSn = `${subNetworkName || ''} ${subNetworkType}`.toLowerCase();
+            if (normalizedSn.includes('goose') || normalizedSn.includes('8-1')) hints.add('goose');
+            if (normalizedSn.includes('smv') || normalizedSn.includes('9-2') || normalizedSn.includes('sampled')) hints.add('sv');
+            if (normalizedSn.includes('mms') || normalizedSn.includes('8-mms') || normalizedSn.includes('station')) hints.add('mms');
+            if (ap.querySelector('GSE')) hints.add('goose');
+            if (ap.querySelector('SMV')) hints.add('sv');
+            if (!hints.has('goose') && !hints.has('sv')) hints.add('mms');
+            profile.protocolHints = Array.from(hints);
+
+            const bucket = result[iedName] || [];
+            const exists = bucket.some(entry => entry.ip === profile.ip && entry.subNetwork === profile.subNetwork);
+            if (!exists) bucket.push(profile);
+            result[iedName] = bucket;
+        });
+    } catch {
+        return {};
+    }
+
+    return result;
+};
+
+export const extractCommunicationMap = (xmlText: string): Record<string, Partial<IEDConfig>> => {
+    const result: Record<string, Partial<IEDConfig>> = {};
+
+    try {
+        const profiles = extractCommunicationProfiles(xmlText);
+        Object.entries(profiles).forEach(([iedName, addresses]) => {
+            const mmsEntry = addresses.find(a => a.protocolHints?.includes('mms')) || addresses[0];
+            const gooseEntry = addresses.find(a => a.protocolHints?.includes('goose')) || addresses[0];
+            if (!mmsEntry) return;
+
+            result[iedName] = {
+                ip: mmsEntry.ip,
+                mmsIp: mmsEntry.ip,
+                gooseIp: gooseEntry?.ip,
+                subnet: mmsEntry.subnet,
+                gateway: mmsEntry.gateway,
+                communicationIps: addresses
+            };
+        });
+    } catch {
+        return {};
+    }
+
+    return result;
+};
+
+const parseIedElement = (iedElement: Element, templates: TemplateStore): IEDNode => {
+  const iedName = iedElement.getAttribute('name') || 'Imported_IED';
+  const iedDesc = getAttr(iedElement, 'desc') || 'SCL Import';
+
+  const root: IEDNode = {
+      id: genId(),
+      name: iedName,
+      type: NodeType.IED,
+      path: iedName,
+      description: iedDesc,
+      children: []
+  };
+
+  iedElement.querySelectorAll('AccessPoint').forEach(ap => {
+      const server = ap.querySelector('Server');
+      if (!server) return;
+
+      server.querySelectorAll('LDevice').forEach(ld => {
+          const inst = ld.getAttribute('inst') || 'LD0';
+          const ldName = inst;
+          const ldPath = `${iedName}${inst}`;
+          const ldDesc = getAttr(ld, 'desc');
+
+          const ldNode: IEDNode = {
+              id: genId(),
+              name: ldName,
+              type: NodeType.LDevice,
+              path: ldPath,
+              description: ldDesc,
+              children: []
+          };
+
+          const lns = [...Array.from(ld.querySelectorAll('LN0')), ...Array.from(ld.querySelectorAll('LN'))];
+          lns.forEach(ln => {
+              const prefix = ln.getAttribute('prefix') || '';
+              const lnClass = ln.getAttribute('lnClass') || '';
+              const inst = ln.getAttribute('inst') || '';
+              const lnType = ln.getAttribute('lnType');
+
+              const nodeName = `${prefix}${lnClass}${inst}`;
+              const lnPath = `${ldPath}/${nodeName}`;
+              const desc = LOGICAL_NODE_DESCRIPTIONS[lnClass] || `Logical Node ${lnClass}`;
+
+              const lnNode: IEDNode = {
+                  id: genId(),
+                  name: nodeName,
+                  type: NodeType.LN,
+                  path: lnPath,
+                  description: desc,
+                  children: []
+              };
+
+              if (lnType && templates.lNodeTypes.has(lnType)) {
+                  const doList = templates.lNodeTypes.get(lnType);
+                  if (doList) {
+                      lnNode.children = doList.map(doDef => expandDO(doDef, templates, lnPath));
+                  }
+              }
+
+              ldNode.children?.push(lnNode);
+          });
+
+          root.children?.push(ldNode);
+      });
+  });
+
+  return root;
+};
+
+export const parseSCLMany = (xmlText: string, targetIEDNames: string[]): IEDNode[] => {
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(xmlText, 'text/xml');
+
+  if (xmlDoc.getElementsByTagName('parsererror').length > 0) {
+      throw new Error('Invalid XML file.');
+  }
+
+  const templates = parseTemplates(xmlDoc);
+  const wanted = new Set(targetIEDNames.filter(Boolean));
+  const allIeds = Array.from(xmlDoc.querySelectorAll('IED'));
+
+  if (wanted.size === 0) return [];
+
+  const selected = allIeds.filter(el => wanted.has(el.getAttribute('name') || ''));
+  return selected.map(el => parseIedElement(el, templates));
 };
 
 export const parseSCL = (xmlText: string, targetIEDName?: string): IEDNode => {
@@ -308,73 +455,5 @@ export const parseSCL = (xmlText: string, targetIEDName?: string): IEDNode => {
       throw new Error("No IED element found in SCL file.");
   }
 
-  const iedName = iedElement.getAttribute('name') || "Imported_IED";
-  const iedDesc = getAttr(iedElement, 'desc') || "SCL Import";
-
-  const root: IEDNode = {
-      id: genId(),
-      name: iedName,
-      type: NodeType.IED,
-      path: iedName,
-      description: iedDesc,
-      children: []
-  };
-
-  // AccessPoint -> Server -> LDevice
-  // IMPORTANT: We must query only within the selected IED element to avoid mixing devices
-  iedElement.querySelectorAll('AccessPoint').forEach(ap => {
-      const server = ap.querySelector('Server');
-      if (!server) return;
-
-      server.querySelectorAll('LDevice').forEach(ld => {
-          const inst = ld.getAttribute('inst') || 'LD0';
-          const ldName = inst; 
-          const ldPath = `${iedName}${inst}`;
-          const ldDesc = getAttr(ld, 'desc');
-
-          const ldNode: IEDNode = {
-              id: genId(),
-              name: ldName,
-              type: NodeType.LDevice,
-              path: ldPath,
-              description: ldDesc,
-              children: []
-          };
-
-          // LNs
-          const lns = [...Array.from(ld.querySelectorAll('LN0')), ...Array.from(ld.querySelectorAll('LN'))];
-          lns.forEach(ln => {
-              const prefix = ln.getAttribute('prefix') || '';
-              const lnClass = ln.getAttribute('lnClass') || '';
-              const inst = ln.getAttribute('inst') || '';
-              const lnType = ln.getAttribute('lnType');
-              
-              const nodeName = `${prefix}${lnClass}${inst}`;
-              const lnPath = `${ldPath}/${nodeName}`;
-              const desc = LOGICAL_NODE_DESCRIPTIONS[lnClass] || `Logical Node ${lnClass}`;
-
-              const lnNode: IEDNode = {
-                  id: genId(),
-                  name: nodeName,
-                  type: NodeType.LN,
-                  path: lnPath,
-                  description: desc,
-                  children: []
-              };
-
-              if (lnType && templates.lNodeTypes.has(lnType)) {
-                  const doList = templates.lNodeTypes.get(lnType);
-                  if (doList) {
-                      lnNode.children = doList.map(doDef => expandDO(doDef, templates, lnPath));
-                  }
-              }
-
-              ldNode.children?.push(lnNode);
-          });
-
-          root.children?.push(ldNode);
-      });
-  });
-
-  return root;
+  return parseIedElement(iedElement, templates);
 };

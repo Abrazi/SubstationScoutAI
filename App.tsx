@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef, Component, ErrorInfo } from 'react';
+import { useState, useEffect, useRef, Component, type ErrorInfo } from 'react';
 import { Icons } from './components/Icons';
 import { TreeExplorer } from './components/TreeExplorer';
 import { Dashboard } from './components/Dashboard';
@@ -14,12 +14,30 @@ import { NetworkTap } from './components/NetworkTap';
 import { WatchListPanel } from './components/WatchListPanel';
 import { ClientMasterPanel } from './components/ClientMasterPanel';
 import { DeviceList } from './components/DeviceList';
+import { BindingPanel } from './components/BindingPanel';
 import { generateFleet } from './utils/mockGenerator';
-import { GENERATOR_LOGIC_SCRIPT } from './utils/generatorLogic';
-import { analyzeSCLFile } from './services/geminiService';
-import { parseSCL, validateSCL } from './utils/sclParser';
+import { parseSCLMany, validateSCL, extractIEDs, extractCommunicationMap, SclCommunicationAddress } from './utils/sclParser';
 import { IEDNode, ViewMode, LogEntry, WatchItem } from './types';
 import { engine } from './services/SimulationEngine';
+
+type ScdImportCandidate = {
+    name: string;
+    ip: string;
+    addresses: SclCommunicationAddress[];
+    selectedMmsIp: string;
+    selectedGooseIp: string;
+    selected: boolean;
+    manufacturer?: string;
+    type?: string;
+};
+
+type ScdImportProgress = {
+    total: number;
+    processed: number;
+    batch: number;
+    totalBatches: number;
+    phase: 'idle' | 'parsing' | 'applying' | 'done';
+};
 
 // --- Error Boundary Component ---
 export class ErrorBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean, error: Error | null }> {
@@ -90,7 +108,7 @@ const collectDataAttributes = (node: IEDNode, map: Map<string, any>) => {
 };
 
 const AppContent = () => {
-  const [viewMode, setViewMode] = useState<ViewMode | 'devices'>('dashboard');
+    const [viewMode, setViewMode] = useState<ViewMode | 'devices'>('dashboard');
   
   // Initialize IEDs with the full generator fleet
   const [iedList, setIedList] = useState<IEDNode[]>([]);
@@ -123,11 +141,33 @@ const AppContent = () => {
   // Watch List State
   const [watchList, setWatchList] = useState<WatchItem[]>([]);
 
+    const iecExplorerDevices = iedList.filter(ied => {
+        const hasIecModel = Array.isArray(ied.children) && ied.children.length > 0;
+        const isIecServer = (ied.config?.role ?? 'server') === 'server';
+        return hasIecModel && isIecServer;
+    });
+
   // File Upload State
   const [fileAnalysis, setFileAnalysis] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+    const logsBufferRef = useRef<LogEntry[]>([]);
+        const [isLogCapturePaused, setIsLogCapturePaused] = useState(false);
+    const [scdImportOpen, setScdImportOpen] = useState(false);
+    const [scdImportFileName, setScdImportFileName] = useState('');
+    const [scdImportContent, setScdImportContent] = useState('');
+    const [scdImportCandidates, setScdImportCandidates] = useState<ScdImportCandidate[]>([]);
+    const [isPreparingScdImport, setIsPreparingScdImport] = useState(false);
+    const [isApplyingScdImport, setIsApplyingScdImport] = useState(false);
+    const [scdImportProgress, setScdImportProgress] = useState<ScdImportProgress>({
+        total: 0,
+        processed: 0,
+        batch: 0,
+        totalBatches: 0,
+        phase: 'idle'
+    });
 
   const fileInputRef = useRef<HTMLInputElement>(null); // For Open Project
+    const sclImportInputRef = useRef<HTMLInputElement>(null);
 
     const handleRightSidebarResizeStart = (e: React.MouseEvent) => {
             e.preventDefault();
@@ -168,40 +208,37 @@ const AppContent = () => {
 
   // Initialize Engine Logging & Discovery (One time)
   useEffect(() => {
-    // Load Fleet
+    engine.subscribeToLogs((log) => {
+        if (isLogCapturePaused) return;
+        logsBufferRef.current.push(log);
+        if (logsBufferRef.current.length > 500) {
+            logsBufferRef.current.splice(0, logsBufferRef.current.length - 500);
+        }
+    });
+
+    const flushInterval = window.setInterval(() => {
+        if (logsBufferRef.current.length === 0) return;
+        const batch = logsBufferRef.current.splice(0, 50);
+        setLogs(prev => [...prev, ...batch].slice(-100));
+    }, 300);
+
     const fleet = generateFleet();
     setIedList(fleet);
-    
-    // Default select G1
+
     if (fleet.length > 0) {
         setSelectedIED(fleet[0]);
         setSelectedNode(fleet[0]);
     }
 
-    engine.subscribeToLogs((log) => {
-        setLogs(prev => [...prev.slice(-99), log]);
-    });
-
     initializeSimulation(fleet);
 
-    // AUTO-LOAD GENERATOR LOGIC (Specific to Mock Fleet)
-    // Run this in a timeout to allow UI to render first
-    setTimeout(() => {
-        try {
-            fleet.forEach(ied => {
-                if (ied.id.startsWith('G') && !isNaN(parseInt(ied.id.substring(1)))) {
-                    engine.updateScriptConfig({
-                        deviceId: ied.id,
-                        code: GENERATOR_LOGIC_SCRIPT,
-                        tickRate: 100
-                    });
-                }
-            });
-            engine.start(); 
-        } catch (e) {
-            console.error("Error auto-loading scripts:", e);
-        }
-    }, 100);
+    setLogs(prev => [...prev, {
+        id: `${Date.now()}-init`,
+        timestamp: new Date().toISOString(),
+        source: 'System',
+        level: 'info',
+        message: 'Startup complete. Click Run to start simulation.'
+    }]);
 
         try {
             const saved = localStorage.getItem('ui.rightSidebarOpen');
@@ -214,7 +251,25 @@ const AppContent = () => {
             }
         }
 
-  }, []); // Run once on mount
+    return () => {
+        clearInterval(flushInterval);
+    };
+    }, [isLogCapturePaused]); // Re-subscribe when pause state changes
+
+        const handleExportLogs = () => {
+                const payload = {
+                        exportedAt: new Date().toISOString(),
+                        total: logs.length,
+                        logs
+                };
+                const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `diagnostic-logs-${new Date().toISOString().replace(/[:]/g, '-').split('.')[0]}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+        };
 
   // Initialize selectedNode
   useEffect(() => {
@@ -225,7 +280,19 @@ const AppContent = () => {
 
     useEffect(() => {
         engine.syncModbusDevices(iedList);
+        engine.syncIecServers(iedList);
     }, [iedList]);
+
+    useEffect(() => {
+        if (viewMode !== 'explorer') return;
+
+        const activeIec = selectedIED && iecExplorerDevices.find(ied => ied.id === selectedIED.id);
+        if (!activeIec) {
+            const fallback = iecExplorerDevices[0] || null;
+            setSelectedIED(fallback);
+            setSelectedNode(fallback);
+        }
+    }, [viewMode, selectedIED?.id, iecExplorerDevices]);
 
     useEffect(() => {
         try {
@@ -516,12 +583,13 @@ const AppContent = () => {
       setWatchList(prev => prev.filter(i => i.id !== id));
   };
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
     setErrorMsg(null);
-    setFileAnalysis("Validating...");
+        setIsPreparingScdImport(true);
+        setFileAnalysis('Scanning SCD for available IEDs...');
     
     try {
         const text = await file.text();
@@ -531,34 +599,216 @@ const AppContent = () => {
             return;
         }
 
-        const parsedIED = parseSCL(text);
-        
-        setIedList(prev => [...prev, parsedIED]);
-        setSelectedIED(parsedIED);
-        setSelectedNode(parsedIED);
-        setViewMode('network');
-        
-        const newData = new Map<string, any>();
-        collectDataAttributes(parsedIED, newData);
-        engine.initializeData(newData);
-        engine.registerDevice(parsedIED.id, parsedIED.name);
-        
-        setFileAnalysis("SCL Imported Successfully. Running AI Analysis...");
-        const analysis = await analyzeSCLFile(text);
-        setFileAnalysis(analysis);
-        
-        setLogs(prev => [...prev, {
-            id: Date.now().toString(),
-            timestamp: new Date().toISOString(),
-            source: 'System',
-            level: 'info',
-            message: `Imported SCL file: ${file.name}`
-        }]);
+                const discovered = extractIEDs(text);
+                if (discovered.length === 0) {
+                        setErrorMsg('No IEDs found in selected SCD file.');
+                        return;
+                }
+
+                const communicationMap = extractCommunicationMap(text);
+                const candidates: ScdImportCandidate[] = discovered.map((meta) => {
+                    const comm = communicationMap[meta.name];
+                    const addresses = comm?.communicationIps || [];
+                    const selectedMmsIp = comm?.mmsIp || comm?.ip || addresses[0]?.ip || '';
+                    const selectedGooseIp = comm?.gooseIp || selectedMmsIp || addresses[0]?.ip || '';
+                    return {
+                        name: meta.name,
+                        ip: selectedMmsIp || 'N/A',
+                        addresses,
+                        selectedMmsIp,
+                        selectedGooseIp,
+                        selected: true,
+                        manufacturer: meta.manufacturer,
+                        type: meta.type
+                    };
+                });
+
+                setScdImportFileName(file.name);
+                setScdImportContent(text);
+                setScdImportCandidates(candidates);
+                setScdImportOpen(true);
+                setScdImportProgress({
+                    total: candidates.length,
+                    processed: 0,
+                    batch: 0,
+                    totalBatches: 0,
+                    phase: 'idle'
+                });
+                setFileAnalysis(`Found ${candidates.length} IED(s) in ${file.name}`);
 
     } catch (error: any) {
         setErrorMsg(error.message);
+    } finally {
+                setIsPreparingScdImport(false);
+        if (sclImportInputRef.current) sclImportInputRef.current.value = '';
     }
   };
+
+    const handleToggleScdCandidate = (name: string) => {
+        setScdImportCandidates(prev => prev.map(c => c.name === name ? { ...c, selected: !c.selected } : c));
+    };
+
+    const handleScdCandidateIpChange = (name: string, field: 'mms' | 'goose', value: string) => {
+        setScdImportCandidates(prev => prev.map(c => {
+            if (c.name !== name) return c;
+            if (field === 'mms') return { ...c, selectedMmsIp: value || c.selectedMmsIp };
+            return { ...c, selectedGooseIp: value || c.selectedGooseIp };
+        }));
+    };
+
+    const handleSelectAllScdCandidates = (selected: boolean) => {
+        setScdImportCandidates(prev => prev.map(c => ({ ...c, selected })));
+    };
+
+    const handleConfirmScdImport = async () => {
+        const selectedCandidates = scdImportCandidates.filter(c => c.selected);
+        if (selectedCandidates.length === 0) {
+            setErrorMsg('Select at least one IED to import.');
+            return;
+        }
+
+        setIsApplyingScdImport(true);
+        setErrorMsg(null);
+
+        try {
+            const selectedNames = selectedCandidates.map(c => c.name);
+            const communicationMap = extractCommunicationMap(scdImportContent);
+            const selectedByName = new Map(selectedCandidates.map(c => [c.name, c]));
+            const chunkSize = selectedNames.length > 200 ? 8 : 16;
+            const totalBatches = Math.max(1, Math.ceil(selectedNames.length / chunkSize));
+
+            setScdImportProgress({
+                total: selectedNames.length,
+                processed: 0,
+                batch: 0,
+                totalBatches,
+                phase: 'parsing'
+            });
+
+            const existingNames = new Set(iedList.map(ied => ied.name));
+            const usedNames = new Set<string>();
+            const resolveUniqueName = (baseName: string) => {
+                    let candidate = baseName;
+                    let suffix = 2;
+                    while (existingNames.has(candidate) || usedNames.has(candidate)) {
+                            candidate = `${baseName}_${suffix++}`;
+                    }
+                    usedNames.add(candidate);
+                    return candidate;
+            };
+
+            const importedIEDs: IEDNode[] = [];
+            let processed = 0;
+
+            for (let batch = 0; batch < totalBatches; batch++) {
+                const from = batch * chunkSize;
+                const to = Math.min(from + chunkSize, selectedNames.length);
+                const batchNames = selectedNames.slice(from, to);
+                const parsedBatch = parseSCLMany(scdImportContent, batchNames);
+
+                for (let idx = 0; idx < parsedBatch.length; idx++) {
+                    const parsed = parsedBatch[idx];
+                    const originalName = parsed.name;
+                    const uniqueName = resolveUniqueName(originalName);
+
+                    if (uniqueName !== originalName) {
+                        const updatePaths = (nodes: IEDNode[]) => {
+                            nodes.forEach(node => {
+                                if (node.path) node.path = node.path.replace(originalName, uniqueName);
+                                if (node.children) updatePaths(node.children);
+                            });
+                        };
+                        parsed.name = uniqueName;
+                        parsed.path = uniqueName;
+                        updatePaths(parsed.children || []);
+                    }
+
+                    const comm = communicationMap[originalName];
+                    const selectedProfile = selectedByName.get(originalName);
+                    const selectedMmsIp = selectedProfile?.selectedMmsIp || comm?.mmsIp || comm?.ip || parsed.config?.ip || `10.0.10.${200 + processed}`;
+                    const selectedGooseIp = selectedProfile?.selectedGooseIp || comm?.gooseIp || selectedMmsIp;
+                    parsed.config = {
+                        ip: selectedMmsIp,
+                        mmsIp: selectedMmsIp,
+                        gooseIp: selectedGooseIp,
+                        communicationIps: selectedProfile?.addresses?.length ? selectedProfile.addresses : comm?.communicationIps,
+                        subnet: comm?.subnet || parsed.config?.subnet || '255.255.255.0',
+                        gateway: comm?.gateway || parsed.config?.gateway || '10.0.10.1',
+                        vlan: parsed.config?.vlan || 10,
+                        role: parsed.config?.role || 'server',
+                        iecMmsPort: parsed.config?.iecMmsPort || 102,
+                        iecBackendHost: 'simulation',
+                        iecBackendPort: 0
+                    };
+
+                    importedIEDs.push(parsed);
+                    processed++;
+                }
+
+                setScdImportProgress({
+                    total: selectedNames.length,
+                    processed,
+                    batch: batch + 1,
+                    totalBatches,
+                    phase: 'parsing'
+                });
+
+                await new Promise<void>(resolve => {
+                    requestAnimationFrame(() => resolve());
+                });
+            }
+
+            if (importedIEDs.length === 0) {
+                setErrorMsg('No selected IEDs could be parsed from SCD file.');
+                return;
+            }
+
+            setScdImportProgress(prev => ({ ...prev, phase: 'applying' }));
+
+            setIedList(prev => [...prev, ...importedIEDs]);
+            setSelectedIED(importedIEDs[0]);
+            setSelectedNode(importedIEDs[0]);
+            setViewMode('network');
+            initializeSimulation(importedIEDs);
+
+            // Auto-connect bridge if not already connected (devices need bridge for network binding)
+            if (!engine.getBridgeStatus().connected) {
+                setTimeout(() => {
+                    engine.connectBridge('ws://127.0.0.1:34001');
+                    setLogs(prev => [...prev, {
+                        id: Date.now().toString() + '_bridge',
+                        timestamp: new Date().toISOString(),
+                        source: 'System',
+                        level: 'info',
+                        message: 'Auto-connecting to relay bridge for network binding...'
+                    }]);
+                }, 500);
+            }
+
+            setScdImportProgress(prev => ({ ...prev, phase: 'done' }));
+
+            setFileAnalysis(`Imported ${importedIEDs.length} selected IED(s) from ${scdImportFileName}`);
+            setLogs(prev => [...prev, {
+                    id: Date.now().toString(),
+                    timestamp: new Date().toISOString(),
+                    source: 'System',
+                    level: 'info',
+                    message: `Imported ${importedIEDs.length} selected IED(s) from ${scdImportFileName}`
+            }]);
+
+            setScdImportOpen(false);
+        } catch (error: any) {
+            setErrorMsg(error.message || 'Failed to import selected IEDs.');
+        } finally {
+            setIsApplyingScdImport(false);
+            setScdImportProgress(prev => ({ ...prev, phase: 'idle', batch: 0, totalBatches: 0 }));
+        }
+    };
+
+    const selectedCount = scdImportCandidates.filter(c => c.selected).length;
+    const progressPercent = scdImportProgress.total > 0
+        ? Math.min(100, Math.round((scdImportProgress.processed / scdImportProgress.total) * 100))
+        : 0;
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-scada-bg text-scada-text font-sans">
@@ -582,6 +832,7 @@ const AppContent = () => {
            
            <NavItem icon={Icons.Tree} label="IEC 61850 Explorer" active={viewMode === 'explorer'} onClick={() => setViewMode('explorer')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Cable} label="Client & Master" active={viewMode === 'client'} onClick={() => setViewMode('client')} collapsed={!sidebarOpen} />
+           <NavItem icon={Icons.Zap} label="Binding" active={viewMode === 'binding'} onClick={() => setViewMode('binding')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Settings} label="Device Configurator" active={viewMode === 'config'} onClick={() => setViewMode('config')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Database} label="Modbus Slave" active={viewMode === 'modbus'} onClick={() => setViewMode('modbus')} collapsed={!sidebarOpen} />
            <NavItem icon={Icons.Code} label="Logic Editor" active={viewMode === 'logic'} onClick={() => setViewMode('logic')} collapsed={!sidebarOpen} />
@@ -607,6 +858,7 @@ const AppContent = () => {
             </div>
             {/* Hidden Input for Open Project */}
             <input type="file" ref={fileInputRef} className="hidden" accept=".json" onChange={handleOpenProject} />
+            <input type="file" ref={sclImportInputRef} className="hidden" accept=".xml,.scd,.cid,.icd" onChange={handleFileUpload} />
 
             <label className={`flex items-center gap-2 text-xs text-scada-muted hover:text-white cursor-pointer transition-colors p-2 rounded hover:bg-white/5 border border-dashed border-scada-border hover:border-scada-accent ${!sidebarOpen ? 'justify-center' : ''}`} title="Import SCL/CID Definition">
                 <Icons.Upload className="w-4 h-4" />
@@ -633,6 +885,7 @@ const AppContent = () => {
                 {viewMode === 'network' && 'Network Simulation & Topology'}
                 {viewMode === 'tap' && 'Packet Analyzer (vTAP)'}
                 {viewMode === 'explorer' && 'IEC 61850 Data Model'}
+                {viewMode === 'binding' && 'Network Binding & Adapter Control'}
                 {viewMode === 'modbus' && 'Modbus Gateway Configuration'}
                 {viewMode === 'logic' && 'Programmable Logic Controller'}
                 {viewMode === 'config' && 'IED Configuration Wizard'}
@@ -644,6 +897,14 @@ const AppContent = () => {
                     <button className="p-1.5 hover:bg-white/10 rounded text-scada-success" title="Run Simulation" onClick={() => engine.start()}><Icons.Play className="w-4 h-4" /></button>
                     <button className="p-1.5 hover:bg-white/10 rounded text-scada-danger" title="Stop" onClick={() => engine.stop()}><Icons.Stop className="w-4 h-4" /></button>
                  </div>
+
+                      <button
+                          onClick={() => sclImportInputRef.current?.click()}
+                          className="px-3 py-1.5 bg-scada-bg border border-scada-border hover:border-scada-accent rounded text-xs text-scada-muted hover:text-white transition-colors flex items-center gap-2"
+                          title="Import SCD/CID/ICD/XML"
+                      >
+                          <Icons.Upload className="w-4 h-4" /> Import SCD
+                      </button>
                  
                  {/* Right Sidebar Toggle (Watch List) */}
                  <button 
@@ -668,7 +929,7 @@ const AppContent = () => {
                             <select 
                                 value={selectedIED?.id || ''} 
                                 onChange={(e) => {
-                                    const ied = iedList.find(i => i.id === e.target.value);
+                                    const ied = iecExplorerDevices.find(i => i.id === e.target.value);
                                     if(ied) {
                                         setSelectedIED(ied);
                                         setSelectedNode(ied);
@@ -676,10 +937,10 @@ const AppContent = () => {
                                 }}
                                 className="w-full bg-scada-bg border border-scada-border rounded-md pl-3 pr-8 py-2 text-sm text-white focus:border-scada-accent focus:ring-1 focus:ring-scada-accent outline-none appearance-none transition-all hover:border-scada-muted cursor-pointer font-medium truncate"
                             >
-                                {iedList.length === 0 ? (
-                                    <option value="">No Devices</option>
+                                {iecExplorerDevices.length === 0 ? (
+                                    <option value="">No IEC 61850 Server Devices</option>
                                 ) : (
-                                    iedList.map(ied => (
+                                    iecExplorerDevices.map(ied => (
                                         <option key={ied.id} value={ied.id}>{ied.name}</option>
                                     ))
                                 )}
@@ -687,7 +948,11 @@ const AppContent = () => {
                             <Icons.ChevronDown className="absolute right-2 top-1/2 -translate-y-1/2 w-4 h-4 text-scada-muted pointer-events-none group-hover:text-white transition-colors" />
                         </div>
                     </div>
-                    {selectedIED && <TreeExplorer root={selectedIED} onSelect={handleNodeSelect} selectedId={selectedNode?.id} />}
+                    {selectedIED ? (
+                        <TreeExplorer root={selectedIED} onSelect={handleNodeSelect} selectedId={selectedNode?.id} />
+                    ) : (
+                        <div className="p-4 text-sm text-scada-muted">No IEC 61850 server devices available for explorer view.</div>
+                    )}
                  </div>
             )}
 
@@ -766,11 +1031,115 @@ const AppContent = () => {
                         <ClientMasterPanel ieds={iedList} />
                     )}
 
+                    {viewMode === 'binding' && (
+                        <BindingPanel ieds={iedList} onUpdateNode={handleUpdateIED} />
+                    )}
+
                     {/* Error Overlay */}
                     {errorMsg && (
                         <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-scada-danger/90 text-white px-4 py-2 rounded shadow-lg flex items-center gap-2 z-50">
                             <Icons.Alert className="w-4 h-4" /> {errorMsg}
                             <button onClick={() => setErrorMsg(null)} className="ml-2 hover:bg-white/20 rounded-full p-0.5"><Icons.Stop className="w-3 h-3" /></button>
+                        </div>
+                    )}
+
+                    {scdImportOpen && (
+                        <div className="absolute inset-0 z-40 bg-black/60 backdrop-blur-sm flex items-center justify-center p-6">
+                            <div className="w-full max-w-4xl bg-scada-panel border border-scada-border rounded-xl shadow-2xl overflow-hidden">
+                                <div className="px-6 py-4 border-b border-scada-border flex items-center justify-between">
+                                    <div>
+                                        <h3 className="text-lg font-bold text-white">Import SCD - Select IEDs</h3>
+                                        <p className="text-xs text-scada-muted mt-1">{scdImportFileName} · {scdImportCandidates.length} discovered</p>
+                                    </div>
+                                    <button
+                                        onClick={() => setScdImportOpen(false)}
+                                        className="text-scada-muted hover:text-white"
+                                        disabled={isApplyingScdImport}
+                                    >
+                                        <Icons.Close className="w-5 h-5" />
+                                    </button>
+                                </div>
+
+                                <div className="px-6 py-3 border-b border-scada-border flex flex-wrap gap-2 items-center">
+                                    <button onClick={() => handleSelectAllScdCandidates(true)} className="px-3 py-1.5 bg-scada-bg border border-scada-border rounded text-xs hover:border-scada-accent">Select All</button>
+                                    <button onClick={() => handleSelectAllScdCandidates(false)} className="px-3 py-1.5 bg-scada-bg border border-scada-border rounded text-xs hover:border-scada-accent">Deselect All</button>
+                                    <span className="text-xs text-scada-muted ml-auto">Selected: {selectedCount}</span>
+                                </div>
+
+                                {isApplyingScdImport && (
+                                    <div className="px-6 py-3 border-b border-scada-border bg-black/20">
+                                        <div className="flex items-center justify-between text-xs mb-1">
+                                            <span className="text-scada-muted">
+                                                {scdImportProgress.phase === 'parsing' ? 'Parsing selected IEDs...' : scdImportProgress.phase === 'applying' ? 'Applying imported devices...' : 'Importing...'}
+                                            </span>
+                                            <span className="font-mono text-white">{scdImportProgress.processed}/{scdImportProgress.total} ({progressPercent}%)</span>
+                                        </div>
+                                        <div className="w-full h-2 rounded bg-scada-bg border border-scada-border overflow-hidden">
+                                            <div className="h-full bg-scada-accent transition-all duration-200" style={{ width: `${progressPercent}%` }} />
+                                        </div>
+                                        {scdImportProgress.totalBatches > 0 && (
+                                            <div className="text-[10px] text-scada-muted mt-1 font-mono">
+                                                Batch {Math.max(1, scdImportProgress.batch)} / {scdImportProgress.totalBatches}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                <div className="max-h-[50vh] overflow-auto p-4 space-y-2">
+                                    {scdImportCandidates.map(c => (
+                                        <label key={c.name} className="flex items-center gap-3 px-3 py-2 rounded border border-scada-border bg-scada-bg/50 hover:border-scada-accent cursor-pointer">
+                                            <input type="checkbox" checked={c.selected} onChange={() => handleToggleScdCandidate(c.name)} />
+                                            <div className="flex-1 min-w-0">
+                                                <div className="text-sm text-white truncate">{c.name}</div>
+                                                <div className="text-[11px] text-scada-muted font-mono">IPs: {c.addresses.length > 0 ? c.addresses.map(a => `${a.ip}${a.protocolHints?.length ? `(${a.protocolHints.join('/')})` : ''}`).join(', ') : c.ip} {c.manufacturer ? `· ${c.manufacturer}` : ''} {c.type ? `· ${c.type}` : ''}</div>
+                                                <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2" onClick={(e) => e.preventDefault()}>
+                                                    <div>
+                                                        <div className="text-[10px] uppercase text-scada-muted mb-1">MMS IP</div>
+                                                        <select
+                                                            value={c.selectedMmsIp}
+                                                            onChange={(e) => handleScdCandidateIpChange(c.name, 'mms', e.target.value)}
+                                                            className="w-full bg-scada-panel border border-scada-border rounded px-2 py-1 text-[11px] font-mono text-white"
+                                                        >
+                                                            {(c.addresses.length > 0 ? c.addresses : [{ ip: c.ip } as SclCommunicationAddress]).map((a, idx) => (
+                                                                <option key={`${a.ip}-${idx}`} value={a.ip}>{a.ip}</option>
+                                                            ))}
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <div className="text-[10px] uppercase text-scada-muted mb-1">GOOSE IP</div>
+                                                        <select
+                                                            value={c.selectedGooseIp}
+                                                            onChange={(e) => handleScdCandidateIpChange(c.name, 'goose', e.target.value)}
+                                                            className="w-full bg-scada-panel border border-scada-border rounded px-2 py-1 text-[11px] font-mono text-white"
+                                                        >
+                                                            {(c.addresses.length > 0 ? c.addresses : [{ ip: c.ip } as SclCommunicationAddress]).map((a, idx) => (
+                                                                <option key={`${a.ip}-${idx}`} value={a.ip}>{a.ip}</option>
+                                                            ))}
+                                                        </select>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </label>
+                                    ))}
+                                </div>
+
+                                <div className="px-6 py-4 border-t border-scada-border flex justify-end gap-2">
+                                    <button
+                                        onClick={() => setScdImportOpen(false)}
+                                        className="px-4 py-2 border border-scada-border rounded text-sm text-scada-muted hover:text-white"
+                                        disabled={isApplyingScdImport}
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        onClick={handleConfirmScdImport}
+                                        className="px-4 py-2 bg-scada-accent rounded text-sm text-white font-bold hover:bg-cyan-600 disabled:opacity-60"
+                                        disabled={isApplyingScdImport || selectedCount === 0}
+                                    >
+                                        {isApplyingScdImport ? 'Importing...' : 'Import Selected'}
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     )}
                 </div>
@@ -780,6 +1149,11 @@ const AppContent = () => {
                     <LogPanel
                       logs={logs}
                       onClear={() => setLogs([])}
+                                            onExport={handleExportLogs}
+                                            onStart={() => engine.start()}
+                                            onStop={() => engine.stop()}
+                                            onTogglePause={() => setIsLogCapturePaused(prev => !prev)}
+                                            isPaused={isLogCapturePaused}
                       isCollapsed={isLogPanelCollapsed}
                       onToggleCollapse={() => setIsLogPanelCollapsed(prev => !prev)}
                     />

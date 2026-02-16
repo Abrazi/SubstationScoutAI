@@ -2,7 +2,10 @@
 
 const os = require('os');
 const net = require('net');
+const { spawn } = require('child_process');
 const { WebSocketServer } = require('ws');
+const modbus = require('./lib/modbus-server.cjs');
+const iec = require('./lib/iec-server.cjs');
 
 const WS_PORT = Number(process.env.RELAY_WS_PORT || 34001);
 const MODBUS_PORT = Number(process.env.RELAY_MODBUS_PORT || 502);
@@ -17,6 +20,14 @@ const IEC_FORCE_BACKEND_PORT = Number(process.env.RELAY_IEC_FORCE_BACKEND_PORT |
 const IEC_DEFAULT_LISTENER = process.env.RELAY_IEC_DEFAULT_LISTENER === '1';
 const CLEAR_IEC_ON_UI_DISCONNECT = process.env.RELAY_CLEAR_IEC_ON_UI_DISCONNECT !== '0';
 const ALLOW_HEADLESS_WS = process.env.RELAY_ALLOW_HEADLESS_WS === '1';
+
+// Managed C-Server (Bridge)
+const IEC_SERVER_BIN = process.env.IEC_SERVER_BIN; // Path to C binary
+let iecChildProcess = null;
+let iecChildStdoutBuffer = '';
+let iecChildStderrBuffer = '';
+let iecChildReady = false;
+const pendingIecUpdates = [];
 
 let uiSocket = null;
 let selectedAdapterIp = null;
@@ -102,7 +113,7 @@ function probeBackend(host, port, timeoutMs = 1200) {
     const done = (ok, error) => {
       if (settled) return;
       settled = true;
-      try { socket.destroy(); } catch {}
+      try { socket.destroy(); } catch { }
       resolve({ ok, error });
     };
 
@@ -125,108 +136,161 @@ function updateIecClientCount(bindHost, bindPort, delta) {
   }
 }
 
+function handleIecChildStdoutChunk(data) {
+  iecChildStdoutBuffer += data.toString();
+  const lines = iecChildStdoutBuffer.split(/\r?\n/);
+  iecChildStdoutBuffer = lines.pop() || '';
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    console.log(`[libiec] ${trimmed}`);
+
+    if (trimmed.includes('IEC 61850 server started on port')) {
+      iecChildReady = true;
+      flushPendingIecUpdates();
+    }
+
+    if (trimmed.startsWith('CONTROL_UPDATE ')) {
+      const ref = trimmed.substring('CONTROL_UPDATE '.length).trim();
+      sendUi({
+        type: 'IEC_TRACE', direction: 'rx', source: 'External IEC Client',
+        targetIp: 'IEC Server', targetPort: IEC_BACKEND_PORT,
+        info: `Control operated: ${ref}`
+      });
+    }
+    if (trimmed.startsWith('BRIDGE_OK: ')) {
+      sendUi({
+        type: 'IEC_TRACE', direction: 'tx', source: 'Logic Engine',
+        targetIp: 'IEC Server', targetPort: IEC_BACKEND_PORT, info: trimmed
+      });
+    }
+    if (trimmed.startsWith('BRIDGE_ERR: ')) {
+      sendUi({
+        type: 'IEC_TRACE', direction: 'error', source: 'Logic Engine',
+        targetIp: 'IEC Server', targetPort: IEC_BACKEND_PORT, info: trimmed
+      });
+    }
+  });
+}
+
+function handleIecChildStderrChunk(data) {
+  iecChildStderrBuffer += data.toString();
+  const lines = iecChildStderrBuffer.split(/\r?\n/);
+  iecChildStderrBuffer = lines.pop() || '';
+
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    console.error(`[libiec:err] ${trimmed}`);
+  });
+}
+
+function queueIecUpdate(ref, value, reason) {
+  pendingIecUpdates.push({ ref, value });
+  if (pendingIecUpdates.length > 500) {
+    pendingIecUpdates.shift();
+  }
+  console.warn(`[relay] Queued IEC update for ${ref} (${reason})`);
+}
+
+function writeIecUpdate(ref, value) {
+  if (!iecChildProcess || !iecChildProcess.stdin || iecChildProcess.stdin.destroyed) {
+    queueIecUpdate(ref, value, 'IEC child stdin unavailable');
+    return false;
+  }
+
+  const line = `${ref}=${value}\n`;
+  const ok = iecChildProcess.stdin.write(line);
+  if (!ok) {
+    queueIecUpdate(ref, value, 'stdin backpressure');
+    return false;
+  }
+
+  return true;
+}
+
+function flushPendingIecUpdates() {
+  if (!iecChildProcess || !iecChildReady) return;
+  if (!pendingIecUpdates.length) return;
+
+  const pending = pendingIecUpdates.splice(0, pendingIecUpdates.length);
+  let flushed = 0;
+  pending.forEach(({ ref, value }) => {
+    if (writeIecUpdate(ref, value)) {
+      flushed += 1;
+    }
+  });
+
+  if (flushed > 0) {
+    console.log(`[relay] Flushed ${flushed} queued IEC update(s)`);
+  }
+}
+
+function routeIecUpdate(ref, value) {
+  if (!ref || value === undefined) return;
+
+  if (!iecChildProcess || !iecChildReady) {
+    queueIecUpdate(ref, value, iecChildProcess ? 'IEC child not ready yet' : 'IEC child not running');
+    return;
+  }
+
+  if (!writeIecUpdate(ref, value)) {
+    console.warn(`[relay] Failed to write IEC update for ${ref}; left queued`);
+  }
+}
+
+
+function startIecChildProcess() {
+  if (!IEC_SERVER_BIN) return;
+
+  if (iecChildProcess) {
+    try { iecChildProcess.kill(); } catch { }
+  }
+
+  console.log(`[relay] Spawning managed IEC server: ${IEC_SERVER_BIN}`);
+  iecChildReady = false;
+  iecChildStdoutBuffer = '';
+  iecChildStderrBuffer = '';
+  iecChildProcess = spawn(IEC_SERVER_BIN, [String(IEC_BACKEND_PORT)], {
+    stdio: ['pipe', 'pipe', 'pipe']
+  });
+
+  iecChildProcess.on('error', (err) => {
+    console.error(`[relay] Managed IEC server spawn error: ${err.message}`);
+  });
+
+  iecChildProcess.stdin.on('error', (err) => {
+    console.error(`[relay] IEC child stdin error: ${err.message}`);
+  });
+
+  iecChildProcess.stdout.on('data', handleIecChildStdoutChunk);
+  iecChildProcess.stderr.on('data', handleIecChildStderrChunk);
+
+  iecChildProcess.on('close', (code) => {
+    console.log(`[relay] Managed IEC server exited with code ${code}`);
+    iecChildReady = false;
+    iecChildProcess = null;
+  });
+}
+
 function startServers() {
+  startIecChildProcess();
   applyProtocolEndpoints('modbus', []);
   applyProtocolEndpoints('iec61850', []);
 }
 
 // Helper: Build MMS GetNameList Response from IED model
-function buildGetNameListResponse(iedModel) {
-  if (!iedModel || !iedModel.children) {
-    // Fallback: return empty list
-    return Buffer.from([
-      0x03, 0x00, 0x00, 0x1D,  // TPKT: version 3, length 29
-      0x02,                     // COTP: length 2
-      0xF0,                     // COTP: DT (Data)
-      0x80,                     // COTP: EOT flag
-      // MMS Confirmed-ResponsePDU
-      0xA1, 0x16,              // [1] IMPLICIT SEQUENCE
-      0x02, 0x01, 0x00,        // invokeID INTEGER 0
-      // getNameList Response [1]
-      0xA1, 0x11,              // [1] IMPLICIT SEQUENCE
-      0xA0, 0x00,              // [0] IMPLICIT SEQUENCE OF (empty)
-      0x81, 0x01, 0x00         // [1] BOOLEAN FALSE (moreFollows)
-    ]);
-  }
+// (Logic moved to lib/iec-server.js)
 
-  // Extract Logical Devices from IED model (look for LD children)
-  const logicalDevices = [];
-  if (iedModel.children) {
-    for (const child of iedModel.children) {
-      // Check if this is a Logical Device (type === 'LD' or has LN children)
-      if (child.type === 'LD' || (child.children && child.children.some(c => c.type === 'LN'))) {
-        logicalDevices.push(child.name);
-      }
-    }
-  }
-
-  if (logicalDevices.length === 0) {
-    logicalDevices.push('LD0'); // Default logical device
-  }
-
-  // Build MMS response with first LD (IEDScout will query each separately)  
-  const ldName = logicalDevices[0];
-  const ldNameBuf = Buffer.from(ldName, 'utf8');
-  const ldNameLen = ldNameBuf.length;
-
-  // Calculate lengths
-  const identListLen = 2 + ldNameLen; // tag(1) + len(1) + name
-  const responseBodyLen = 2 + identListLen + 3; // listOfIdentifier + moreFollows
-  const confirmedRespLen = 3 + 2 + responseBodyLen; // invokeID + getNameList response
-
-  const totalLen =7 + 2 + confirmedRespLen; // TPKT/COTP + confirmed-resp
-
-  const response = Buffer.alloc(totalLen);
-  let offset = 0;
-
-  // TPKT Header
-  response[offset++] = 0x03; // Version 3
-  response[offset++] = 0x00; // Reserved
-  response[offset++] = (totalLen >> 8) & 0xFF;
-  response[offset++] = totalLen & 0xFF;
-
-  // COTP Header
-  response[offset++] = 0x02; // Length 2
-  response[offset++] = 0xF0; // DT Data
-  response[offset++] = 0x80; // EOT flag
-
-  // MMS Confirmed-ResponsePDU [1]
-  response[offset++] = 0xA1; // tag
-  response[offset++] = confirmedRespLen;
-
-  // invokeID
-  response[offset++] = 0x02; // INTEGER tag
-  response[offset++] = 0x01; // length 1
-  response[offset++] = 0x00; // value 0
-
-  // getNameList Response [1]
-  response[offset++] = 0xA1; // tag
-  response[offset++] = responseBodyLen;
-
-  // listOfIdentifier [0] SEQUENCE OF
-  response[offset++] = 0xA0; // tag
-  response[offset++] = identListLen;
-
-  // Identifier (VisibleString)
-  response[offset++] = 0x1A; // VisibleString tag
-  response[offset++] = ldNameLen;
-  ldNameBuf.copy(response, offset);
-  offset += ldNameLen;
-
-  // moreFollows [1] BOOLEAN
-  response[offset++] = 0x81; // tag
-  response[offset++] = 0x01; // length 1
-  response[offset++] = logicalDevices.length > 1 ? 0xFF : 0x00; // TRUE if more LDs, else FALSE
-
-  return response;
-}
 
 function closeProtocolServers(protocol) {
   for (const [key, server] of tcpServers.entries()) {
     if (!key.startsWith(`${protocol}|`)) continue;
     try {
       server.close();
-    } catch {}
+    } catch { }
     tcpServers.delete(key);
     endpointStates.delete(key);
     endpointConfigs.delete(key);
@@ -272,15 +336,15 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
         const fc = pdu.readUInt8(0);
 
         if (protoId !== 0) {
-          socket.write(buildExceptionResponse(transId, unitId, fc, 1));
+          socket.write(modbus.buildExceptionResponse(transId, unitId, fc, 1));
           continue;
         }
 
-        const cmd = parsePdu(transId, unitId, pdu);
+        const cmd = modbus.parsePdu(transId, unitId, pdu);
         socketContext.get(socket).lastUnitId = unitId;
 
         if (!cmd) {
-          socket.write(buildExceptionResponse(transId, unitId, fc, 1));
+          socket.write(modbus.buildExceptionResponse(transId, unitId, fc, 1));
           continue;
         }
 
@@ -294,7 +358,7 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
       }
     });
 
-    socket.on('error', () => {});
+    socket.on('error', () => { });
     socket.on('close', () => {
       if (protocol === 'iec61850') {
         updateIecClientCount(bindHost, bindPort, -1);
@@ -324,8 +388,8 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
       const effectiveBackendHost = backendHost || IEC_BACKEND_HOST;
       const effectiveBackendPort = Number(backendPort || IEC_BACKEND_PORT);
       const simulationMode = (effectiveBackendHost === bindHost && effectiveBackendPort === bindPort) ||
-                             effectiveBackendHost === 'simulation' ||
-                             effectiveBackendHost === 'none';
+        effectiveBackendHost === 'simulation' ||
+        effectiveBackendHost === 'none';
 
       if (simulationMode) {
         // Simulation mode: accept connection but provide basic MMS responses
@@ -363,14 +427,8 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
               if (buffer.length >= 7 && buffer[5] === 0xE0) {
                 // Send COTP Connection Confirm (CC)
                 // TPKT header (4 bytes) + COTP CC packet
-                const response = Buffer.from([
-                  0x03, 0x00, 0x00, 0x0B,  // TPKT: version 3, length 11
-                  0x06,                     // COTP: length 6
-                  0xD0,                     // COTP: CC (Connection Confirm)
-                  0x00, 0x00,               // COTP: dst-ref
-                  0x00, 0x01,               // COTP: src-ref
-                  0x00                      // COTP: class
-                ]);
+                // Send COTP Connection Confirm (CC)
+                const response = iec.buildCotpConnectionConfirm();
                 socket.write(response);
                 cotpConnected = true;
                 sendUi({
@@ -388,47 +446,22 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
                 // Parse COTP header to find where MMS PDU starts
                 const cotpLength = buffer[4]; // COTP length includes itself
                 const mmsStart = 5 + cotpLength; // MMS starts after TPKT (4 bytes) + COTP length + COTP data
-                
+
                 if (buffer.length < mmsStart + 1) {
                   console.log(`[relay] IEC incomplete MMS message (${buffer.length} bytes, need ${mmsStart + 1})`);
                   return;
                 }
-                
+
                 const mmsPduTag = buffer[mmsStart];
                 console.log(`[relay] IEC COTP DT received (COTP len=${cotpLength}), MMS PDU tag: 0x${mmsPduTag?.toString(16).padStart(2, '0')} at offset ${mmsStart} (total ${buffer.length} bytes)`);
-                
+
                 // MMS Initiate Request (tag 0xA8)
                 if (mmsPduTag === 0xA8) {
                   console.log(`[relay] IEC MMS Initiate Request from ${source}`);
                   // Send a proper MMS Initiate Response
-                  const response = Buffer.from([
-                    0x03, 0x00, 0x00, 0x46,  // TPKT: version 3, length 70 bytes
-                    0x02,                     // COTP: length 2
-                    0xF0,                     // COTP: DT (Data)
-                    0x80,                     // COTP: EOT flag
-                    // MMS Initiate-ResponsePDU
-                    0xA9, 0x3E,              // [UNIVERSAL 9] IMPLICIT SEQUENCE (62 bytes)
-                    // localDetailCalling (negotiated parameter)
-                    0x80, 0x01, 0x01,        // [0] INTEGER 1 (local detail)
-                    // negociatedMaxServOutstandingCalling
-                    0x81, 0x01, 0x01,        // [1] INTEGER 1
-                    // negociatedMaxServOutstandingCalled
-                    0x82, 0x01, 0x01,        // [2] INTEGER 1
-                    // negociatedDataStructureNestingLevel (optional removed for compatibility)
-                    // negociatedMaxPduSize
-                    0x88, 0x03, 0x00, 0xFF, 0xF0,  // [8] INTEGER 65520 (max PDU size)
-                    // proposedVersionNumber - IEC 61850 Ed 2
-                    0x89, 0x02, 0x07, 0xC0,  // [9] BIT STRING 0x07C0 = version 1+2 (Ed 1 & Ed 2)
-                    // proposedParameterCBB - STR1+STR2+NEST
-                    0x8A, 0x05, 0x04, 0xF1, 0x00, 0x00, 0x00,  // [10] BIT STRING (CBB = 0xF1000000)
-                    // servicesSupportedCalling (advertise GetNameList, Identify, Read, etc.)
-                    0x8B, 0x20,              // [11] BIT STRING (32 bytes of service flags)
-                    0x5F, 0x1F, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00,  // Status, GetNameList, Identify, Read
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-                  ]);
-                  
+                  // Send a proper MMS Initiate Response
+                  const response = iec.buildInitiateResponse();
+
                   socket.write(response);
                   console.log(`[relay] IEC MMS Initiate Response sent to ${source} (${response.length} bytes)`);
                   sendUi({
@@ -488,46 +521,29 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
                 // MMS Confirmed Request (tag 0xA0) - GetNameList, Read, etc.
                 else if (mmsPduTag === 0xA0) {
                   const mmsPdu = buffer.subarray(mmsStart);
-                  
+
                   // Check for GetNameList (tag 0xA1)
                   if (mmsPdu.length > 3 && mmsPdu[2] === 0xA1) {
                     console.log(`[relay] IEC MMS GetNameList request from ${source}`);
-                    
+
                     // Get IED model for this endpoint
                     const epKey = endpointKey('iec61850', targetIp, targetPort);
                     const iedModel = iedModels.get(epKey);
-                    
+
                     let response;
                     let logInfo;
-                    
+
                     if (iedModel) {
-                      response = buildGetNameListResponse(iedModel);
+                      response = iec.buildGetNameListResponse(iedModel);
                       logInfo = `GetNameList Response (from ${iedModel.name})`;
                       console.log(`[relay] IEC MMS GetNameList Response sent: ${iedModel.name}`);
                     } else {
                       // Fallback to TEMPLATE if model not available yet
-                      response = Buffer.from([
-                        0x03, 0x00, 0x00, 0x2D,  // TPKT: version 3, length 45
-                        0x02,                     // COTP: length 2
-                        0xF0,                     // COTP: DT (Data)
-                        0x80,                     // COTP: EOT flag
-                        // MMS Confirmed-ResponsePDU
-                        0xA1, 0x26,              // [1] IMPLICIT SEQUENCE (38 bytes)
-                        // invokeID (match request or use 0)
-                        0x02, 0x01, 0x00,        // INTEGER 0
-                        // getNameList Response [1]
-                        0xA1, 0x21,              // [1] IMPLICIT SEQUENCE (33 bytes)
-                        // listOfIdentifier [0]
-                        0xA0, 0x0A,              // [0] IMPLICIT SEQUENCE OF (10 bytes)
-                        // Identifier: "TEMPLATE"  
-                        0x1A, 0x08, 0x54, 0x45, 0x4D, 0x50, 0x4C, 0x41, 0x54, 0x45,
-                        // moreFollows [1] = FALSE
-                        0x81, 0x01, 0x00         // [1] BOOLEAN FALSE
-                      ]);
+                      response = iec.buildTemplateResponse();
                       logInfo = 'GetNameList Response (TEMPLATE - model pending)';
                       console.log(`[relay] IEC MMS GetNameList Response sent: TEMPLATE (model not loaded)`);
                     }
-                    
+
                     socket.write(response);
                     sendUi({
                       type: 'IEC_TRACE',
@@ -542,20 +558,10 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
                   // Check for GetLogicalDeviceDirectory or other requests
                   else {
                     console.log(`[relay] IEC MMS request from ${source}: ${buffer.length} bytes (PDU: 0x${mmsPdu[2]?.toString(16) || '??'})`);
-                    
+
                     // Send generic error for unsupported services
-                    const errorResponse = Buffer.from([
-                      0x03, 0x00, 0x00, 0x0F,  // TPKT: version 3, length 15
-                      0x02,                     // COTP: length 2
-                      0xF0,                     // COTP: DT (Data)
-                      0x80,                     // COTP: EOT flag
-                      // MMS Confirmed-ErrorPDU
-                      0xA2, 0x08,              // [2] IMPLICIT SEQUENCE (8 bytes)
-                      0x02, 0x01, 0x00,        // invokeID INTEGER 0
-                      0xA0, 0x03,              // [0] ServiceError
-                      0x80, 0x01, 0x01         // service-not-supported
-                    ]);
-                    
+                    const errorResponse = iec.buildErrorResponse();
+
                     socket.write(errorResponse);
                     console.log(`[relay] IEC MMS Error Response sent (service not supported in simulation)`);
                   }
@@ -667,10 +673,10 @@ function createBoundServer(protocol, bindHost, bindPort, name, backendHost, back
     if (protocol === 'iec61850') {
       const effectiveBackendHost = backendHost || IEC_BACKEND_HOST;
       const effectiveBackendPort = Number(backendPort || IEC_BACKEND_PORT);
-      const simulationMode = effectiveBackendHost === 'simulation' || 
-                             effectiveBackendHost === 'none' ||
-                             (effectiveBackendHost === bindHost && effectiveBackendPort === bindPort);
-      
+      const simulationMode = effectiveBackendHost === 'simulation' ||
+        effectiveBackendHost === 'none' ||
+        (effectiveBackendHost === bindHost && effectiveBackendPort === bindPort);
+
       if (simulationMode) {
         setEndpointState(protocol, bindHost, bindPort, 'active', undefined, name, 'simulation', 0);
         console.log(`[relay] IEC ${bindHost}:${bindPort} in simulation mode (no backend)`);
@@ -747,82 +753,8 @@ function applyProtocolEndpoints(protocol, endpoints) {
   }
 }
 
-function parsePdu(transId, unitId, pdu) {
-  if (pdu.length < 1) return null;
-  const fc = pdu.readUInt8(0);
+// Protocols handled in libraries
 
-  if ([1, 2, 3, 4].includes(fc)) {
-    if (pdu.length < 5) return null;
-    const addr = pdu.readUInt16BE(1);
-    const len = pdu.readUInt16BE(3);
-    return { transId, unitId, fc, addr, len };
-  }
-
-  if (fc === 5) {
-    if (pdu.length < 5) return null;
-    const addr = pdu.readUInt16BE(1);
-    const raw = pdu.readUInt16BE(3);
-    const val = raw === 0xff00 ? 1 : 0;
-    return { transId, unitId, fc, addr, val };
-  }
-
-  if (fc === 6) {
-    if (pdu.length < 5) return null;
-    const addr = pdu.readUInt16BE(1);
-    const val = pdu.readUInt16BE(3);
-    return { transId, unitId, fc, addr, val };
-  }
-
-  return { transId, unitId, fc, addr: 0, len: 0 };
-}
-
-function buildExceptionResponse(transId, unitId, fc, exCode) {
-  const pdu = Buffer.from([fc | 0x80, exCode & 0xff]);
-  return buildAdu(transId, unitId, pdu);
-}
-
-function buildReadResponse(transId, unitId, fc, data) {
-  const values = Array.isArray(data) ? data : [];
-
-  if (fc === 1 || fc === 2) {
-    const byteCount = Math.ceil(values.length / 8);
-    const bytes = Buffer.alloc(byteCount, 0);
-    values.forEach((value, idx) => {
-      if (Number(value)) bytes[Math.floor(idx / 8)] |= 1 << (idx % 8);
-    });
-    const pdu = Buffer.concat([Buffer.from([fc, byteCount]), bytes]);
-    return buildAdu(transId, unitId, pdu);
-  }
-
-  const byteCount = values.length * 2;
-  const payload = Buffer.alloc(byteCount);
-  values.forEach((value, idx) => {
-    payload.writeUInt16BE((Number(value) || 0) & 0xffff, idx * 2);
-  });
-  const pdu = Buffer.concat([Buffer.from([fc, byteCount]), payload]);
-  return buildAdu(transId, unitId, pdu);
-}
-
-function buildWriteEchoResponse(transId, unitId, fc, addr, val) {
-  const pdu = Buffer.alloc(5);
-  pdu.writeUInt8(fc, 0);
-  pdu.writeUInt16BE(addr & 0xffff, 1);
-  if (fc === 5) {
-    pdu.writeUInt16BE(Number(val) ? 0xff00 : 0x0000, 3);
-  } else {
-    pdu.writeUInt16BE((Number(val) || 0) & 0xffff, 3);
-  }
-  return buildAdu(transId, unitId, pdu);
-}
-
-function buildAdu(transId, unitId, pdu) {
-  const mbap = Buffer.alloc(7);
-  mbap.writeUInt16BE(transId & 0xffff, 0);
-  mbap.writeUInt16BE(0, 2); // protocol id
-  mbap.writeUInt16BE(pdu.length + 1, 4); // unit id + pdu
-  mbap.writeUInt8(unitId & 0xff, 6);
-  return Buffer.concat([mbap, pdu]);
-}
 
 function handleModbusResponse(msg) {
   const pending = pendingRequests.get(msg.transId);
@@ -838,13 +770,13 @@ function handleModbusResponse(msg) {
 
   let response;
   if (exceptionCode > 0) {
-    response = buildExceptionResponse(msg.transId, unitId, fc, exceptionCode);
+    response = modbus.buildExceptionResponse(msg.transId, unitId, fc, exceptionCode);
   } else if ([1, 2, 3, 4].includes(fc)) {
-    response = buildReadResponse(msg.transId, unitId, fc, msg.data || []);
+    response = modbus.buildReadResponse(msg.transId, unitId, fc, msg.data || []);
   } else if (fc === 5 || fc === 6) {
-    response = buildWriteEchoResponse(msg.transId, unitId, fc, Number(msg.addr || 0), msg.val);
+    response = modbus.buildWriteEchoResponse(msg.transId, unitId, fc, Number(msg.addr || 0), msg.val);
   } else {
-    response = buildExceptionResponse(msg.transId, unitId, fc, 1);
+    response = modbus.buildExceptionResponse(msg.transId, unitId, fc, 1);
   }
 
   socket.write(response);
@@ -857,9 +789,9 @@ function cleanupTimeouts() {
     if (now - pending.ts > 5000) {
       try {
         if (!pending.socket.destroyed) {
-          pending.socket.write(buildExceptionResponse(tid, pending.unitId, pending.fc, 4));
+          pending.socket.write(modbus.buildExceptionResponse(tid, pending.unitId, pending.fc, 4));
         }
-      } catch {}
+      } catch { }
       pendingRequests.delete(tid);
     }
   }
@@ -875,7 +807,7 @@ wss.on('connection', (ws, req) => {
     console.warn(`[relay] Rejected WS control connection without trusted browser origin (origin: ${origin || 'none'})`);
     try {
       ws.close(1008, 'Browser app origin required');
-    } catch {}
+    } catch { }
     return;
   }
 
@@ -909,6 +841,9 @@ wss.on('connection', (ws, req) => {
         if (msg.protocol === 'modbus' || msg.protocol === 'iec61850') {
           applyProtocolEndpoints(msg.protocol, msg.endpoints || []);
         }
+        break;
+      case 'IEC_UPDATE':
+        routeIecUpdate(msg.ref, msg.value);
         break;
       case 'IED_MODEL':
         // Store the received IED model

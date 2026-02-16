@@ -75,23 +75,23 @@ export interface IEDNode {
 }
 
 export interface GooseConfig {
-    appID: string;
-    confRev: number;
-    minTime: number; // ms
-    maxTime: number; // ms
-    datSet: string; // Reference to dataset
+  appID: string;
+  confRev: number;
+  minTime: number; // ms
+  maxTime: number; // ms
+  datSet: string; // Reference to dataset
 }
 
 export interface GooseState {
-    enabled: boolean;
-    stNum: number; // Status Number (increments on data change)
-    sqNum: number; // Sequence Number (increments on retransmission)
-    timeAllowedToLive: number;
-    timestamp: number;
-    nextTx: number; // Timestamp for next transmission
-    currentInterval: number; // Current retransmission interval
-    burstMode: boolean;
-    data: Record<string, any>; // Cache of dataset values
+  enabled: boolean;
+  stNum: number; // Status Number (increments on data change)
+  sqNum: number; // Sequence Number (increments on retransmission)
+  timeAllowedToLive: number;
+  timestamp: number;
+  nextTx: number; // Timestamp for next transmission
+  currentInterval: number; // Current retransmission interval
+  burstMode: boolean;
+  data: Record<string, any>; // Cache of dataset values
 }
 
 export type LogLevel = 'info' | 'warning' | 'error' | 'packet' | 'goose' | 'mms' | 'debug';
@@ -186,13 +186,18 @@ export interface IDeviceContext {
   readRegister(address: number): number;
   writeRegister(address: number, value: number): void;
   readInput(address: number): number; // 30000 range
-  
+
   // IEC 61850 access (Simulated)
   getDAValue(path: string): any;
   setDAValue(path: string, value: any): void;
-  
+
   // Logging
   Log(level: string, message: string): void;
+
+  // IEC Bridge Access
+  IEC: {
+    Update(path: string, value: any): void;
+  };
 }
 
 // Network Bridge Types
@@ -269,18 +274,18 @@ export interface DebugState {
 }
 
 export interface ScriptConfig {
-    deviceId: string;
-    code: string;
-    tickRate: number; // ms
+  deviceId: string;
+  code: string;
+  tickRate: number; // ms
 }
 
 // Client Master Types
 export interface ClientTransaction {
-    id: string;
-    timestamp: string;
-    type: 'request' | 'response' | 'error';
-    protocol: 'Modbus' | 'MMS';
-    details: string;
-    value?: any;
-    status: 'success' | 'timeout' | 'error';
+  id: string;
+  timestamp: string;
+  type: 'request' | 'response' | 'error';
+  protocol: 'Modbus' | 'MMS';
+  details: string;
+  value?: any;
+  status: 'success' | 'timeout' | 'error';
 }

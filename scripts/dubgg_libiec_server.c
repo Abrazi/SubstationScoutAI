@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include "iec61850_server.h"
 #include "hal_thread.h"
 #include "ied_model.h"
@@ -133,6 +134,99 @@ register_all_control_handlers(IedModel* model)
     printf("Registered %d controllable data object handlers\n", gBindingCount);
 }
 
+// --- Bridge Logic ---
+
+static void
+handle_bridge_update(const char* ref, const char* valStr)
+{
+    if (!gIedServer) return;
+
+    DataAttribute* attr = (DataAttribute*) IedModel_getModelNodeByObjectReference(&iedModel, ref);
+    if (!attr) {
+        // Try appending .stVal if not present, common abbreviation
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s.stVal", ref);
+        attr = (DataAttribute*) IedModel_getModelNodeByObjectReference(&iedModel, buf);
+    }
+
+    if (!attr || ModelNode_getType((ModelNode*)attr) != DataAttributeModelType) {
+        if (running) {
+            printf("BRIDGE_ERR: Node not found or not attribute: %s\n", ref);
+            fflush(stdout);
+        }
+        return;
+    }
+
+    MmsValue* newVal = NULL;
+    // Type type = ModelNode_getType((ModelNode*)attr);
+    // basic Type (MmsType) check requires accessing mmsValue type
+    // We infer from MmsValue of the attribute if possible, or just try Types
+    
+    // For simplicity, we assume common types:
+    // BOOLEAN, INT32, FLOAT32
+    // We can check the node type directly if needed, but libiec61850 abstraction 
+    // usually requires getting the specific BasicType from the MmsValue container or DataAttribute spec via 
+    // DataAttribute_getType((DataAttribute*) node) -> but that returns complex MmsType enum
+    
+    // Let's rely on string parsing heuristics or check current value type
+    // MmsValue* current = IedServer_getAttributeValue(gIedServer, attr); // Not public API easily
+    // We will try to parse based on input format
+    
+    if (strcasecmp(valStr, "true") == 0 || strcasecmp(valStr, "false") == 0) {
+        newVal = MmsValue_newBoolean(strcasecmp(valStr, "true") == 0);
+    }
+    else if (strchr(valStr, '.')) {
+        newVal = MmsValue_newFloat(strtof(valStr, NULL));
+    }
+    else {
+        newVal = MmsValue_newIntegerFromInt32(atoi(valStr));
+    }
+
+    if (newVal) {
+        IedServer_updateAttributeValue(gIedServer, attr, newVal);
+        
+        // Also update timestamp 't' if it exists in the same DO
+        ModelNode* parent = ModelNode_getParent((ModelNode*)attr);
+        if (parent) {
+            ModelNode* tNode = ModelNode_getChild(parent, "t");
+            if (tNode) {
+                IedServer_updateUTCTimeAttributeValue(gIedServer, (DataAttribute*)tNode, Hal_getTimeInMs());
+            }
+        }
+        
+        MmsValue_delete(newVal);
+        if (running) {
+            printf("BRIDGE_OK: Updated %s = %s\n", ref, valStr);
+            fflush(stdout);
+        }
+    }
+}
+
+static void*
+stdin_reader_thread(void* arg)
+{
+    (void) arg;
+    char line[1024];
+    while (running && fgets(line, sizeof(line), stdin)) {
+        // Trim newline
+        line[strcspn(line, "\r\n")] = 0;
+        
+        if (strlen(line) == 0) continue;
+
+        // Message format: "REF=VALUE"
+        char* eq = strchr(line, '=');
+        if (eq) {
+            *eq = 0;
+            const char* ref = line;
+            const char* val = eq + 1;
+            handle_bridge_update(ref, val);
+        }
+    }
+    return NULL;
+}
+
+// --------------------
+
 static void
 sigint_handler(int signalId)
 {
@@ -144,6 +238,9 @@ int
 main(int argc, char** argv)
 {
     int tcpPort = 8102;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
 
     if (argc > 1)
         tcpPort = atoi(argv[1]);
@@ -160,6 +257,10 @@ main(int argc, char** argv)
 
     register_all_control_handlers(&iedModel);
 
+    // Start STDIN Interface Thread
+    Thread thread = Thread_create(stdin_reader_thread, NULL, false);
+    Thread_start(thread);
+
     IedServer_start(iedServer, tcpPort);
 
     if (!IedServer_isRunning(iedServer)) {
@@ -169,13 +270,15 @@ main(int argc, char** argv)
     }
 
     printf("IEC 61850 server started on port %d\n", tcpPort);
+    fflush(stdout);
 
     while (running) {
-        Thread_sleep(1000);
+        Thread_sleep(100);
     }
 
     IedServer_stop(iedServer);
     IedServer_destroy(iedServer);
+    Thread_destroy(thread);
 
     if (gBindings)
         free(gBindings);

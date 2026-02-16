@@ -122,8 +122,8 @@ stop_old() {
 }
 
 start_backend() {
-  nohup "$LIBIEC_BIN" "$BACKEND_PORT" > "$BACKEND_LOG" 2>&1 &
-  echo "[std-iec] backend started: $BACKEND_HOST:$BACKEND_PORT"
+  # Backend is now started by the relay (modbus-relay.cjs)
+  echo "[std-iec] backend binary ready at $LIBIEC_BIN"
 }
 
 start_relay() {
@@ -137,12 +137,14 @@ start_relay() {
       RELAY_IEC_FORCE_BACKEND_PORT="$BACKEND_PORT" \
       RELAY_IEC_DEFAULT_LISTENER=0 \
       RELAY_CLEAR_IEC_ON_UI_DISCONNECT=1 \
+      IEC_SERVER_BIN="$LIBIEC_BIN" \
       nohup npm run relay > "$RELAY_LOG" 2>&1 &
     else
       RELAY_IEC_BACKEND_HOST="$BACKEND_HOST" \
       RELAY_IEC_BACKEND_PORT="$BACKEND_PORT" \
       RELAY_IEC_DEFAULT_LISTENER=0 \
       RELAY_CLEAR_IEC_ON_UI_DISCONNECT=1 \
+      IEC_SERVER_BIN="$LIBIEC_BIN" \
       nohup npm run relay > "$RELAY_LOG" 2>&1 &
     fi
   )

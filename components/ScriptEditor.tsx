@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Icons } from './Icons';
 import { engine } from '../services/SimulationEngine';
 import { DebugState, IEDNode } from '../types';
@@ -220,7 +220,8 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
     const [isCompiling, setIsCompiling] = useState(false);
     const [transitionTrace, setTransitionTrace] = useState<Array<{ timestamp: number, from?: number | null, to?: number | null, deviceId?: string }>>([]);
-    const transitionTraceRef = useRef<{ timestamp: number, from?: number | null, to?: number | null, deviceId?: string } | null>(null);
+    // ref to hold a pending compile timeout so we can clear it on unmount
+    const compileTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [forcedSteps, setForcedSteps] = useState<Record<string, boolean>>({});
     const [showPrintBounds, setShowPrintBounds] = useState(false);
     const [findReplaceOpen, setFindReplaceOpen] = useState(false);
@@ -262,7 +263,172 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     const panStartRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
     const stepDragRef = useRef<{ targets: string[]; startX: number; startY: number; base: Record<string, { x: number; y: number }> } | null>(null);
 
+    // clean up maps when component unmounts to avoid retaining DOM references
+    useEffect(() => {
+        return () => {
+            sfcNodeRefs.current.clear();
+            transitionHandleRefs.current.clear();
+        };
+    }, []);
+
+    // clear pending compile timer on unmount
+    useEffect(() => {
+        return () => {
+            if (compileTimeoutRef.current) {
+                clearTimeout(compileTimeoutRef.current);
+            }
+        };
+    }, []);
+
+    // stable callbacks for global listeners -- avoids stale closures during cleanup
+    const onReconnectMouseMove = useCallback((e: MouseEvent) => {
+        setReconnectDrag(prev => prev.active ? { ...prev, cursorX: e.clientX, cursorY: e.clientY } : prev);
+    }, []);
+    const onReconnectMouseUp = useCallback(() => {
+        setReconnectDrag(prev => prev.active ? { active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 } : prev);
+    }, []);
+
+    const handleNodeDragMouseMove = useCallback((e: MouseEvent) => {
+        const drag = stepDragRef.current;
+        if (!drag) return;
+        const zoomFactor = Math.max(0.25, zoomLevel / 100);
+        const dx = (e.clientX - drag.startX) / zoomFactor;
+        const dy = (e.clientY - drag.startY) / zoomFactor;
+        setNodePositions(prev => {
+            const next = { ...prev };
+            drag.targets.forEach(id => {
+                const basePos = drag.base[id] || { x: 0, y: 0 };
+                let x = basePos.x + dx;
+                let y = basePos.y + dy;
+                if (snapToGrid) {
+                    x = Math.round(x / 10) * 10;
+                    y = Math.round(y / 10) * 10;
+                }
+                next[id] = { x, y };
+            });
+            return next;
+        });
+    }, [zoomLevel, snapToGrid]);
+    const handleNodeDragMouseUp = useCallback(() => {
+        stepDragRef.current = null;
+        setDraggingNodeIds([]);
+    }, []);
+
+    const handleConsoleMouseMove = useCallback((e: MouseEvent) => {
+        const rightPanel = document.querySelector('.right-panel-container');
+        if (!rightPanel) return;
+        const panelRect = rightPanel.getBoundingClientRect();
+        const newHeight = panelRect.bottom - e.clientY;
+        const minHeight = 100;
+        const maxHeight = panelRect.height * 0.8;
+        setConsoleHeight(Math.max(minHeight, Math.min(maxHeight, newHeight)));
+    }, []);
+    const handleConsoleMouseUp = useCallback(() => {
+        setIsResizingConsole(false);
+    }, []);
+
+    const handleRightPanelMouseMove = useCallback((e: MouseEvent) => {
+        const newWidth = window.innerWidth - e.clientX;
+        const minWidth = 240;
+        const maxWidth = Math.min(720, Math.floor(window.innerWidth * 0.6));
+        setRightPanelWidth(Math.max(minWidth, Math.min(maxWidth, newWidth)));
+    }, []);
+    const handleRightPanelMouseUp = useCallback(() => {
+        setIsResizingRightPanel(false);
+    }, []);
+
+    const handleDebugPanelMouseMove = useCallback((e: MouseEvent) => {
+        const newWidth = window.innerWidth - e.clientX;
+        const minWidth = 260;
+        const maxWidth = Math.min(720, Math.floor(window.innerWidth * 0.7));
+        setDebugPanelWidth(Math.max(minWidth, Math.min(maxWidth, newWidth)));
+    }, []);
+    const handleDebugPanelMouseUp = useCallback(() => {
+        setIsResizingDebugPanel(false);
+    }, []);
+
     const getDraftKey = (deviceId: string) => `substation-scout:draft:${deviceId}`;
+
+    const onKeyDown = useCallback((e: KeyboardEvent) => {
+        const activeDebugTarget = debugState.activeDeviceId === selectedDeviceId;
+        const isUndoCombo = (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z';
+        const isRedoCombo = (e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'));
+
+        if (isUndoCombo) {
+            e.preventDefault();
+            undoCodeChange();
+            return;
+        }
+
+        if (isRedoCombo) {
+            e.preventDefault();
+            redoCodeChange();
+            return;
+        }
+
+        if (viewMode === 'sfc') {
+            const target = e.target as HTMLElement | null;
+            const inTextField = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+            if (inTextField) return;
+
+            if (e.key === 'Escape') {
+                clearSFCSelection();
+                if (reconnectDrag.active) {
+                    setReconnectDrag({ active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 });
+                }
+                return;
+            }
+
+            if (!selectedTransition.nodeId || selectedTransition.idx === undefined) return;
+
+            const key = e.key.toLowerCase();
+            if (key === 'e') { e.preventDefault(); runTransitionAction('edit'); return; }
+            if (key === 't') { e.preventDefault(); runTransitionAction('retarget'); return; }
+            if (key === 'i') { e.preventDefault(); runTransitionAction('insert'); return; }
+            if (key === 'n') { e.preventDefault(); runTransitionAction('normalize'); return; }
+            if (key === 'p') { e.preventDefault(); runTransitionAction('set-priority'); return; }
+            if (e.key === 'Delete' || e.key === 'Backspace') {
+                e.preventDefault();
+                runTransitionAction('delete');
+                return;
+            }
+        }
+
+        if (viewMode !== 'code') return;
+
+        if (e.key === 'F9') {
+            e.preventDefault();
+            let line = debugState.currentLine;
+            if (editorRef.current) {
+                const text = editorRef.current.value;
+                const cursorPos = editorRef.current.selectionStart || 0;
+                line = text.slice(0, cursorPos).split('\n').length;
+            }
+            if (line > 0) toggleBreakpoint(line);
+            return;
+        }
+
+        if (e.key === 'F5') {
+            e.preventDefault();
+            if (!debugState.isRunning) {
+                handleRun();
+            } else if (debugState.isPaused) {
+                engine.resume();
+            } else {
+                engine.pause(selectedDeviceId);
+            }
+            return;
+        }
+
+        if (e.key === 'F10') {
+            e.preventDefault();
+            if (debugState.isPaused && activeDebugTarget) {
+                engine.stepOver();
+            }
+        }
+    }, [viewMode, debugState.isRunning, debugState.isPaused, debugState.currentLine, debugState.activeDeviceId, selectedDeviceId, code, tickRate, selectedTransition, normalizeStepSize, selectedSteps, reconnectDrag.active]);
+
+    const handleWindowClick = useCallback(() => closeAllSFCMenus(), []);
 
     const createUniqueStateId = (sourceCode: string, rawName: string): string | null => {
         const clean = rawName.trim().toUpperCase().replace(/\s+/g, '_').replace(/[^A-Z0-9_]/g, '');
@@ -283,7 +449,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
         const matches = sourceCode.matchAll(/STATE_\w+\s*:\s*INT\s*:=\s*(\d+)/g);
         for (const m of matches) maxId = Math.max(maxId, parseInt(m[1], 10));
         const newStateValue = maxId + 1;
-        const endVarIdx = lines.findIndex(l => /^\s*END_VAR;\s*$/i.test(l.trim()));
+        const endVarIdx = lines.findIndex(l => /^\s*END_VAR;?\s*$/i.test(l.trim()));
         if (endVarIdx >= 0) {
             lines.splice(endVarIdx, 0, `  ${stateId} : INT := ${newStateValue};`);
         }
@@ -302,6 +468,8 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
         syncHistoryDepth();
     };
 
+    // note: pushHistory is called on every code update which triggers parsing/analysis
+    // and can slow down rapid edits (dragging, typing). Consider debouncing or batching
     const pushHistory = (snapshot: string) => {
         const current = undoHistoryRef.current[undoIndexRef.current];
         if (snapshot === current) return;
@@ -426,7 +594,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
             nextCode = nextCode.replace(initLineRe, `IF ${stateVar} = undefined THEN ${stateVar} := ${nodeId}; END_IF;`);
         } else {
             const lines = nextCode.split('\n');
-            const endVarIdx = lines.findIndex(l => /^\s*END_VAR;\s*$/i.test(l.trim()));
+            const endVarIdx = lines.findIndex(l => /^\s*END_VAR;?\s*$/i.test(l.trim()));
             if (endVarIdx >= 0) {
                 lines.splice(endVarIdx + 1, 0, '', `IF ${stateVar} = undefined THEN ${stateVar} := ${nodeId}; END_IF;`);
                 nextCode = lines.join('\n');
@@ -455,38 +623,69 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     };
 
     const retargetTransitionByRef = (sourceNodeId: string, transIdx: number, targetStateId: string, sourceCode?: string) => {
-        const workingCode = sourceCode ?? code;
-        const parsed = parseSFC(workingCode);
-        const node = parsed.find(n => n.id === sourceNodeId);
-        if (!node) return;
-        const trans = node.transitions[transIdx];
-        if (!trans) return;
-        if (trans.target === targetStateId) return;
-
-        const lines = workingCode.split('\n');
-        const blockStart = trans.lineIndex;
-        const blockEnd = trans.blockEndIndex;
-        const blockText = lines.slice(blockStart, blockEnd + 1).join('\n');
-
-        const stateVar = detectedStateVar || 'state';
-        const exactAssignRe = new RegExp(`\\b${stateVar}\\s*:=\\s*STATE_\\w+\\b`);
-        const genericAssignRe = /\b[A-Za-z_][A-Za-z0-9_]*\s*:=\s*STATE_\w+\b/;
-        const replacement = `${stateVar} := ${targetStateId}`;
-
-        let newBlockText = blockText;
-        if (exactAssignRe.test(newBlockText)) {
-            newBlockText = newBlockText.replace(exactAssignRe, replacement);
-        } else if (genericAssignRe.test(newBlockText)) {
-            newBlockText = newBlockText.replace(genericAssignRe, replacement);
-        } else {
+        // handle snapshot case separately so we don't accidentally read stale `code`
+        if (sourceCode !== undefined) {
+            const workingCode = sourceCode;
+            const parsed = parseSFC(workingCode);
+            const node = parsed.find(n => n.id === sourceNodeId);
+            if (!node) return;
+            const trans = node.transitions[transIdx];
+            if (!trans || trans.target === targetStateId) return;
+            const lines = workingCode.split('\n');
+            const blockStart = trans.lineIndex;
+            const blockEnd = trans.blockEndIndex;
+            const blockText = lines.slice(blockStart, blockEnd + 1).join('\n');
+            const stateVar = detectedStateVar || 'state';
+            const exactAssignRe = new RegExp(`\\b${stateVar}\\s*:=\\s*STATE_\\w+\\b`);
+            const genericAssignRe = /\b[A-Za-z_][A-Za-z0-9_]*\s*:=\s*STATE_\w+\b/;
+            const replacement = `${stateVar} := ${targetStateId}`;
+            let newBlockText = blockText;
+            if (exactAssignRe.test(newBlockText)) {
+                newBlockText = newBlockText.replace(exactAssignRe, replacement);
+            } else if (genericAssignRe.test(newBlockText)) {
+                newBlockText = newBlockText.replace(genericAssignRe, replacement);
+            } else {
+                return;
+            }
+            lines.splice(blockStart, blockEnd - blockStart + 1, ...newBlockText.split('\n'));
+            const final = lines.join('\n');
+            setCode(final);
+            setIsDirty(true);
+            setConsoleOutput(prev => [...prev, `> Reconnected Transition: ${node.label} -> ${targetStateId.replace('STATE_', '')}`]);
             return;
         }
-
-        lines.splice(blockStart, blockEnd - blockStart + 1, ...newBlockText.split('\n'));
-        setCode(lines.join('\n'));
+        let consoleMsg = '';
+        setCode(prev => {
+            const workingCode = prev;
+            const parsed = parseSFC(workingCode);
+            const node = parsed.find(n => n.id === sourceNodeId);
+            if (!node) return prev;
+            const trans = node.transitions[transIdx];
+            if (!trans || trans.target === targetStateId) return prev;
+            const lines = workingCode.split('\n');
+            const blockStart = trans.lineIndex;
+            const blockEnd = trans.blockEndIndex;
+            const blockText = lines.slice(blockStart, blockEnd + 1).join('\n');
+            const stateVar = detectedStateVar || 'state';
+            const exactAssignRe = new RegExp(`\\b${stateVar}\\s*:=\\s*STATE_\\w+\\b`);
+            const genericAssignRe = /\b[A-Za-z_][A-Za-z0-9_]*\s*:=\s*STATE_\w+\b/;
+            const replacement = `${stateVar} := ${targetStateId}`;
+            let newBlockText = blockText;
+            if (exactAssignRe.test(newBlockText)) {
+                newBlockText = newBlockText.replace(exactAssignRe, replacement);
+            } else if (genericAssignRe.test(newBlockText)) {
+                newBlockText = newBlockText.replace(genericAssignRe, replacement);
+            } else {
+                return prev;
+            }
+            lines.splice(blockStart, blockEnd - blockStart + 1, ...newBlockText.split('\n'));
+            consoleMsg = `> Reconnected Transition: ${node.label} -> ${targetStateId.replace('STATE_', '')}`;
+            return lines.join('\n');
+        });
         setIsDirty(true);
-        setConsoleOutput(prev => [...prev, `> Reconnected Transition: ${node.label} -> ${targetStateId.replace('STATE_', '')}`]);
+        if (consoleMsg) setConsoleOutput(prev => [...prev, consoleMsg]);
     };
+
 
     const applyReconnectToNewStep = () => {
         if (!reconnectNewStepModal.nodeId || reconnectNewStepModal.idx === undefined) return;
@@ -563,61 +762,23 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
     useEffect(() => {
         if (!reconnectDrag.active) return;
-
-        const onMouseMove = (e: MouseEvent) => {
-            setReconnectDrag(prev => prev.active ? { ...prev, cursorX: e.clientX, cursorY: e.clientY } : prev);
-        };
-
-        const onMouseUp = () => {
-            setReconnectDrag(prev => prev.active ? { active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 } : prev);
-        };
-
-        window.addEventListener('mousemove', onMouseMove);
-        window.addEventListener('mouseup', onMouseUp);
+        window.addEventListener('mousemove', onReconnectMouseMove);
+        window.addEventListener('mouseup', onReconnectMouseUp);
         return () => {
-            window.removeEventListener('mousemove', onMouseMove);
-            window.removeEventListener('mouseup', onMouseUp);
+            window.removeEventListener('mousemove', onReconnectMouseMove);
+            window.removeEventListener('mouseup', onReconnectMouseUp);
         };
-    }, [reconnectDrag.active]);
+    }, [reconnectDrag.active, onReconnectMouseMove, onReconnectMouseUp]);
 
     useEffect(() => {
         if (!draggingNodeIds.length) return;
-
-        const onMouseMove = (e: MouseEvent) => {
-            const drag = stepDragRef.current;
-            if (!drag) return;
-            const zoomFactor = Math.max(0.25, zoomLevel / 100);
-            const dx = (e.clientX - drag.startX) / zoomFactor;
-            const dy = (e.clientY - drag.startY) / zoomFactor;
-
-            setNodePositions(prev => {
-                const next = { ...prev };
-                drag.targets.forEach(id => {
-                    const basePos = drag.base[id] || { x: 0, y: 0 };
-                    let x = basePos.x + dx;
-                    let y = basePos.y + dy;
-                    if (snapToGrid) {
-                        x = Math.round(x / 10) * 10;
-                        y = Math.round(y / 10) * 10;
-                    }
-                    next[id] = { x, y };
-                });
-                return next;
-            });
-        };
-
-        const onMouseUp = () => {
-            stepDragRef.current = null;
-            setDraggingNodeIds([]);
-        };
-
-        window.addEventListener('mousemove', onMouseMove);
-        window.addEventListener('mouseup', onMouseUp);
+        window.addEventListener('mousemove', handleNodeDragMouseMove);
+        window.addEventListener('mouseup', handleNodeDragMouseUp);
         return () => {
-            window.removeEventListener('mousemove', onMouseMove);
-            window.removeEventListener('mouseup', onMouseUp);
+            window.removeEventListener('mousemove', handleNodeDragMouseMove);
+            window.removeEventListener('mouseup', handleNodeDragMouseUp);
         };
-    }, [draggingNodeIds, snapToGrid, zoomLevel]);
+    }, [draggingNodeIds, handleNodeDragMouseMove, handleNodeDragMouseUp]);
 
     // Console resize handlers
     const handleConsoleResizeStart = (e: React.MouseEvent) => {
@@ -637,80 +798,36 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
     useEffect(() => {
         if (!isResizingConsole) return;
-
-        const handleMouseMove = (e: MouseEvent) => {
-            const rightPanel = document.querySelector('.right-panel-container');
-            if (!rightPanel) return;
-
-            const panelRect = rightPanel.getBoundingClientRect();
-            const newHeight = panelRect.bottom - e.clientY;
-
-            // Constrain console height between 100px and 80% of panel height
-            const minHeight = 100;
-            const maxHeight = panelRect.height * 0.8;
-            setConsoleHeight(Math.max(minHeight, Math.min(maxHeight, newHeight)));
-        };
-
-        const handleMouseUp = () => {
-            setIsResizingConsole(false);
-        };
-
-        document.addEventListener('mousemove', handleMouseMove);
-        document.addEventListener('mouseup', handleMouseUp);
-
+        document.addEventListener('mousemove', handleConsoleMouseMove);
+        document.addEventListener('mouseup', handleConsoleMouseUp);
         return () => {
-            document.removeEventListener('mousemove', handleMouseMove);
-            document.removeEventListener('mouseup', handleMouseUp);
+            document.removeEventListener('mousemove', handleConsoleMouseMove);
+            document.removeEventListener('mouseup', handleConsoleMouseUp);
         };
-    }, [isResizingConsole]);
+    }, [isResizingConsole, handleConsoleMouseMove, handleConsoleMouseUp]);
 
     useEffect(() => {
         if (!isResizingRightPanel) return;
-
-        const handleMouseMove = (e: MouseEvent) => {
-            const newWidth = window.innerWidth - e.clientX;
-            const minWidth = 240;
-            const maxWidth = Math.min(720, Math.floor(window.innerWidth * 0.6));
-            setRightPanelWidth(Math.max(minWidth, Math.min(maxWidth, newWidth)));
-        };
-
-        const handleMouseUp = () => {
-            setIsResizingRightPanel(false);
-        };
-
-        document.addEventListener('mousemove', handleMouseMove);
-        document.addEventListener('mouseup', handleMouseUp);
-
+        document.addEventListener('mousemove', handleRightPanelMouseMove);
+        document.addEventListener('mouseup', handleRightPanelMouseUp);
         return () => {
-            document.removeEventListener('mousemove', handleMouseMove);
-            document.removeEventListener('mouseup', handleMouseUp);
+            document.removeEventListener('mousemove', handleRightPanelMouseMove);
+            document.removeEventListener('mouseup', handleRightPanelMouseUp);
         };
-    }, [isResizingRightPanel]);
+    }, [isResizingRightPanel, handleRightPanelMouseMove, handleRightPanelMouseUp]);
 
     useEffect(() => {
         if (!isResizingDebugPanel) return;
-
-        const handleMouseMove = (e: MouseEvent) => {
-            const newWidth = window.innerWidth - e.clientX;
-            const minWidth = 260;
-            const maxWidth = Math.min(720, Math.floor(window.innerWidth * 0.7));
-            setDebugPanelWidth(Math.max(minWidth, Math.min(maxWidth, newWidth)));
-        };
-
-        const handleMouseUp = () => {
-            setIsResizingDebugPanel(false);
-        };
-
-        document.addEventListener('mousemove', handleMouseMove);
-        document.addEventListener('mouseup', handleMouseUp);
-
+        document.addEventListener('mousemove', handleDebugPanelMouseMove);
+        document.addEventListener('mouseup', handleDebugPanelMouseUp);
         return () => {
-            document.removeEventListener('mousemove', handleMouseMove);
-            document.removeEventListener('mouseup', handleMouseUp);
+            document.removeEventListener('mousemove', handleDebugPanelMouseMove);
+            document.removeEventListener('mouseup', handleDebugPanelMouseUp);
         };
-    }, [isResizingDebugPanel]);
+    }, [isResizingDebugPanel, handleDebugPanelMouseMove, handleDebugPanelMouseUp]);
 
     // SFC Data with Error Boundary
+    // NOTE: parseSFC and analyzeSFC are pure functions with no side effects or mutation of inputs
     const sfcNodes = useMemo(() => {
         try {
             return parseSFC(code);
@@ -721,7 +838,17 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     }, [code]);
 
     // Diagnostics computed from parsed SFC + source code
+    // NOTE: analyzeSFC is expected to be a pure function with no side effects or input mutation
     const diagnostics = useMemo(() => analyzeSFC(sfcNodes, code), [sfcNodes, code]);
+
+    // cache resolved state values for performance
+    const stateValuesMap = useMemo(() => {
+        const map = new Map<string, number | undefined>();
+        sfcNodes.forEach(node => {
+            map.set(node.id, resolveStateValue(code, node.id));
+        });
+        return map;
+    }, [sfcNodes, code]);
 
 
     // Initialize Engine Devices
@@ -790,8 +917,9 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
                     savedAt
                 }));
                 setDraftMeta(prev => ({ ...prev, hasDraft: true, savedAt }));
-            } catch {
-                // Ignore storage errors
+            } catch (e) {
+                console.error('Failed to save draft:', e);
+                setConsoleOutput(prev => [...prev, '> Warning: Draft could not be saved.']);
             }
         }, 30000);
 
@@ -807,8 +935,9 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
                     tickRate,
                     savedAt: Date.now()
                 }));
-            } catch {
-                // Ignore storage errors
+            } catch (e) {
+                console.error('Failed to save draft:', e);
+                setConsoleOutput(prev => [...prev, '> Warning: Draft could not be saved.']);
             }
         };
 
@@ -817,9 +946,12 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     }, [selectedDeviceId, code, tickRate]);
 
     useEffect(() => {
-        engine.subscribeToDebug((state) => {
+        const unsubscribe = engine.subscribeToDebug((state) => {
             setDebugState(state);
         });
+        return () => {
+            if (typeof unsubscribe === 'function') unsubscribe();
+        };
     }, []);
 
     useEffect(() => {
@@ -852,115 +984,15 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     }, []);
 
     useEffect(() => {
-        const activeDebugTarget = debugState.activeDeviceId === selectedDeviceId;
-        const onKeyDown = (e: KeyboardEvent) => {
-            const isUndoCombo = (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z';
-            const isRedoCombo = (e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'));
-
-            if (isUndoCombo) {
-                e.preventDefault();
-                undoCodeChange();
-                return;
-            }
-
-            if (isRedoCombo) {
-                e.preventDefault();
-                redoCodeChange();
-                return;
-            }
-
-            if (viewMode === 'sfc') {
-                const target = e.target as HTMLElement | null;
-                const inTextField = !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
-                if (inTextField) return;
-
-                if (e.key === 'Escape') {
-                    clearSFCSelection();
-                    if (reconnectDrag.active) {
-                        setReconnectDrag({ active: false, startX: 0, startY: 0, cursorX: 0, cursorY: 0 });
-                    }
-                    return;
-                }
-
-                if (!selectedTransition.nodeId || selectedTransition.idx === undefined) return;
-
-                const key = e.key.toLowerCase();
-                if (key === 'e') {
-                    e.preventDefault();
-                    runTransitionAction('edit');
-                    return;
-                }
-                if (key === 't') {
-                    e.preventDefault();
-                    runTransitionAction('retarget');
-                    return;
-                }
-                if (key === 'i') {
-                    e.preventDefault();
-                    runTransitionAction('insert');
-                    return;
-                }
-                if (key === 'n') {
-                    e.preventDefault();
-                    runTransitionAction('normalize');
-                    return;
-                }
-                if (key === 'p') {
-                    e.preventDefault();
-                    runTransitionAction('set-priority');
-                    return;
-                }
-                if (e.key === 'Delete' || e.key === 'Backspace') {
-                    e.preventDefault();
-                    runTransitionAction('delete');
-                    return;
-                }
-            }
-
-            if (viewMode !== 'code') return;
-
-            if (e.key === 'F9') {
-                e.preventDefault();
-                let line = debugState.currentLine;
-                if (editorRef.current) {
-                    const text = editorRef.current.value;
-                    const cursorPos = editorRef.current.selectionStart || 0;
-                    line = text.slice(0, cursorPos).split('\n').length;
-                }
-                if (line > 0) toggleBreakpoint(line);
-                return;
-            }
-
-            if (e.key === 'F5') {
-                e.preventDefault();
-                if (!debugState.isRunning) {
-                    handleRun();
-                } else if (debugState.isPaused) {
-                    engine.resume();
-                } else {
-                    engine.pause(selectedDeviceId);
-                }
-                return;
-            }
-
-            if (e.key === 'F10') {
-                e.preventDefault();
-                if (debugState.isPaused && activeDebugTarget) {
-                    engine.stepOver();
-                }
-            }
-        };
-
         window.addEventListener('keydown', onKeyDown);
         return () => window.removeEventListener('keydown', onKeyDown);
-    }, [viewMode, debugState.isRunning, debugState.isPaused, debugState.currentLine, debugState.activeDeviceId, selectedDeviceId, code, selectedTransition, normalizeStepSize, sfcNodes, selectedSteps, reconnectDrag.active]);
+    }, [onKeyDown]);
 
     useEffect(() => {
         if (!transitionContextMenu.isOpen && !stepContextMenu.isOpen && !canvasContextMenu.isOpen) return;
-        const close = () => closeAllSFCMenus();
-        window.addEventListener('click', close);
-        return () => window.removeEventListener('click', close);
-    }, [transitionContextMenu.isOpen, stepContextMenu.isOpen, canvasContextMenu.isOpen]);
+        window.addEventListener('click', handleWindowClick);
+        return () => window.removeEventListener('click', handleWindowClick);
+    }, [transitionContextMenu.isOpen, stepContextMenu.isOpen, canvasContextMenu.isOpen, handleWindowClick]);
 
     useEffect(() => {
         if (!selectedTransition.nodeId || selectedTransition.idx === undefined) return;
@@ -982,9 +1014,18 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
     // Detect state variable name used in the ST source (e.g. `state`, `CurrentState`)
     const detectedStateVar = useMemo(() => {
-        const m1 = code.match(/IF\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*STATE_\w+/i);
-        const m2 = code.match(/([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*STATE_\w+/i);
-        return (m1 && m1[1]) || (m2 && m2[1]) || 'state';
+        const stateVars = new Set<string>();
+        for (const m of code.matchAll(/IF\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*STATE_\w+/gi)) {
+            stateVars.add(m[1]);
+        }
+        for (const m of code.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*STATE_\w+/gi)) {
+            stateVars.add(m[1]);
+        }
+        if (stateVars.size > 1) {
+            console.warn('Multiple state variables detected. Using first one.');
+        }
+        if (stateVars.size === 0) return 'state';
+        return stateVars.values().next().value!;
     }, [code]);
 
     // Update transition trace when debugger reports a new state value for the selected device
@@ -1046,7 +1087,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     const handleRun = () => {
         setIsCompiling(true);
         setConsoleOutput(prev => [...prev, `> Compiling logic for ${selectedDeviceId}...`]);
-        setTimeout(() => {
+        if (compileTimeoutRef.current) {
+            clearTimeout(compileTimeoutRef.current);
+        }
+        compileTimeoutRef.current = setTimeout(() => {
             handleSave();
             const result = engine.compile(selectedDeviceId, code);
             if (result.success) {
@@ -1056,6 +1100,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
                 setConsoleOutput(prev => [...prev, `> Error: ${result.error}`]);
             }
             setIsCompiling(false);
+            compileTimeoutRef.current = null;
         }, 500);
     };
 
@@ -1112,9 +1157,10 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
         const container = sfcContainerRef.current;
         if (!container) return { x: 0, y: 0 };
         const rect = container.getBoundingClientRect();
+        const zoomFactor = Math.max(0.25, zoomLevel / 100);
         return {
-            x: e.clientX - rect.left + container.scrollLeft,
-            y: e.clientY - rect.top + container.scrollTop
+            x: (e.clientX - rect.left + container.scrollLeft) / zoomFactor,
+            y: (e.clientY - rect.top + container.scrollTop) / zoomFactor
         };
     };
 
@@ -1322,120 +1368,99 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     };
 
     const deleteTransition = (node: SFCNode, transIdx: number) => {
-        if (!window.confirm('Delete this transition? This action cannot be undone.')) return;
-
-        const lines = code.split('\n');
-        const trans = node.transitions[transIdx];
-
-        // Remove the transition block from code
-        lines.splice(trans.lineIndex, trans.blockEndIndex - trans.lineIndex + 1);
-
-        setCode(lines.join('\n'));
-        setIsDirty(true);
-        setConsoleOutput(prev => [...prev, `> Deleted transition from ${node.id}`]);
+        // show confirmation dialog via modal, encode transition info in nodeId
+        setDeleteModal({
+            isOpen: true,
+            nodeId: `${node.id}:${transIdx}`,
+            label: `transition from ${node.label}`
+        });
     };
 
     const saveActionList = () => {
-        const node = sfcNodes.find(n => n.id === actionEditor.nodeId);
-        if (!node) return;
+        const actions = actionEditor.actions;
+        const stepId = actionEditor.nodeId;
+        if (!stepId) return;
 
-        const lines = code.split('\n');
-        const transitionsText = node.transitions.map(t => t.fullText);
+        setCode(prev => {
+            const nodes = parseSFC(prev);
+            const n = nodes.find(n => n.id === stepId);
+            if (!n) return prev;
+            const lines = prev.split('\n');
+            const transitionsText = n.transitions.map(t => t.fullText);
 
-        const newActionLines: string[] = [];
+            const newActionLines: string[] = [];
 
-        // Group actions by qualifier type for proper execution order
-        const p1Actions = actionEditor.actions.filter(a => a.qualifier === 'P1');
-        const normalActions = actionEditor.actions.filter(a => !['P1', 'P0'].includes(a.qualifier));
-        const p0Actions = actionEditor.actions.filter(a => a.qualifier === 'P0');
+            const p1Actions = actions.filter(a => a.qualifier === 'P1');
+            const normalActions = actions.filter(a => !['P1', 'P0'].includes(a.qualifier));
+            const p0Actions = actions.filter(a => a.qualifier === 'P0');
 
-        // Generate code for P1 actions (execute once on step entry)
-        p1Actions.forEach((act) => {
-            if (!act.code.trim()) return;
-
-            const qualifierPrefix = `(* Q:P1 *)`;
-            const codeLines = act.code.split('\n');
-
-            // Wrap P1 code in stepTime check to execute only on first cycle(s)
-            newActionLines.push(`   ${qualifierPrefix} IF stepTime < 100 THEN`);
-            codeLines.forEach((codeLine) => {
-                const trimmed = codeLine.trim();
-                if (!trimmed) return;
-                newActionLines.push(`       ${trimmed};`);
-            });
-            newActionLines.push(`   END_IF;`);
-        });
-
-        // Generate code for normal actions (N, S, R, L, D, P, DS, SL)
-        normalActions.forEach((act) => {
-            if (!act.code.trim()) return;
-
-            // Build qualifier prefix for this action
-            let qualifierPrefix = `(* Q:${act.qualifier}`;
-            if (TIME_QUALIFIERS.includes(act.qualifier) && act.time) {
-                const t = act.time.startsWith('T#') ? act.time : `T#${act.time}`;
-                qualifierPrefix += ` T:${t}`;
-            }
-            qualifierPrefix += ` *)`;
-
-            const codeLines = act.code.split('\n');
-            codeLines.forEach((codeLine, lineIdx) => {
-                const trimmed = codeLine.trim();
-                if (!trimmed) return;
-
-                // First line of action gets the qualifier prefix
-                if (lineIdx === 0) {
-                    newActionLines.push(`   ${qualifierPrefix} ${trimmed};`);
-                } else {
-                    // Subsequent lines are indented code without qualifier
-                    newActionLines.push(`   ${trimmed};`);
-                }
-            });
-        });
-
-        // Generate code for P0 actions (execute once just before leaving step)
-        // P0 executes when any transition condition is true
-        if (p0Actions.length > 0 && node.transitions.length > 0) {
-            // Build combined condition: any transition is about to fire
-            const allTransitionConditions = node.transitions.map(t => `(${t.condition})`).join(' OR ');
-
-            newActionLines.push(`   (* P0 Actions - Execute on step exit *)`);
-            newActionLines.push(`   IF (${allTransitionConditions}) THEN`);
-
-            p0Actions.forEach((act) => {
+            p1Actions.forEach((act) => {
                 if (!act.code.trim()) return;
-
-                const qualifierPrefix = `(* Q:P0 *)`;
+                const qualifierPrefix = `(* Q:P1 *)`;
                 const codeLines = act.code.split('\n');
+                newActionLines.push(`   ${qualifierPrefix} IF stepTime < 100 THEN`);
+                codeLines.forEach((codeLine) => {
+                    const trimmed = codeLine.trim();
+                    if (!trimmed) return;
+                    newActionLines.push(`       ${trimmed};`);
+                });
+                newActionLines.push(`   END_IF;`);
+            });
 
+            normalActions.forEach((act) => {
+                if (!act.code.trim()) return;
+                let qualifierPrefix = `(* Q:${act.qualifier}`;
+                if (TIME_QUALIFIERS.includes(act.qualifier) && act.time) {
+                    const t = act.time.startsWith('T#') ? act.time : `T#${act.time}`;
+                    qualifierPrefix += ` T:${t}`;
+                }
+                qualifierPrefix += ` *)`;
+                const codeLines = act.code.split('\n');
                 codeLines.forEach((codeLine, lineIdx) => {
                     const trimmed = codeLine.trim();
                     if (!trimmed) return;
-
                     if (lineIdx === 0) {
-                        newActionLines.push(`       ${qualifierPrefix} ${trimmed};`);
+                        newActionLines.push(`   ${qualifierPrefix} ${trimmed};`);
                     } else {
-                        newActionLines.push(`       ${trimmed};`);
+                        newActionLines.push(`   ${trimmed};`);
                     }
                 });
             });
 
-            newActionLines.push(`   END_IF;`);
-        } else if (p0Actions.length > 0) {
-            // If no transitions defined, P0 actions won't execute (add as comment)
-            newActionLines.push(`   (* Warning: P0 actions defined but no transitions exist *)`);
-        }
+            if (p0Actions.length > 0 && n.transitions.length > 0) {
+                const allTransitionConditions = n.transitions.map(t => `(${t.condition})`).join(' OR ');
+                newActionLines.push(`   (* P0 Actions - Execute on step exit *)`);
+                newActionLines.push(`   IF (${allTransitionConditions}) THEN`);
+                p0Actions.forEach((act) => {
+                    if (!act.code.trim()) return;
+                    const qualifierPrefix = `(* Q:P0 *)`;
+                    const codeLines = act.code.split('\n');
+                    codeLines.forEach((codeLine, lineIdx) => {
+                        const trimmed = codeLine.trim();
+                        if (!trimmed) return;
+                        if (lineIdx === 0) {
+                            newActionLines.push(`       ${qualifierPrefix} ${trimmed};`);
+                        } else {
+                            newActionLines.push(`       ${trimmed};`);
+                        }
+                    });
+                });
+                newActionLines.push(`   END_IF;`);
+            } else if (p0Actions.length > 0) {
+                newActionLines.push(`   (* Warning: P0 actions defined but no transitions exist *)`);
+            }
 
-        const newBodyLines = [
-            ...newActionLines,
-            '',
-            ...transitionsText
-        ];
+            const newBodyLines = [
+                ...newActionLines,
+                '',
+                ...transitionsText
+            ];
 
-        const deleteCount = (node.stepEndLine - node.stepStartLine);
-        lines.splice(node.stepStartLine + 1, deleteCount, ...newBodyLines);
+            const deleteCount = (n.stepEndLine - n.stepStartLine);
+            lines.splice(n.stepStartLine + 1, deleteCount, ...newBodyLines);
 
-        setCode(lines.join('\n'));
+            return lines.join('\n');
+        });
         setIsDirty(true);
         setActionEditor({ isOpen: false, nodeId: '', actions: [] });
     };
@@ -1537,7 +1562,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
             // handle priority change from modal if provided
             if (typeof editModal.priority === 'number') {
-                const currentPriority = trans.priority;
+
                 const desired = Math.max(0, Math.floor(editModal.priority));
                 // If desired equals another transition's priority, show validation and don't apply here
                 const conflict = node.transitions.some((t, i) => i !== editModal.transitionIdx && t.priority === desired);
@@ -1600,25 +1625,27 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
     const handleAddStep = () => {
         if (!newStepName) return;
         const stepName = `STATE_${newStepName.toUpperCase().replace(/\s+/g, '_')}`;
-        let maxId = 0;
-        const matches = code.matchAll(/STATE_\w+\s*:\s*INT\s*:=\s*(\d+)/g);
-        for (const m of matches) maxId = Math.max(maxId, parseInt(m[1]));
-        const newId = maxId + 1;
-        let newCode = code.replace(/END_VAR/, `  ${stepName} : INT := ${newId};\nEND_VAR`);
-        const lastEndIf = newCode.lastIndexOf('END_IF;');
-        if (lastEndIf > 0) {
-            const block = `
+        setCode(prev => {
+            let maxId = 0;
+            const matches = prev.matchAll(/STATE_\w+\s*:\s*INT\s*:=\s*(\d+)/g);
+            for (const m of matches) maxId = Math.max(maxId, parseInt(m[1]));
+            const newId = maxId + 1;
+            let newCode = prev.replace(/END_VAR/, `  ${stepName} : INT := ${newId};\nEND_VAR`);
+            const lastEndIf = newCode.lastIndexOf('END_IF;');
+            if (lastEndIf > 0) {
+                const block = `
 ELSIF ${detectedStateVar} = ${stepName} THEN
    (* Actions for ${newStepName} *)
    (* Q:N *) ;
 `;
-            newCode = newCode.slice(0, lastEndIf) + block + newCode.slice(lastEndIf);
-            setCode(newCode);
-            setIsDirty(true);
-            setAddModal({ ...addModal, isOpen: false });
-            setNewStepName('');
-            setConsoleOutput(prev => [...prev, `> Added Step: ${stepName}`]);
-        }
+                newCode = newCode.slice(0, lastEndIf) + block + newCode.slice(lastEndIf);
+            }
+            return newCode;
+        });
+        setIsDirty(true);
+        setAddModal({ ...addModal, isOpen: false });
+        setNewStepName('');
+        setConsoleOutput(prev => [...prev, `> Added Step: ${stepName}`]);
     };
 
     const handleAddTransition = () => {
@@ -1627,35 +1654,37 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
         const pendingNewTarget = newTransTarget === '__NEW_STEP__';
         if (pendingNewTarget && !newTransTargetStepName.trim()) return;
 
-        const node = sfcNodes.find(n => n.id === addModal.sourceId);
-        if (!node) return;
+        let assignedPriority = 0;
+        setCode(prev => {
+            let workingCode = prev;
+            let targetStateId = newTransTarget;
+            if (pendingNewTarget) {
+                const createdId = createUniqueStateId(workingCode, newTransTargetStepName);
+                if (!createdId) return prev;
+                targetStateId = createdId;
+            }
+            const nodes = parseSFC(workingCode);
+            const node = nodes.find(n => n.id === addModal.sourceId);
+            if (!node) return prev;
+            const lines = workingCode.split('\n');
+            const insertIdx = node.stepEndLine + 1;
+            const maxExistingPriority = node.transitions.length > 0 ? Math.max(...node.transitions.map(t => t.priority || 0)) : 0;
+            assignedPriority = maxExistingPriority + Math.max(1, Math.floor(newTransitionPriorityStep || 10));
+            const transCode = `   (* PRI: ${assignedPriority} *) IF ${newTransCond} THEN ${detectedStateVar} := ${targetStateId}; END_IF;`;
+            lines.splice(insertIdx, 0, transCode);
 
-        let workingCode = code;
-        let targetStateId = newTransTarget;
-        if (pendingNewTarget) {
-            const createdId = createUniqueStateId(workingCode, newTransTargetStepName);
-            if (!createdId) return;
-            targetStateId = createdId;
-        }
-
-        const lines = workingCode.split('\n');
-        const insertIdx = node.stepEndLine + 1;
-        const maxExistingPriority = node.transitions.length > 0 ? Math.max(...node.transitions.map(t => t.priority || 0)) : 0;
-        const assignedPriority = maxExistingPriority + Math.max(1, Math.floor(newTransitionPriorityStep || 10));
-        const transCode = `   (* PRI: ${assignedPriority} *) IF ${newTransCond} THEN ${detectedStateVar} := ${targetStateId}; END_IF;`;
-        lines.splice(insertIdx, 0, transCode);
-
-        let nextCode = lines.join('\n');
-        if (pendingNewTarget) {
-            nextCode = insertStateConstant(nextCode, targetStateId);
-        }
-
-        setCode(nextCode);
+            let nextCode = lines.join('\n');
+            if (pendingNewTarget) {
+                nextCode = insertStateConstant(nextCode, targetStateId);
+            }
+            return nextCode;
+        });
         setIsDirty(true);
         setAddModal({ ...addModal, isOpen: false });
         setNewTransTarget('');
         setNewTransTargetStepName('');
-        setConsoleOutput(prev => [...prev, `> Added Transition: ${node.label} -> ${targetStateId.replace('STATE_', '')} (PRI ${assignedPriority})`]);
+        setNewTransCond('TRUE');
+        setConsoleOutput(prev => [...prev, `> Added Transition for ${addModal.sourceId} (PRI ${assignedPriority})`]);
     };
 
     const handleOpenRetargetTransition = (node: SFCNode, transIdx: number) => {
@@ -1735,7 +1764,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
         for (const m of matches) maxId = Math.max(maxId, parseInt(m[1], 10));
         const newStateValue = maxId + 1;
 
-        const endVarIdx = lines.findIndex(l => /^\s*END_VAR;\s*$/i.test(l.trim()));
+        const endVarIdx = lines.findIndex(l => /^\s*END_VAR;?\s*$/i.test(l.trim()));
         if (endVarIdx >= 0) {
             lines.splice(endVarIdx, 0, `  ${newStateId} : INT := ${newStateValue};`);
         }
@@ -1814,6 +1843,23 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
 
     const confirmDeleteStep = () => {
         if (!deleteModal.nodeId) return setDeleteModal({ isOpen: false, nodeId: undefined });
+        if (deleteModal.nodeId.includes(':')) {
+            const [nodeId, idxStr] = deleteModal.nodeId.split(':');
+            const idx = parseInt(idxStr, 10);
+            const node = sfcNodes.find(n => n.id === nodeId);
+            if (node && !isNaN(idx) && idx >= 0 && idx < node.transitions.length) {
+                setCode(prev => {
+                    const lines = prev.split('\n');
+                    const t = node.transitions[idx];
+                    lines.splice(t.lineIndex, t.blockEndIndex - t.lineIndex + 1);
+                    return lines.join('\n');
+                });
+                setIsDirty(true);
+                setConsoleOutput(prev => [...prev, `> Deleted transition from ${nodeId}`]);
+            }
+            setDeleteModal({ isOpen: false, nodeId: undefined });
+            return;
+        }
         const node = sfcNodes.find(n => n.id === deleteModal.nodeId);
         if (!node) return setDeleteModal({ isOpen: false, nodeId: undefined });
         const newCode = removeStateFromCode(code, node.id, detectedStateVar);
@@ -1838,88 +1884,90 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
 
 
     const moveTransitionInCode = (nodeId: string, idx: number, direction: 'up' | 'down') => {
-        const nodes = parseSFC(code);
-        const node = nodes.find(n => n.id === nodeId);
-        if (!node) return;
-        const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
-        if (targetIdx < 0 || targetIdx >= node.transitions.length) return;
-        const newCode = reorderTransitionBlocks(code, nodeId, idx, targetIdx);
-        setCode(newCode);
+        setCode(prev => {
+            const nodes = parseSFC(prev);
+            const node = nodes.find(n => n.id === nodeId);
+            if (!node) return prev;
+            const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
+            if (targetIdx < 0 || targetIdx >= node.transitions.length) return prev;
+            return reorderTransitionBlocks(prev, nodeId, idx, targetIdx);
+        });
         setIsDirty(true);
-        setConsoleOutput(prev => [...prev, `> Reordered transitions for ${node.label}`]);
+        setConsoleOutput(prev => [...prev, `> Reordered transitions for ${nodeId}`]);
     };
 
     // Update a transition's explicit priority in the ST source (inserts or updates a `(* PRI: N *)` comment)
     const updateTransitionPriority = (nodeId: string, transIdx: number, newPriority: number) => {
-        const nodes = parseSFC(code);
-        const node = nodes.find(n => n.id === nodeId);
-        if (!node) return;
-        const trans = node.transitions[transIdx];
-        if (!trans) return;
+        let msgNodeLabel: string | undefined;
+        let msgTarget: string | undefined;
+        setCode(prev => {
+            const nodes = parseSFC(prev);
+            const node = nodes.find(n => n.id === nodeId);
+            if (!node) return prev;
+            const trans = node.transitions[transIdx];
+            if (!trans) return prev;
+            msgNodeLabel = node.label;
+            msgTarget = trans.target.replace('STATE_', '');
+            const lines = prev.split('\n');
+            const start = trans.lineIndex;
+            const end = trans.blockEndIndex;
+            const blockLines = lines.slice(start, end + 1);
+            const blockText = blockLines.join('\n');
 
-        const lines = code.split('\n');
-        const start = trans.lineIndex;
-        const end = trans.blockEndIndex;
-        const blockLines = lines.slice(start, end + 1);
-        const blockText = blockLines.join('\n');
-
-        const priRe = /\(\*\s*PRI(?:ORITY)?\s*:\s*\d+\s*\*\)/i;
-        if (priRe.test(blockText)) {
-            // replace existing PRI in the block
-            const newBlockText = blockText.replace(priRe, `(* PRI: ${newPriority} *)`);
-            const newBlockLines = newBlockText.split('\n');
-            lines.splice(start, end - start + 1, ...newBlockLines);
-        } else {
-            // insert PRI comment before the block start
-            lines.splice(start, 0, `   (* PRI: ${newPriority} *)`);
-        }
-
-        setCode(lines.join('\n'));
+            const priRe = /\(\*\s*PRI(?:ORITY)?\s*:\s*\d+\s*\*\)/i;
+            if (priRe.test(blockText)) {
+                const newBlockText = blockText.replace(priRe, `(* PRI: ${newPriority} *)`);
+                const newBlockLines = newBlockText.split('\n');
+                lines.splice(start, end - start + 1, ...newBlockLines);
+            } else {
+                lines.splice(start, 0, `   (* PRI: ${newPriority} *)`);
+            }
+            return lines.join('\n');
+        });
         setIsDirty(true);
-        setConsoleOutput(prev => [...prev, `> Set priority ${newPriority} on transition ${node.label} -> ${trans.target.replace('STATE_', '')}`]);
+        setConsoleOutput(prev => [...prev, `> Set priority ${newPriority} on transition ${msgNodeLabel || nodeId}${msgTarget ? ' -> ' + msgTarget : ''}`]);
     };
 
     // Replace all transition priorities for a node in one pass (used by auto-resolve)
     const setNodeTransitionPriorities = (nodeId: string, newPriorities: number[]) => {
-        const nodes = parseSFC(code);
-        const node = nodes.find(n => n.id === nodeId);
-        if (!node) return;
-        const lines = code.split('\n');
-        const start = node.stepStartLine + 1;
-        const end = node.stepEndLine;
-        // collect action lines (non-transition lines inside the step)
-        const actionLines: string[] = [];
-        let i = start;
-        while (i <= end) {
-            const inTransition = node.transitions.some(t => i >= t.lineIndex && i <= t.blockEndIndex);
-            if (inTransition) {
-                // skip the whole transition block
-                const t = node.transitions.find(t => i >= t.lineIndex && i <= t.blockEndIndex) as any;
-                i = (t.blockEndIndex || i) + 1;
-                continue;
+        setCode(prev => {
+            const nodes = parseSFC(prev);
+            const node = nodes.find(n => n.id === nodeId);
+            if (!node) return prev;
+            const lines = prev.split('\n');
+            const start = node.stepStartLine + 1;
+            const end = node.stepEndLine;
+            // collect action lines (non-transition lines inside the step)
+            const actionLines: string[] = [];
+            let i = start;
+            while (i <= end) {
+                const inTransition = node.transitions.some(t => i >= t.lineIndex && i <= t.blockEndIndex);
+                if (inTransition) {
+                    const t = node.transitions.find(t => i >= t.lineIndex && i <= t.blockEndIndex) as any;
+                    i = (t.blockEndIndex || i) + 1;
+                    continue;
+                }
+                actionLines.push(lines[i].trim());
+                i++;
             }
-            actionLines.push(lines[i].trim());
-            i++;
-        }
 
-        const transitionsText = node.transitions.map((t, idx) => {
-            // remove existing PRI comments from block text
-            const blockText = t.fullText.replace(/\(\*\s*PRI(?:ORITY)?\s*:\s*\d+\s*\*\)/i, '').trim();
-            const pri = newPriorities[idx];
-            return `   (* PRI: ${pri} *) ${blockText}`;
+            const transitionsText = node.transitions.map((t, idx) => {
+                const blockText = t.fullText.replace(/\(\*\s*PRI(?:ORITY)?\s*:\s*\d+\s*\*\)/i, '').trim();
+                const pri = newPriorities[idx];
+                return `   (* PRI: ${pri} *) ${blockText}`;
+            });
+
+            const newBodyLines = [
+                ...actionLines.filter(l => l !== ''),
+                '',
+                ...transitionsText
+            ];
+
+            lines.splice(node.stepStartLine + 1, node.stepEndLine - node.stepStartLine, ...newBodyLines);
+            return lines.join('\n');
         });
-
-        const newBodyLines = [
-            ...actionLines.filter(l => l !== ''),
-            '',
-            ...transitionsText
-        ];
-
-        // Replace the step body in the original lines array
-        lines.splice(node.stepStartLine + 1, node.stepEndLine - node.stepStartLine, ...newBodyLines);
-        setCode(lines.join('\n'));
         setIsDirty(true);
-        setConsoleOutput(prev => [...prev, `> Reassigned priorities for ${node.label}`]);
+        setConsoleOutput(prev => [...prev, `> Reassigned priorities for ${nodeId}`]);
     };
 
     // Normalize priorities for a step to tidy spacing (10,20,30...)
@@ -1938,6 +1986,25 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
     const applyEditPriority = (applyValue?: number) => {
         if (!editingPriority.nodeId || editingPriority.idx === undefined) return setEditingPriority({});
         const v = applyValue !== undefined ? applyValue : editingPriority.value || 0;
+        const node = sfcNodes.find(n => n.id === editingPriority.nodeId);
+
+        if (applyValue === undefined && node) {
+            // auto-resolve duplicate priorities across this node
+            const priorities = node.transitions.map(t => t.priority);
+            priorities[editingPriority.idx] = v;
+            const used = new Set<number>();
+            const resolved: number[] = [];
+            for (const p of priorities) {
+                let candidate = p > 0 ? p : 1;
+                while (used.has(candidate)) candidate++;
+                used.add(candidate);
+                resolved.push(candidate);
+            }
+            setNodeTransitionPriorities(node.id, resolved);
+            setEditingPriority({});
+            return;
+        }
+
         updateTransitionPriority(editingPriority.nodeId, editingPriority.idx, Math.max(0, Math.floor(Number(v))));
         setEditingPriority({});
     };
@@ -1970,7 +2037,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
             }
             const standstillVal = maxStateVal >= 0 ? maxStateVal + 1 : 1;
 
-            const varBlock = /VAR([\s\S]*?)END_VAR;/m.exec(nextCode);
+            const varBlock = /VAR([\s\S]*?)END_VAR;?/m.exec(nextCode);
             if (varBlock) {
                 const full = varBlock[0];
                 const body = varBlock[1];
@@ -1990,7 +2057,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
             nextCode = nextCode.replace(initLineRe, `IF ${stateVar} = undefined THEN ${stateVar} := STATE_INITIAL; END_IF;`);
         } else {
             const lines = nextCode.split('\n');
-            const endVarIdx = lines.findIndex(l => /^\s*END_VAR;\s*$/i.test(l.trim()));
+            const endVarIdx = lines.findIndex(l => /^\s*END_VAR;?\s*$/i.test(l.trim()));
             if (endVarIdx >= 0) {
                 lines.splice(endVarIdx + 1, 0, '', `IF ${stateVar} = undefined THEN ${stateVar} := STATE_INITIAL; END_IF;`);
                 nextCode = lines.join('\n');
@@ -2037,7 +2104,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
             }
         }
         return null;
-    }, [debugState.variables, code, isActiveDebugTarget, debugState.isRunning]);
+    }, [debugState.variables, code, isActiveDebugTarget, debugState.isRunning, detectedStateVar]);
 
     // Auto-scroll to active state in SFC view
     useEffect(() => {
@@ -2428,8 +2495,9 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                             const nodeHasError = diagnostics.some(d => d.nodes?.includes(node.id) && d.severity === 'error');
                                             const nodeHasWarning = diagnostics.some(d => d.nodes?.includes(node.id) && d.severity === 'warning');
                                             const isForced = !!forcedSteps[node.id];
-                                            const activationCount = (() => { const v = resolveStateValue(code, node.id); if (v === undefined) return 0; return transitionTrace.filter(t => t.to === v && t.deviceId === selectedDeviceId).length; })();
-                                            const lastActivationAge = (() => { const v = resolveStateValue(code, node.id); if (v === undefined) return null; const entry = transitionTrace.find(t => t.to === v && t.deviceId === selectedDeviceId); return entry ? Date.now() - entry.timestamp : null; })();
+                                            const v = stateValuesMap.get(node.id);
+                                            const activationCount = v === undefined ? 0 : transitionTrace.filter(t => t.to === v && t.deviceId === selectedDeviceId).length;
+                                            const lastActivationAge = (() => { if (v === undefined) return null; const entry = transitionTrace.find(t => t.to === v && t.deviceId === selectedDeviceId); return entry ? Date.now() - entry.timestamp : null; })();
                                             return (
                                                 <div
                                                     key={node.id}
@@ -3042,7 +3110,7 @@ ELSIF ${detectedStateVar} = ${stepName} THEN
                                     style={{
                                         lineHeight: '24px',
                                         tabSize: 4,
-                                        MozTabSize: 4
+
                                     }}
                                 />
                             </div>

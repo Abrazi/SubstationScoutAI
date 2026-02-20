@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Icons } from './Icons';
 import { IEDNode, ClientTransaction } from '../types';
 import { engine } from '../services/SimulationEngine';
@@ -11,7 +11,16 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
   const [activeTab, setActiveTab] = useState<'iec61850' | 'modbus'>('iec61850');
   const [transactions, setTransactions] = useState<ClientTransaction[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
-    const [connectedTargetId, setConnectedTargetId] = useState<string | null>(null);
+  const [connectedTargetId, setConnectedTargetId] = useState<string | null>(null);
+  const timersRef = useRef<number[]>([]); // store setTimeout ids for cleanup
+
+  // when tab switches we clear connection state and logs
+  useEffect(() => {
+    setIsConnected(false);
+    setConnectionStatus('idle');
+    setConnectedTargetId(null);
+    setTransactions([]);
+  }, [activeTab]);
 
   // Common Connection State
   const [targetIP, setTargetIP] = useState('192.168.1.100');
@@ -29,7 +38,27 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
   const [mmsPath, setMmsPath] = useState('IED_Bay_01_Main/LD0/MMXU1.PhV.phsA.mag');
   const [mmsWriteValue, setMmsWriteValue] = useState('');
 
-    const modbusEndpoints = ieds
+  // -- validation helpers ---------------------------------------------------
+  const isValidIP = (raw: string) => {
+      if (!raw) return false;
+      const [host, port] = raw.split(':');
+      const ipRegex = /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+      if (!ipRegex.test(host)) return false;
+      if (port === undefined) return true;
+      const p = Number(port);
+      return !Number.isNaN(p) && p > 0 && p <= 65535;
+  };
+  const isValidPort = (p: number) => p > 0 && p <= 65535;
+  const isValidUnitId = (u: number) => u >= 1 && u <= 247;
+  const isValidMmsPath = (p: string) => p.trim().length > 0 && !/\s/.test(p);
+
+  // derived validity flags
+  const ipValid = isValidIP(targetIP);
+  const mbPortValid = isValidPort(mbPort);
+  const mbUnitValid = isValidUnitId(mbUnitId);
+  const mmsPathValid = isValidMmsPath(mmsPath);
+
+    const modbusEndpoints = useMemo(() => ieds
         .filter(ied => !!ied.config?.modbusMap)
         .map(ied => ({
             id: ied.id,
@@ -37,9 +66,9 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
             ip: ied.config?.ip || '0.0.0.0',
             port: ied.config?.modbusPort ?? 502,
             unitId: ied.config?.modbusUnitId ?? 1
-        }));
+        })), [ieds]);
 
-    const iecEndpoints = ieds
+    const iecEndpoints = useMemo(() => ieds
         .filter(ied => {
             const hasIecModel = Array.isArray(ied.children) && ied.children.length > 0;
             const isIecServer = (ied.config?.role ?? 'server') === 'server';
@@ -50,7 +79,7 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
             name: ied.name,
             ip: ied.config?.ip || '0.0.0.0',
             port: ied.config?.iecMmsPort ?? 102
-        }));
+        })), [ieds]);
 
   // Auto-scroll log
   useEffect(() => {
@@ -59,29 +88,40 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
     }
   }, [transactions]);
 
+  const MAX_LOG_ENTRIES = 200;
   const addLog = (type: 'request' | 'response' | 'error', protocol: 'Modbus' | 'MMS', details: string, value?: any, status: 'success' | 'timeout' | 'error' = 'success') => {
-      setTransactions(prev => [...prev, {
-          id: Date.now().toString(),
-          timestamp: new Date().toLocaleTimeString(),
-          type,
-          protocol,
-          details,
-          value,
-          status
-      }]);
+      setTransactions(prev => {
+          const entry: ClientTransaction = {
+              id: Date.now().toString(),
+              timestamp: new Date().toLocaleTimeString(),
+              type,
+              protocol,
+              details,
+              value,
+              status
+          };
+          const next = [...prev, entry];
+          if (next.length > MAX_LOG_ENTRIES) next.shift();
+          return next;
+      });
   };
 
   const handleConnect = () => {
       setConnectionStatus('connecting');
-      // Simulate network handshake
-      setTimeout(() => {
+      // simulate handshake and remember timer
+      const tid = window.setTimeout(() => {
           const target = activeTab === 'modbus'
               ? modbusEndpoints.find(ep =>
                     ep.ip === targetIP && ep.port === mbPort
                 )
-              : iecEndpoints.find(ep =>
-                    ep.ip === targetIP
-                );
+              : (() => {
+                    // allow specifying port in the IP field (e.g. "1.2.3.4:102")
+                    const [host, portStr] = targetIP.split(':');
+                    const portNum = portStr ? parseInt(portStr) : undefined;
+                    return iecEndpoints.find(ep =>
+                        ep.ip === host && (portNum === undefined ? true : ep.port === portNum)
+                    );
+                })();
           
           if (target) {
               setConnectionStatus('connected');
@@ -100,6 +140,7 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
               addLog('error', activeTab === 'modbus' ? 'Modbus' : 'MMS', `Connection Timeout: ${reason}`, undefined, 'timeout');
           }
       }, 800);
+      timersRef.current.push(tid);
   };
 
   const handleDisconnect = () => {
@@ -114,12 +155,16 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
           addLog('error', 'Modbus', 'Socket not connected', undefined, 'error');
           return;
       }
+      if (!mbUnitValid) {
+          addLog('error', 'Modbus', 'Invalid Unit ID', undefined, 'error');
+          return;
+      }
 
-      const reqStr = `FC:${mbFunction} Addr:${mbAddress} ${mbFunction === 6 || mbFunction === 5 ? `Val:${mbValue}` : ''}`;
+      const reqStr = `UID:${mbUnitId} FC:${mbFunction} Addr:${mbAddress} ${mbFunction === 6 || mbFunction === 5 ? `Val:${mbValue}` : ''}`;
       addLog('request', 'Modbus', `TX > ${reqStr}`);
 
       // Logic Execution
-      setTimeout(() => {
+      const tid = window.setTimeout(() => {
            const target = ieds.find(ied => ied.id === connectedTargetId);
            if (!target || !target.config?.modbusMap) {
                addLog('error', 'Modbus', 'Target is not an active Modbus slave endpoint', undefined, 'error');
@@ -166,6 +211,7 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
            }
 
       }, 200); // Network Latency
+      timersRef.current.push(tid);
   };
 
   const sendMmsRequest = (action: 'read' | 'write' | 'select') => {
@@ -173,11 +219,15 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
           addLog('error', 'MMS', 'Association not established', undefined, 'error');
           return;
       }
+      if (!mmsPathValid) {
+          addLog('error', 'MMS', 'Invalid object path', undefined, 'error');
+          return;
+      }
 
       const valDisplay = action === 'write' ? `=${mmsWriteValue}` : '';
       addLog('request', 'MMS', `TX > ${action.toUpperCase()} ${mmsPath}${valDisplay}`);
 
-       setTimeout(() => {
+       const tid = window.setTimeout(() => {
            // Resolve Target (Simulated)
            // In real logic, MMS path usually contains IED name "IED1/..." so we can route even if IP check is loose
            // But here we rely on the IP connection context
@@ -193,9 +243,9 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                } else if (action === 'write') {
                    // Type Inference
                    let valToWrite: any = mmsWriteValue;
-                   if (mmsWriteValue.toLowerCase() === 'true') valToWrite = true;
-                   else if (mmsWriteValue.toLowerCase() === 'false') valToWrite = false;
-                   else if (!isNaN(Number(mmsWriteValue)) && mmsWriteValue.trim() !== '') valToWrite = Number(mmsWriteValue);
+                   if (mmsWriteValue?.toLowerCase() === 'true') valToWrite = true;
+                   else if (mmsWriteValue?.toLowerCase() === 'false') valToWrite = false;
+                   else if (!isNaN(Number(mmsWriteValue)) && mmsWriteValue?.trim() !== '') valToWrite = Number(mmsWriteValue);
 
                    const res = engine.writeMMS(mmsPath, valToWrite, 'MasterClient');
                    if (res.success) {
@@ -215,7 +265,18 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                addLog('error', 'MMS', 'Service Error', undefined, 'error');
            }
        }, 300);
+      timersRef.current.push(tid);
   };
+
+
+  // cleanup pending timers
+  useEffect(() => {
+    return () => {
+      timersRef.current.forEach(id => clearTimeout(id));
+      timersRef.current = [];
+    };
+  }, []);
+
 
   return (
     <div className="h-full flex flex-col bg-scada-bg animate-in fade-in duration-300">
@@ -268,8 +329,11 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                             value={targetIP}
                             onChange={(e) => setTargetIP(e.target.value)}
                             disabled={isConnected}
-                            className="w-full bg-scada-panel border border-scada-border rounded px-3 py-2 text-white font-mono focus:border-scada-accent outline-none disabled:opacity-50"
+                            className={`w-full bg-scada-panel border rounded px-3 py-2 text-white font-mono focus:border-scada-accent outline-none disabled:opacity-50 ${!ipValid && targetIP ? 'border-scada-danger' : 'border-scada-border'}`}
                         />
+                        {!ipValid && (
+                            <p className="text-xs text-scada-danger">Enter valid IPv4 address (port optional)</p>
+                        )}
                     </div>
 
                     {!isConnected && activeTab === 'iec61850' && iecEndpoints.length > 0 && (
@@ -277,7 +341,7 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                             <label className="text-xs font-bold text-gray-400">Quick Select IEC Server</label>
                             <div className="relative">
                                 <select
-                                    value=""
+                                    value={undefined}
                                     onChange={(e) => {
                                         const endpoint = iecEndpoints.find(ep => ep.id === e.target.value);
                                         if (endpoint) {
@@ -305,8 +369,12 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                                     value={mbPort}
                                     onChange={(e) => setMbPort(parseInt(e.target.value))}
                                     disabled={isConnected}
-                                    className="w-full bg-scada-panel border border-scada-border rounded px-3 py-2 text-white font-mono focus:border-scada-accent outline-none disabled:opacity-50"
+                                    min={1} max={65535}
+                                    className={`w-full bg-scada-panel border rounded px-3 py-2 text-white font-mono focus:border-scada-accent outline-none disabled:opacity-50 ${!mbPortValid && String(mbPort) ? 'border-scada-danger' : 'border-scada-border'}`}
                                 />
+                                {!mbPortValid && (
+                                    <p className="text-xs text-scada-danger">Port must be 1–65535</p>
+                                )}
                             </div>
                             <div className="space-y-1">
                                 <label className="text-xs font-bold text-gray-400">Unit ID</label>
@@ -315,15 +383,19 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                                     value={mbUnitId}
                                     onChange={(e) => setMbUnitId(parseInt(e.target.value))}
                                     disabled={isConnected}
-                                    className="w-full bg-scada-panel border border-scada-border rounded px-3 py-2 text-white font-mono focus:border-scada-accent outline-none disabled:opacity-50"
+                                    className={`w-full bg-scada-panel border rounded px-3 py-2 text-white font-mono focus:border-scada-accent outline-none disabled:opacity-50 ${!mbUnitValid && String(mbUnitId) ? 'border-scada-danger' : 'border-scada-border'}`}
                                 />
+                            {!mbUnitValid && (
+                                <p className="text-xs text-scada-danger">Unit ID 1–247</p>
+                            )}
                             </div>
                         </div>
                     )}
 
                     <button 
                         onClick={isConnected ? handleDisconnect : handleConnect}
-                        className={`w-full py-2 rounded font-bold text-sm transition-colors flex items-center justify-center gap-2 ${isConnected ? 'bg-scada-danger text-white hover:bg-red-600' : 'bg-scada-success text-white hover:bg-emerald-600'}`}
+                        disabled={!ipValid || (activeTab === 'modbus' && !mbPortValid)}
+                        className={`w-full py-2 rounded font-bold text-sm transition-colors flex items-center justify-center gap-2 ${isConnected ? 'bg-scada-danger text-white hover:bg-red-600' : 'bg-scada-success text-white hover:bg-emerald-600'} ${(!ipValid || (activeTab === 'modbus' && !mbPortValid)) && 'opacity-50 cursor-not-allowed'}`}
                     >
                         {isConnected ? <Icons.Close className="w-4 h-4"/> : <Icons.Cable className="w-4 h-4"/>}
                         {isConnected ? 'Disconnect' : 'Connect'}
@@ -429,8 +501,11 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                                 onChange={(e) => setMmsPath(e.target.value)}
                                 placeholder="IED/LD/LN.DO.DA"
                                 disabled={!isConnected}
-                                className="w-full bg-scada-bg border border-scada-border rounded px-3 py-2 text-white font-mono text-xs focus:border-scada-accent outline-none disabled:opacity-50"
+                                className={`w-full bg-scada-bg border rounded px-3 py-2 text-white font-mono text-xs focus:border-scada-accent outline-none disabled:opacity-50 ${!mmsPathValid && mmsPath ? 'border-scada-danger' : 'border-scada-border'}`}
                             />
+                            {!mmsPathValid && (
+                                <p className="text-xs text-scada-danger">Path cannot be empty or contain spaces.</p>
+                            )}
                             <p className="text-[10px] text-scada-muted">Example: IED_Bay_01_Main/LD0/MMXU1.PhV.phsA.mag</p>
                         </div>
 
@@ -449,21 +524,21 @@ export const ClientMasterPanel: React.FC<ClientMasterPanelProps> = ({ ieds }) =>
                         <div className="grid grid-cols-2 gap-2 mt-4">
                             <button 
                                 onClick={() => sendMmsRequest('read')}
-                                disabled={!isConnected}
+                                disabled={!isConnected || !mmsPathValid}
                                 className="py-2 bg-scada-accent/10 border border-scada-accent/50 text-scada-accent rounded font-bold text-xs hover:bg-scada-accent/20 disabled:opacity-50"
                             >
                                 GetDataValues
                             </button>
                             <button 
                                 onClick={() => sendMmsRequest('select')}
-                                disabled={!isConnected}
+                                disabled={!isConnected || !mmsPathValid}
                                 className="py-2 bg-yellow-500/10 border border-yellow-500/50 text-yellow-500 rounded font-bold text-xs hover:bg-yellow-500/20 disabled:opacity-50"
                             >
                                 Select (SBO)
                             </button>
                             <button 
                                 onClick={() => sendMmsRequest('write')}
-                                disabled={!isConnected}
+                                disabled={!isConnected || !mmsPathValid}
                                 className="py-2 bg-purple-500/10 border border-purple-500/50 text-purple-400 rounded font-bold text-xs hover:bg-purple-500/20 disabled:opacity-50 col-span-2"
                             >
                                 SetDataValues (Write)

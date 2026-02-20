@@ -4,6 +4,14 @@ import { IEDNode, NetworkLink, NetworkNode, NetworkPacket } from '../types';
 import { Icons } from './Icons';
 import { engine } from '../services/SimulationEngine';
 
+// improved typing for VLAN configuration
+
+type VlanConfig = {
+  name: string;
+  color: string;
+  subnet: string;
+};
+
 interface NetworkTopologyProps {
   ieds: IEDNode[];
   onSelectIED: (id: string) => void;
@@ -14,33 +22,51 @@ interface NetworkTopologyProps {
 interface Packet {
   id: number;
   linkId: string;
-  path: string;
+  startX: number;
+  startY: number;
+  endX: number;
+  endY: number;
   color: string;
   progress: number;
 }
 
-// Network Configuration Constants
-const VLAN_CONFIG = {
-  10: { name: 'Station Bus (IEC 61850-8-1)', color: '#10b981', subnet: '10.0.10' }, // Emerald
-  20: { name: 'Process Bus (IEC 61850-9-2)', color: '#3b82f6', subnet: '10.0.20' }, // Blue
-  1:  { name: 'Management', color: '#64748b', subnet: '192.168.1' } // Slate
+// Article: VLAN Constitution Constants
+const VLAN_CONFIG: Record<number, VlanConfig> = {
+  10: { name: 'Station Bus (IEC 61850-8-1)', color: '#10b981', subnet: '10.0.10' },
+  20: { name: 'Process Bus (IEC 61850-9-2)', color: '#3b82f6', subnet: '10.0.20' },
+  1: { name: 'Management', color: '#64748b', subnet: '192.168.1' }
 };
 
 const MAX_ACTIVE_PACKETS = 120;
+const ANIMATION_SPEED = 2.4; // Made configurable
+const DRAG_THRESHOLD = 5; // pixels
 
-export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelectIED, onDeleteIED, simulationTime }) => {
-  // Configurable Core Switch State
+export const NetworkTopology: React.FC<NetworkTopologyProps> = ({
+  ieds,
+  onSelectIED,
+  onDeleteIED,
+  simulationTime
+}) => {
   const [switchConfig, setSwitchConfig] = useState({
-      ip: '10.0.0.1',
-      name: 'Core Switch (RSTP)'
+    ip: '10.0.0.1',
+    name: 'Core Switch (RSTP)'
   });
   const [isEditingSwitch, setIsEditingSwitch] = useState(false);
-  const [activeVlanFilter, setActiveVlanFilter] = useState<'all' | number>('all');
-    const [nodePositions, setNodePositions] = useState<Record<string, { x: number; y: number }>>({});
-    const [legendPos, setLegendPos] = useState({ x: 16, y: 16 });
-    const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
-    const [draggingLegend, setDraggingLegend] = useState(false);
-    const dragOffsetRef = useRef({ x: 0, y: 0 });
+  const [activeVlanFilter, setActiveVlanFilter] = useState<keyof typeof VLAN_CONFIG | 'all'>('all');
+  const [nodePositions, setNodePositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [legendPos, setLegendPos] = useState({ x: 16, y: 16 });
+  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null);
+  const [draggingLegend, setDraggingLegend] = useState(false);
+  const [dragStartPos, setDragStartPos] = useState<{ x: number; y: number } | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+
+  const dragOffsetRef = useRef({ x: 0, y: 0 });
+  const animationFrameRef = useRef<number | null>(null);
+  const animationCallbackRef = useRef<FrameRequestCallback | null>(null);
+  const packetsRef = useRef<Packet[]>([]);
+  const prevNodesRef = useRef<NetworkNode[]>([]);
+  const filterId = useMemo(() => `glow-${Math.random().toString(36).slice(2, 9)}`, []);
+
 
   // Transform IEDs into Network Nodes for visualization
   const { nodes, links } = useMemo(() => {
@@ -60,11 +86,12 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
     
     const iedNodes: NetworkNode[] = ieds.map((ied, index) => {
       // Logic: Use Config if available, else fallback to heuristic
-      let ip, vlanId;
+      let ip: string | undefined;
+      let vlanId: keyof typeof VLAN_CONFIG;
       
       if (ied.config) {
           ip = ied.config.ip;
-          vlanId = ied.config.vlan;
+          vlanId = ied.config.vlan as keyof typeof VLAN_CONFIG;
       } else {
           // Fallback heuristic
           const isProcessBus = index % 2 !== 0; 
@@ -78,7 +105,6 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
 
       if (!ip) {
           const config = VLAN_CONFIG[vlanId as keyof typeof VLAN_CONFIG];
-          const host = 100 + index;
           ip = `${config.subnet}.${100 + index}`;
       }
       
@@ -118,14 +144,20 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
         });
     }, [nodes, nodePositions]);
 
+    // only update positions when there are truly new nodes
     useEffect(() => {
-        setNodePositions(prev => {
-            const next: Record<string, { x: number; y: number }> = {};
-            nodes.forEach(node => {
-                next[node.id] = prev[node.id] || { x: node.x, y: node.y };
+        const prevIds = new Set(prevNodesRef.current.map(n => n.id));
+        const hasNew = nodes.some(n => !prevIds.has(n.id));
+        if (hasNew) {
+            setNodePositions(prev => {
+                const next: Record<string, { x: number; y: number }> = {};
+                nodes.forEach(node => {
+                    next[node.id] = prev[node.id] || { x: node.x, y: node.y };
+                });
+                return next;
             });
-            return next;
-        });
+        }
+        prevNodesRef.current = nodes;
     }, [nodes]);
 
     useEffect(() => {
@@ -164,73 +196,85 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
         };
     }, [draggingNodeId, draggingLegend]);
 
-  // Animation Loop (60fps)
-  useEffect(() => {
-    let animationFrameId: number;
+  // animation loop using refs to avoid stale closures and memory leaks
+  animationCallbackRef.current = () => {
+    // 1. Move packets (mutating ref for performance)
+    packetsRef.current = packetsRef.current
+      .map(p => ({ ...p, progress: p.progress + ANIMATION_SPEED }))
+      .filter(p => p.progress < 100);
 
-    const animate = () => {
-      // 1. Move packets
-      setPackets(prev => {
-        if (prev.length === 0) return prev;
-                return prev.map(p => ({ ...p, progress: p.progress + 2.4 })).filter(p => p.progress < 100);
-      });
+    // batch update state once per frame
+    setPackets([...packetsRef.current]);
 
-      // 2. Decay link activity
-      setLinkActivity(prev => {
-        const next = { ...prev };
-        let hasChanges = false;
+    // 2. decay link activity more efficiently
+    setLinkActivity(prev => {
+      const next: Record<string, number> = {};
+      let hasChanges = false;
 
-        Object.keys(next).forEach(key => {
-          if (next[key] > 0) {
-            next[key] = Math.max(0, next[key] - 0.03); // Fade out speed
-            hasChanges = true;
-          } else {
-             delete next[key];
-             hasChanges = true;
+      Object.entries(prev).forEach(([key, value]) => {
+        if (value > 0) {
+          const newValue = Math.max(0, value - 0.03);
+          if (newValue > 0 || value <= 0.03) {
+            next[key] = newValue;
           }
-        });
-
-        if (!hasChanges) return prev;
-        return next;
+          hasChanges = true;
+        }
       });
 
-      animationFrameId = requestAnimationFrame(animate);
-    };
+      return hasChanges ? next : prev;
+    });
 
-    animationFrameId = requestAnimationFrame(animate);
-    return () => cancelAnimationFrame(animationFrameId);
+    animationFrameRef.current = requestAnimationFrame(animationCallbackRef.current!);
+  };
+
+  useEffect(() => {
+    animationFrameRef.current = requestAnimationFrame(animationCallbackRef.current!);
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
   }, []);
 
   // Real Traffic Monitoring
   useEffect(() => {
       const handlePacket = (packet: NetworkPacket) => {
-          // Find source node by name (Packet source uses IED Name, Nodes use generated ID, but we mapped names)
           const sourceNode = positionedNodes.find(n => n.name === packet.source);
-          
-          if (sourceNode) {
-              const linkToSwitch = links.find(l => (l.sourceId === sourceNode.id && l.targetId === 'switch-01') || (l.sourceId === 'switch-01' && l.targetId === sourceNode.id));
-              
-              if (linkToSwitch) {
-                  // Determine direction: Source -> Switch
-                  const start = sourceNode;
-                  const end = positionedNodes.find(n => n.id === 'switch-01');
-                  
-                  if (start && end) {
-                      const color = packet.protocol === 'GOOSE' ? '#a855f7' : (packet.protocol === 'SV' ? '#3b82f6' : '#10b981'); 
-                      
-                      setPackets(prev => [...prev, {
-                          id: packet.id,
-                          linkId: linkToSwitch.id,
-                          path: `M ${start.x} ${start.y} L ${end.x} ${end.y}`,
-                          color: color,
-                          progress: 0
-                      }].slice(-MAX_ACTIVE_PACKETS));
-                      
-                      // Flash link
-                      setLinkActivity(prev => ({ ...prev, [linkToSwitch.id]: 1.0 }));
-                  }
-              }
+          if (!sourceNode) return;
+
+          const linkToSwitch = links.find(l => (
+              (l.sourceId === sourceNode.id && l.targetId === 'switch-01') ||
+              (l.sourceId === 'switch-01' && l.targetId === sourceNode.id)
+          ));
+          if (!linkToSwitch) return;
+
+          const end = positionedNodes.find(n => n.id === 'switch-01');
+          if (!end) return;
+
+          const color = packet.protocol === 'GOOSE'
+              ? '#a855f7'
+              : packet.protocol === 'SV'
+                  ? '#3b82f6'
+                  : '#10b981';
+
+          const newPacket: Packet = {
+              id: packet.id,
+              linkId: linkToSwitch.id,
+              startX: sourceNode.x,
+              startY: sourceNode.y,
+              endX: end.x,
+              endY: end.y,
+              color,
+              progress: 0
+          };
+
+          packetsRef.current.push(newPacket);
+          if (packetsRef.current.length > MAX_ACTIVE_PACKETS) {
+              packetsRef.current.shift();
           }
+          setPackets([...packetsRef.current]);
+
+          setLinkActivity(prev => ({ ...prev, [linkToSwitch.id]: 1.0 }));
       };
 
       const unsubscribe = engine.subscribeToTraffic(handlePacket);
@@ -335,7 +379,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
 
       <svg className="w-full h-full pointer-events-none">
         <defs>
-            <filter id="glow">
+            <filter id={filterId}>
                 <feGaussianBlur stdDeviation="2.5" result="coloredBlur"/>
                 <feMerge>
                     <feMergeNode in="coloredBlur"/>
@@ -349,8 +393,8 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
              const source = positionedNodes.find(n => n.id === link.sourceId)!;
              const target = positionedNodes.find(n => n.id === link.targetId)!;
              const intensity = linkActivity[link.id] || 0;
-             const vlanConfig = VLAN_CONFIG[link.vlan as keyof typeof VLAN_CONFIG];
-             const vlanColor = vlanConfig?.color || '#64748b';
+             const vlanConfig = VLAN_CONFIG[link.vlan as keyof typeof VLAN_CONFIG] ?? { name: 'Unknown', color: '#64748b', subnet: '0.0.0' };
+             const vlanColor = vlanConfig.color;
              
              // Dynamic Style
              const isActive = intensity > 0.01;
@@ -376,7 +420,7 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                         stroke={vlanColor}
                         strokeWidth={3}
                         strokeOpacity={intensity}
-                        filter={isActive ? "url(#glow)" : undefined}
+                        filter={isActive ? `url(#${filterId})` : undefined}
                      />
                  </g>
              )
@@ -387,21 +431,15 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
              const link = links.find(l => l.id === p.linkId);
              if (activeVlanFilter !== 'all' && link && link.vlan !== activeVlanFilter) return null;
 
-             const parts = p.path.split(' ');
-             const x1 = parseFloat(parts[1]);
-             const y1 = parseFloat(parts[2]);
-             const x2 = parseFloat(parts[4]);
-             const y2 = parseFloat(parts[5]);
-             
-             const cx = x1 + (x2 - x1) * (p.progress / 100);
-             const cy = y1 + (y2 - y1) * (p.progress / 100);
+             const cx = p.startX + (p.endX - p.startX) * (p.progress / 100);
+             const cy = p.startY + (p.endY - p.startY) * (p.progress / 100);
 
              return (
                  <circle 
                     key={p.id}
                     cx={cx} cy={cy} r={3}
                     fill={p.color}
-                    filter="url(#glow)"
+                    filter={`url(#${filterId})`}
                  />
              );
         })}
@@ -423,7 +461,17 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                     opacity: isDimmed ? 0.2 : 1,
                     pointerEvents: isDimmed ? 'none' : 'auto'
                 }}
-                onClick={() => {
+                // click handler respects drag threshold
+                onClick={(e) => {
+                    if (dragStartPos) {
+                        const dx = e.clientX - dragStartPos.x;
+                        const dy = e.clientY - dragStartPos.y;
+                        if (Math.sqrt(dx * dx + dy * dy) > DRAG_THRESHOLD) {
+                            setDragStartPos(null);
+                            return; // it was a drag
+                        }
+                        setDragStartPos(null);
+                    }
                     if (node.type === 'ied') onSelectIED(node.id);
                     if (node.type === 'switch') setIsEditingSwitch(true); // Open config on click
                 }}
@@ -432,11 +480,51 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                     e.preventDefault();
                     e.stopPropagation();
                     setDraggingNodeId(node.id);
+                    setDragStartPos({ x: e.clientX, y: e.clientY });
                     dragOffsetRef.current = {
                         x: e.clientX - node.x,
                         y: e.clientY - node.y
                     };
                 }}
+                onKeyDown={(e) => {
+                    if (node.type !== 'ied') return;
+                    const step = e.shiftKey ? 20 : 5;
+                    switch (e.key) {
+                        case 'ArrowLeft':
+                            e.preventDefault();
+                            setNodePositions(prev => ({
+                                ...prev,
+                                [node.id]: { ...prev[node.id], x: prev[node.id].x - step }
+                            }));
+                            break;
+                        case 'ArrowRight':
+                            e.preventDefault();
+                            setNodePositions(prev => ({
+                                ...prev,
+                                [node.id]: { ...prev[node.id], x: prev[node.id].x + step }
+                            }));
+                            break;
+                        case 'ArrowUp':
+                            e.preventDefault();
+                            setNodePositions(prev => ({
+                                ...prev,
+                                [node.id]: { ...prev[node.id], y: prev[node.id].y - step }
+                            }));
+                            break;
+                        case 'ArrowDown':
+                            e.preventDefault();
+                            setNodePositions(prev => ({
+                                ...prev,
+                                [node.id]: { ...prev[node.id], y: prev[node.id].y + step }
+                            }));
+                            break;
+                        default:
+                            break;
+                    }
+                }}
+                tabIndex={0}
+                role="button"
+                aria-label={`${node.name} - press arrow keys to move`}
             >
                 <div className={`
                     w-12 h-12 rounded-lg flex items-center justify-center border-2 shadow-[0_0_15px_rgba(0,0,0,0.5)]
@@ -483,9 +571,25 @@ export const NetworkTopology: React.FC<NetworkTopologyProps> = ({ ieds, onSelect
                         <div className="text-xs font-bold text-white whitespace-nowrap">{node.name}</div>
                         {node.type === 'ied' && (
                             <button 
-                                onClick={(e) => { e.stopPropagation(); onDeleteIED(node.id); }} 
-                                className="text-scada-danger hover:text-red-400 p-0.5 ml-2 hover:bg-white/10 rounded transition-colors"
-                                title="Remove Device"
+                                onClick={(e) => { 
+                                    e.stopPropagation();
+                                    if (pendingDelete === node.id) {
+                                        onDeleteIED(node.id);
+                                        setPendingDelete(null);
+                                    } else {
+                                        setPendingDelete(node.id);
+                                        setTimeout(() => {
+                                            if (pendingDelete === node.id) {
+                                                setPendingDelete(null);
+                                            }
+                                        }, 3000);
+                                    }
+                                }} 
+                                className={
+                                    `p-0.5 ml-2 rounded transition-colors ` +
+                                    (pendingDelete === node.id ? 'text-red-400 bg-white/10' : 'text-scada-danger hover:text-red-400 hover:bg-white/10')
+                                }
+                                title={pendingDelete === node.id ? 'Click again to confirm' : 'Remove Device'}
                             >
                                 <Icons.Trash className="w-3 h-3" />
                             </button>

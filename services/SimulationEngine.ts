@@ -499,9 +499,15 @@ export class SimulationEngine {
         return () => this.packetListeners.delete(callback);
     }
 
-    public subscribeToDebug(callback: (state: DebugState) => void) {
+    public subscribeToDebug(callback: (state: DebugState) => void): () => void {
         this.debugStateCallback = callback;
         this.emitDebugState(); // Initial state
+        // return unsubscribe function
+        return () => {
+            if (this.debugStateCallback === callback) {
+                this.debugStateCallback = null;
+            }
+        };
     }
 
     public getCoil(addr: number, source: string = 'System'): boolean {

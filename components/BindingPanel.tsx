@@ -13,7 +13,7 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
     connected: false,
     url: 'ws://127.0.0.1:34001',
     adapters: [],
-    selectedAdapter: null,
+    selectedAdapter: '', // use empty string so <select> can handle it without warnings
     rxCount: 0,
     txCount: 0,
     lastError: undefined,
@@ -24,6 +24,16 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
   const [iecBackendInputs, setIecBackendInputs] = useState<Record<string, { host: string; port: number; scdFile: string }>>({});
   const [protocolIpInputs, setProtocolIpInputs] = useState<Record<string, { mmsIp: string; gooseIp: string }>>({});
   const [lastIecConnectAt, setLastIecConnectAt] = useState<number | null>(null);
+  const [syncingIec, setSyncingIec] = useState(false);
+
+  // helpers for repeated logic
+  const isSimulationMode = (host?: string) => {
+    return host?.toLowerCase().trim() === 'simulation';
+  };
+
+  const getPrimaryIp = (config?: IEDNode['config']) => {
+    return config?.ip || config?.communicationIps?.[0]?.ip || '0.0.0.0';
+  };
 
   useEffect(() => {
     engine.subscribeToBridge((status) => {
@@ -102,19 +112,31 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
     engine.selectAdapter(ip);
   };
 
-  const handleConnectIec = () => {
+  const handleConnectIec = async () => {
     if (!bridgeStatus.connected) return;
-    engine.syncIecServers(ieds);
-    setLastIecConnectAt(Date.now());
+    setSyncingIec(true);
+    try {
+      await engine.syncIecServers(ieds); // assumes promise-returning API
+      setLastIecConnectAt(Date.now());
+    } catch (err) {
+      console.error('Failed to sync IEC servers:', err);
+      // optionally surface an error message to the user via toast/notification
+    } finally {
+      setSyncingIec(false);
+    }
   };
 
   const handleIecBackendInput = (iedId: string, field: 'host' | 'port' | 'scdFile', value: string) => {
     setIecBackendInputs(prev => ({
       ...prev,
       [iedId]: {
-        host: field === 'host' ? value : (prev[iedId]?.host || ''),
-        port: field === 'port' ? (parseInt(value) || 8102) : (prev[iedId]?.port ?? 8102),
-        scdFile: field === 'scdFile' ? value : (prev[iedId]?.scdFile || '')
+        host: field === 'host' ? value.trim() : (prev[iedId]?.host || ''),
+        port: field === 'port'
+          ? value.trim() === ''
+            ? 8102
+            : parseInt(value, 10) || 8102
+          : (prev[iedId]?.port ?? 8102),
+        scdFile: field === 'scdFile' ? value.trim() : (prev[iedId]?.scdFile || '')
       }
     }));
   };
@@ -170,13 +192,18 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
   const handleCopyStdBackendCommand = async (ied: IEDNode) => {
     const selectedScd = (iecBackendInputs[ied.id]?.scdFile || ied.config?.iecSclFile || 'DUBGG.scd').trim();
     const cmd = `SCD_FILE=\"${selectedScd}\" npm run iec:std:start`;
+
     try {
       if (navigator?.clipboard?.writeText) {
         await navigator.clipboard.writeText(cmd);
+        console.info(`✅ Copied to clipboard: ${cmd}`);
+      } else {
+        console.warn('Clipboard API not available, copy manually:');
+        console.info(cmd);
       }
-    } catch {
+    } catch (err) {
+      console.error('Failed to copy to clipboard:', err);
     }
-    console.info(`Std backend command prepared for ${ied.name}: ${cmd}`);
   };
 
   return (
@@ -254,11 +281,15 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <button
                 onClick={handleConnectIec}
-                disabled={!bridgeStatus.connected}
-                className="px-3 py-1.5 rounded text-xs font-bold bg-purple-500/20 text-purple-300 border border-purple-500/40 hover:bg-purple-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                disabled={!bridgeStatus.connected || syncingIec}
+                className={`px-3 py-1.5 rounded text-xs font-bold ${
+                  syncingIec
+                    ? 'bg-gray-600 text-gray-400 cursor-not-allowed'
+                    : 'bg-purple-500/20 text-purple-300 border border-purple-500/40 hover:bg-purple-500/30'
+                }`}
                 title="Push IEC 61850 endpoint bindings to relay"
               >
-                Connect IEC 61850
+                {syncingIec ? 'Connecting...' : 'Connect IEC 61850'}
               </button>
               {lastIecConnectAt && (
                 <span className="text-[10px] text-scada-muted font-mono">
@@ -350,14 +381,17 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
                 <div className="text-sm text-scada-muted">No IEC server devices available. Import an SCD to add devices.</div>
               )}
               {iecServerDevices.map((ied) => {
-                const isSimulation = iecBackendInputs[ied.id]?.host === 'simulation' || ied.config?.iecBackendHost === 'simulation';
+                const isSimulation = isSimulationMode(
+                  iecBackendInputs[ied.id]?.host || ied.config?.iecBackendHost
+                );
+                const primaryIp = getPrimaryIp(ied.config);
                 return (
                 <div key={ied.id} className="p-3 rounded bg-scada-bg border border-scada-border/70 space-y-3">
                   <div className="flex items-center justify-between">
                     <div>
                       <label className="text-[10px] uppercase font-mono text-scada-muted">IEC Device</label>
-                      <div className="text-sm text-gray-200 truncate" title={`${ied.name} (MMS ${ied.config?.mmsIp || ied.config?.ip || '0.0.0.0'}:${ied.config?.iecMmsPort ?? 102} / GOOSE ${ied.config?.gooseIp || ied.config?.ip || '0.0.0.0'})`}>
-                        {ied.name} (MMS {ied.config?.mmsIp || ied.config?.ip || '0.0.0.0'}:{ied.config?.iecMmsPort ?? 102} / GOOSE {ied.config?.gooseIp || ied.config?.ip || '0.0.0.0'})
+                      <div className="text-sm text-gray-200 truncate" title={`${ied.name} (MMS ${ied.config?.mmsIp || primaryIp}:${ied.config?.iecMmsPort ?? 102} / GOOSE ${ied.config?.gooseIp || primaryIp})`}>
+                        {ied.name} (MMS {ied.config?.mmsIp || primaryIp}:{ied.config?.iecMmsPort ?? 102} / GOOSE {ied.config?.gooseIp || primaryIp})
                       </div>
                     </div>
                     {isSimulation && (
@@ -374,7 +408,7 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
                         onChange={(e) => handleProtocolIpInput(ied.id, 'mmsIp', e.target.value)}
                         className="w-full bg-scada-panel border border-scada-border rounded px-2 py-1.5 text-xs font-mono text-white"
                       >
-                        {(ied.config?.communicationIps?.length ? ied.config.communicationIps : [{ ip: ied.config?.ip || '0.0.0.0' }]).map((entry, idx) => (
+                        {(ied.config?.communicationIps?.length ? ied.config.communicationIps : [{ ip: getPrimaryIp(ied.config) }]).map((entry, idx) => (
                           <option key={`mms-${ied.id}-${idx}`} value={entry.ip}>{entry.ip}</option>
                         ))}
                       </select>
@@ -386,7 +420,7 @@ export const BindingPanel: React.FC<BindingPanelProps> = ({ ieds, onUpdateNode }
                         onChange={(e) => handleProtocolIpInput(ied.id, 'gooseIp', e.target.value)}
                         className="w-full bg-scada-panel border border-scada-border rounded px-2 py-1.5 text-xs font-mono text-white"
                       >
-                        {(ied.config?.communicationIps?.length ? ied.config.communicationIps : [{ ip: ied.config?.ip || '0.0.0.0' }]).map((entry, idx) => (
+                        {(ied.config?.communicationIps?.length ? ied.config.communicationIps : [{ ip: getPrimaryIp(ied.config) }]).map((entry, idx) => (
                           <option key={`goose-${ied.id}-${idx}`} value={entry.ip}>{entry.ip}</option>
                         ))}
                       </select>

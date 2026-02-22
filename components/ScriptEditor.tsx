@@ -1144,6 +1144,11 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({ ieds, initialDeviceI
 
     const handleSFCWheel = (e: React.WheelEvent<HTMLDivElement>) => {
         if (viewMode !== 'sfc') return;
+        // Only perform zoom when Ctrl (or Meta) is held.
+        // Allow normal scrolling (e.g. two-finger trackpad) to pass through.
+        if (!(e.ctrlKey || e.metaKey)) {
+            return;
+        }
         e.preventDefault();
         const currentIdx = SFC_ZOOM_PRESETS.indexOf(zoomLevel as any);
         const idx = currentIdx >= 0 ? currentIdx : SFC_ZOOM_PRESETS.findIndex(v => v >= zoomLevel);
